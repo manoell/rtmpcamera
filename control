@@ -1,0 +1,9 @@
+Package: com.jpmp2023.rtmpcameratweak
+Name: RTMPCameraTweak
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: RTMP Streaming Camera for iOS
+Maintainer: JPMP
+Author: JPMP
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
