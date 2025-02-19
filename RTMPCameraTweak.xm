@@ -23,11 +23,18 @@ static int serverStarted = 0;
         LOG_INFO("RTMPCamera tweak initialized");
         
         // Inicializar server RTMP
-        rtmp_server_start(1935);
+        if (rtmp_server_start(1935) != 0) {
+            LOG_ERROR("Failed to start RTMP server");
+            return;
+        }
         serverStarted = 1;
         
         // Criar stream RTMP
         rtmpStream = rtmp_stream_create();
+        if (!rtmpStream) {
+            LOG_ERROR("Failed to create RTMP stream");
+            return;
+        }
         
         // Inicializar preview
         rtmp_preview_init();
@@ -38,6 +45,7 @@ static int serverStarted = 0;
 
 - (void)stopRunning {
     if (serverStarted) {
+        LOG_INFO("Stopping RTMP server...");
         rtmp_server_stop();
         serverStarted = 0;
         
@@ -59,7 +67,7 @@ static int serverStarted = 0;
 
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
     %orig;
-    LOG_DEBUG("Video delegate set");
+    LOG_DEBUG("Video delegate set for process: %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
 
 %end
@@ -69,7 +77,7 @@ static int serverStarted = 0;
 
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
     %orig;
-    LOG_DEBUG("Audio delegate set");
+    LOG_DEBUG("Audio delegate set for process: %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
 
 %end
@@ -78,7 +86,15 @@ static int serverStarted = 0;
 
 %ctor {
     @autoreleasepool {
-        LOG_INFO("RTMPCamera tweak loading...");
+        // Inicializar logger para ver se o tweak está sendo carregado
+        init_logger();
+        
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        LOG_INFO("RTMPCamera tweak loading in process: %@", bundleID);
+        
+        // Inicializar tweak
         %init(RTMPCameraTweak);
+        
+        LOG_INFO("RTMPCamera tweak initialized successfully");
     }
 }

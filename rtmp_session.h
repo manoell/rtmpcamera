@@ -4,6 +4,23 @@
 #include <stdint.h>
 #include "rtmp_chunk.h"
 
+// RTMP Message Types
+#define RTMP_MSG_CHUNK_SIZE     1
+#define RTMP_MSG_ABORT          2
+#define RTMP_MSG_ACK            3
+#define RTMP_MSG_USER_CONTROL   4
+#define RTMP_MSG_WINDOW_ACK     5
+#define RTMP_MSG_SET_PEER_BW    6
+#define RTMP_MSG_AUDIO          8
+#define RTMP_MSG_VIDEO          9
+#define RTMP_MSG_DATA_AMF3      15
+#define RTMP_MSG_SHARED_OBJ_AMF3 16
+#define RTMP_MSG_COMMAND_AMF3   17
+#define RTMP_MSG_DATA_AMF0      18
+#define RTMP_MSG_SHARED_OBJ_AMF0 19
+#define RTMP_MSG_COMMAND_AMF0   20
+#define RTMP_MSG_AGGREGATE      22
+
 typedef struct RTMPSession RTMPSession;
 
 RTMPSession* rtmp_session_create(void);

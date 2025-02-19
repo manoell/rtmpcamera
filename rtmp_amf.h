@@ -18,8 +18,23 @@
 #define AMF0_DATE        0x0B
 #define AMF0_LONG_STRING 0x0C
 
-typedef struct AMFObject AMFObject;
-typedef struct AMFValue AMFValue;
+struct AMFObject;
+
+typedef struct AMFValue {
+    uint8_t type;
+    union {
+        double number;
+        int boolean;
+        char* string;
+        struct AMFObject* object;
+    } data;
+} AMFValue;
+
+typedef struct AMFObject {
+    char* name;
+    AMFValue* value;
+    struct AMFObject* next;
+} AMFObject;
 
 // Funções para decodificação
 AMFValue* amf_decode(const uint8_t* data, size_t len, size_t* bytes_read);

@@ -4,22 +4,6 @@
 #include <string.h>
 #include <arpa/inet.h>
 
-struct AMFValue {
-    uint8_t type;
-    union {
-        double number;
-        int boolean;
-        char* string;
-        AMFObject* object;
-    } data;
-};
-
-struct AMFObject {
-    char* name;
-    AMFValue* value;
-    AMFObject* next;
-};
-
 static uint16_t read_uint16(const uint8_t* data) {
     return (data[0] << 8) | data[1];
 }
