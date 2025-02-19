@@ -1,29 +1,32 @@
 #ifndef RTMP_STREAM_H
 #define RTMP_STREAM_H
 
-#include "rtmp_types.h"
+#include <stdint.h>
+#include <stddef.h>
 
-// Funções de gerenciamento de stream
-int rtmp_create_stream_id(rtmp_session_t* session);
-rtmp_stream_t* rtmp_get_stream(rtmp_session_t* session, uint32_t stream_id);
-void rtmp_delete_stream(rtmp_session_t* session, uint32_t stream_id);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Funções de processamento de mídia
-int rtmp_process_video(rtmp_session_t* session, rtmp_packet_t* packet);
-int rtmp_process_audio(rtmp_session_t* session, rtmp_packet_t* packet);
+typedef struct RTMPStream RTMPStream;
 
-// Funções de buffer de stream
-int rtmp_stream_buffer_data(rtmp_stream_t* stream, uint8_t* data, uint32_t size);
-void rtmp_stream_clear_buffer(rtmp_stream_t* stream);
+typedef void (*rtmp_video_callback)(void* ctx, const uint8_t* data, size_t len, uint32_t timestamp);
+typedef void (*rtmp_audio_callback)(void* ctx, const uint8_t* data, size_t len, uint32_t timestamp);
 
-// Funções de controle de stream
-int rtmp_stream_start(rtmp_stream_t* stream);
-int rtmp_stream_stop(rtmp_stream_t* stream);
-int rtmp_stream_pause(rtmp_stream_t* stream);
-int rtmp_stream_resume(rtmp_stream_t* stream);
+RTMPStream* rtmp_stream_create(void);
+void rtmp_stream_destroy(RTMPStream* stream);
 
-// Funções de estado
-int rtmp_stream_is_active(rtmp_stream_t* stream);
-uint32_t rtmp_stream_get_timestamp(rtmp_stream_t* stream);
+int rtmp_stream_process_video(RTMPStream* stream, const uint8_t* data, size_t len, uint32_t timestamp);
+int rtmp_stream_process_audio(RTMPStream* stream, const uint8_t* data, size_t len, uint32_t timestamp);
+
+void rtmp_stream_set_video_callback(RTMPStream* stream, rtmp_video_callback cb, void* ctx);
+void rtmp_stream_set_audio_callback(RTMPStream* stream, rtmp_audio_callback cb, void* ctx);
+
+int rtmp_stream_start(RTMPStream* stream, const char* name);
+void rtmp_stream_stop(RTMPStream* stream);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // RTMP_STREAM_H

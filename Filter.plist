@@ -1,8 +1,7 @@
 {
     Filter = {
         Bundles = (
-            "com.apple.camera",
-            "com.apple.springboard"
+            "com.apple.UIKit"
         );
     };
 }

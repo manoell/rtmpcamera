@@ -1,24 +1,18 @@
 #ifndef RTMP_SESSION_H
 #define RTMP_SESSION_H
 
-#include "rtmp_types.h"
+#include <stdint.h>
+#include "rtmp_chunk.h"
 
-// Funções de gerenciamento de sessão
-rtmp_session_t* rtmp_create_session(int socket, struct sockaddr_in addr);
-void rtmp_destroy_session(rtmp_session_t* session);
-int rtmp_session_handle(rtmp_session_t* session);
+typedef struct RTMPSession RTMPSession;
 
-// Funções de buffer
-int rtmp_session_buffer_data(rtmp_session_t* session, uint8_t* data, uint32_t size);
-void rtmp_session_clear_buffers(rtmp_session_t* session);
-
-// Funções de estado
-int rtmp_session_is_connected(rtmp_session_t* session);
-rtmp_state_t rtmp_session_get_state(rtmp_session_t* session);
-
-// Funções de preview
-int rtmp_session_enable_preview(rtmp_session_t* session);
-int rtmp_session_disable_preview(rtmp_session_t* session);
-int rtmp_session_update_preview(rtmp_session_t* session, void* data, uint32_t size);
+RTMPSession* rtmp_session_create(void);
+void rtmp_session_destroy(RTMPSession* session);
+int rtmp_session_process_chunk(RTMPSession* session, RTMPChunk* chunk);
+int rtmp_session_send_chunk(RTMPSession* session, RTMPChunk* chunk);
+int rtmp_session_handle_connect(RTMPSession* session, const uint8_t* data, size_t len);
+int rtmp_session_handle_createStream(RTMPSession* session, const uint8_t* data, size_t len);
+int rtmp_session_handle_publish(RTMPSession* session, const uint8_t* data, size_t len);
+int rtmp_session_handle_play(RTMPSession* session, const uint8_t* data, size_t len);
 
 #endif // RTMP_SESSION_H

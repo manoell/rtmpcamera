@@ -2,25 +2,40 @@
 #define RTMP_AMF_H
 
 #include <stdint.h>
-#include <stdlib.h>
+#include <stddef.h>
 
-// AMF0 Markers
+// AMF0 Types
 #define AMF0_NUMBER      0x00
 #define AMF0_BOOLEAN     0x01
 #define AMF0_STRING      0x02
 #define AMF0_OBJECT      0x03
 #define AMF0_NULL        0x05
+#define AMF0_UNDEFINED   0x06
+#define AMF0_REFERENCE   0x07
 #define AMF0_ECMA_ARRAY  0x08
 #define AMF0_OBJECT_END  0x09
+#define AMF0_STRICT_ARRAY 0x0A
+#define AMF0_DATE        0x0B
+#define AMF0_LONG_STRING 0x0C
 
-// AMF functions
-int amf_decode_string(const uint8_t *data, size_t data_size, char *string, size_t string_size);
-int amf_decode_number(const uint8_t *data, size_t data_size, double *number);
-int amf_encode_string(uint8_t *data, size_t data_size, const char *string);
-int amf_encode_number(uint8_t *data, size_t data_size, double number);
-int amf_encode_boolean(uint8_t *data, size_t data_size, int boolean);
-int amf_encode_null(uint8_t *data, size_t data_size);
-int amf_encode_object_start(uint8_t *data, size_t data_size);
-int amf_encode_object_end(uint8_t *data, size_t data_size);
+typedef struct AMFObject AMFObject;
+typedef struct AMFValue AMFValue;
 
-#endif /* RTMP_AMF_H */
+// Funções para decodificação
+AMFValue* amf_decode(const uint8_t* data, size_t len, size_t* bytes_read);
+char* amf_decode_string(const uint8_t* data, size_t len, size_t* bytes_read);
+double amf_decode_number(const uint8_t* data, size_t len, size_t* bytes_read);
+int amf_decode_boolean(const uint8_t* data, size_t len, size_t* bytes_read);
+AMFObject* amf_decode_object(const uint8_t* data, size_t len, size_t* bytes_read);
+
+// Funções para codificação
+int amf_encode_string(uint8_t* buffer, size_t len, const char* str, size_t* bytes_written);
+int amf_encode_number(uint8_t* buffer, size_t len, double number, size_t* bytes_written);
+int amf_encode_boolean(uint8_t* buffer, size_t len, int boolean, size_t* bytes_written);
+int amf_encode_object(uint8_t* buffer, size_t len, const AMFObject* obj, size_t* bytes_written);
+
+// Funções de utilidade
+void amf_value_free(AMFValue* value);
+void amf_object_free(AMFObject* obj);
+
+#endif // RTMP_AMF_H

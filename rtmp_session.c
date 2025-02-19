@@ -1,161 +1,164 @@
 #include "rtmp_session.h"
 #include "rtmp_log.h"
-#include "rtmp_handshake.h"
-#include "rtmp_net.h"
+#include "rtmp_preview.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-rtmp_session_t* rtmp_create_session(int socket, struct sockaddr_in addr) {
-    rtmp_session_t* session = (rtmp_session_t*)calloc(1, sizeof(rtmp_session_t));
+typedef struct {
+    uint32_t chunk_size;
+    uint32_t stream_id;
+    uint32_t timestamp;
+    uint8_t type;
+    uint8_t* data;
+    size_t data_size;
+} RTMPMessage;
+
+struct RTMPSession {
+    int socket;
+    uint32_t chunk_size;
+    uint32_t bandwidth;
+    uint32_t window_size;
+    RTMPMessage* messages[64];
+    uint8_t state;
+    char app_name[128];
+    char stream_name[128];
+};
+
+RTMPSession* rtmp_session_create(void) {
+    RTMPSession* session = calloc(1, sizeof(RTMPSession));
     if (!session) {
-        log_rtmp_level(RTMP_LOG_ERROR, "Falha ao alocar memória para sessão");
+        LOG_ERROR("Failed to allocate session");
         return NULL;
     }
-
-    session->socket = socket;
-    session->addr = addr;
-    session->state = RTMP_STATE_INIT;
-    session->connected = 1;
-    session->in_chunk_size = RTMP_MAX_CHUNK_SIZE;
-    session->out_chunk_size = RTMP_MAX_CHUNK_SIZE;
-    session->window_size = RTMP_DEFAULT_BUFFER_SIZE;
-    session->last_ack = 0;  // Inicializar last_ack
-
-    // Alocar buffers
-    session->in_buffer = (uint8_t*)malloc(session->window_size);
-    session->out_buffer = (uint8_t*)malloc(session->window_size);
     
-    if (!session->in_buffer || !session->out_buffer) {
-        log_rtmp_level(RTMP_LOG_ERROR, "Falha ao alocar buffers da sessão");
-        rtmp_destroy_session(session);
-        return NULL;
-    }
-
-    session->in_buffer_size = 0;
-    session->out_buffer_size = 0;
-    session->stream_count = 0;
-    session->preview_enabled = 0;
-    session->preview_data = NULL;
-
-    log_rtmp_level(RTMP_LOG_INFO, "Nova sessão criada (socket: %d)", socket);
+    session->chunk_size = 128;
+    session->bandwidth = 2500000;
+    session->window_size = 2500000;
+    
+    LOG_INFO("Created new RTMP session");
     return session;
 }
 
-void rtmp_destroy_session(rtmp_session_t* session) {
+void rtmp_session_destroy(RTMPSession* session) {
     if (!session) return;
-
-    if (session->socket >= 0) {
-        close(session->socket);
-    }
-
-    free(session->in_buffer);
-    free(session->out_buffer);
     
-    // Limpar streams
-    for (int i = 0; i < session->stream_count; i++) {
-        if (session->streams[i].data) {
-            free(session->streams[i].data);
+    for (int i = 0; i < 64; i++) {
+        if (session->messages[i]) {
+            free(session->messages[i]->data);
+            free(session->messages[i]);
         }
     }
     
-    // Limpar preview
-    if (session->preview_data) {
-        free(session->preview_data);
-    }
-    
     free(session);
-    log_rtmp_level(RTMP_LOG_INFO, "Sessão destruída");
+    LOG_INFO("Destroyed RTMP session");
 }
 
-int rtmp_session_handle(rtmp_session_t* session) {
-    if (!session) return -1;
+static int handle_video_data(RTMPSession* session, RTMPChunk* chunk) {
+    if (!chunk->data || chunk->length == 0) return -1;
+    
+    uint8_t codec_id = chunk->data[0] & 0x0F;
+    
+    if (codec_id != 7) {
+        LOG_WARNING("Unsupported video codec: %d", codec_id);
+        return 0;
+    }
+    
+    uint8_t avc_packet_type = chunk->data[1];
+    uint8_t* video_data = chunk->data + 5;
+    size_t video_length = chunk->length - 5;
+    
+    switch (avc_packet_type) {
+        case 0:
+            LOG_INFO("Received AVC sequence header");
+            break;
+            
+        case 1:
+            rtmp_preview_process_video(video_data, video_length, chunk->timestamp);
+            break;
+            
+        case 2:
+            LOG_INFO("Received AVC end of sequence");
+            break;
+    }
+    
+    return 0;
+}
 
-    switch (session->state) {
-        case RTMP_STATE_INIT:
-            return rtmp_handshake_init(session);
+static int handle_audio_data(RTMPSession* session, RTMPChunk* chunk) {
+    if (!chunk->data || chunk->length == 0) return -1;
+    
+    uint8_t format = (chunk->data[0] & 0xF0) >> 4;
+    
+    if (format != 10) {
+        LOG_WARNING("Unsupported audio format: %d", format);
+        return 0;
+    }
+    
+    uint8_t aac_packet_type = chunk->data[1];
+    uint8_t* audio_data = chunk->data + 2;
+    size_t audio_length = chunk->length - 2;
+    
+    switch (aac_packet_type) {
+        case 0:
+            LOG_INFO("Received AAC sequence header");
+            break;
             
-        case RTMP_STATE_HANDSHAKE_C0C1:
-        case RTMP_STATE_HANDSHAKE_C2:
-            // Processamento continuará no loop principal
-            return 0;
-            
-        case RTMP_STATE_CONNECTED:
-        case RTMP_STATE_STREAMING:
-            return rtmp_maintain_connection(session);
-            
-        case RTMP_STATE_ERROR:
-            return -1;
+        case 1:
+            rtmp_preview_process_audio(audio_data, audio_length, chunk->timestamp);
+            break;
             
         default:
-            log_rtmp_level(RTMP_LOG_ERROR, "Estado de sessão inválido");
-            return -1;
+            LOG_WARNING("Unknown AAC packet type: %d", aac_packet_type);
+            break;
     }
-}
-
-int rtmp_session_buffer_data(rtmp_session_t* session, uint8_t* data, uint32_t size) {
-    if (!session || !data || size == 0) return -1;
-    
-    if (session->in_buffer_size + size > session->window_size) {
-        log_rtmp_level(RTMP_LOG_ERROR, "Buffer de entrada cheio");
-        return -1;
-    }
-    
-    memcpy(session->in_buffer + session->in_buffer_size, data, size);
-    session->in_buffer_size += size;
     
     return 0;
 }
 
-void rtmp_session_clear_buffers(rtmp_session_t* session) {
-    if (!session) return;
+int rtmp_session_process_chunk(RTMPSession* session, RTMPChunk* chunk) {
+    if (!session || !chunk) return -1;
     
-    session->in_buffer_size = 0;
-    session->out_buffer_size = 0;
-}
-
-int rtmp_session_is_connected(rtmp_session_t* session) {
-    if (!session) return 0;
-    return session->connected;
-}
-
-rtmp_state_t rtmp_session_get_state(rtmp_session_t* session) {
-    if (!session) return RTMP_STATE_ERROR;
-    return session->state;
-}
-
-// Funções de preview
-int rtmp_session_enable_preview(rtmp_session_t* session) {
-    if (!session) return -1;
-    session->preview_enabled = 1;
+    switch (chunk->type) {
+        case 8:  // Audio Data
+            return handle_audio_data(session, chunk);
+            
+        case 9:  // Video Data
+            return handle_video_data(session, chunk);
+            
+        case 20: // AMF0 Command
+            LOG_DEBUG("Received AMF0 command");
+            break;
+            
+        default:
+            LOG_DEBUG("Unhandled message type: %d", chunk->type);
+            break;
+    }
+    
     return 0;
 }
 
-int rtmp_session_disable_preview(rtmp_session_t* session) {
-    if (!session) return -1;
-    session->preview_enabled = 0;
-    if (session->preview_data) {
-        free(session->preview_data);
-        session->preview_data = NULL;
-    }
+int rtmp_session_send_chunk(RTMPSession* session, RTMPChunk* chunk) {
+    if (!session || !chunk) return -1;
     return 0;
 }
 
-int rtmp_session_update_preview(rtmp_session_t* session, void* data, uint32_t size) {
-    if (!session || !session->preview_enabled || !data || size == 0) return -1;
-    
-    void* new_data = malloc(size);
-    if (!new_data) {
-        log_rtmp_level(RTMP_LOG_ERROR, "Falha ao alocar memória para preview");
-        return -1;
-    }
-    
-    memcpy(new_data, data, size);
-    
-    if (session->preview_data) {
-        free(session->preview_data);
-    }
-    
-    session->preview_data = new_data;
+int rtmp_session_handle_connect(RTMPSession* session, const uint8_t* data, size_t len) {
+    LOG_INFO("Handling connect command");
+    return 0;
+}
+
+int rtmp_session_handle_createStream(RTMPSession* session, const uint8_t* data, size_t len) {
+    LOG_INFO("Handling createStream command");
+    return 0;
+}
+
+int rtmp_session_handle_publish(RTMPSession* session, const uint8_t* data, size_t len) {
+    LOG_INFO("Handling publish command");
+    rtmp_preview_show();
+    return 0;
+}
+
+int rtmp_session_handle_play(RTMPSession* session, const uint8_t* data, size_t len) {
+    LOG_INFO("Handling play command");
     return 0;
 }

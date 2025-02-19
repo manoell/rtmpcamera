@@ -1,12 +1,28 @@
 #ifndef RTMP_HANDSHAKE_H
 #define RTMP_HANDSHAKE_H
 
-#include "rtmp_types.h"
+#include <stdint.h>
 
-// Funções de handshake
-int rtmp_handshake_init(rtmp_session_t* session);
-int rtmp_process_handshake_c0c1(rtmp_session_t* session, uint8_t* data, uint32_t size);
-int rtmp_process_handshake_c2(rtmp_session_t* session, uint8_t* data, uint32_t size);
-int rtmp_send_handshake_s0s1s2(rtmp_session_t* session, uint8_t* c1_data);
+// RTMP Handshake states
+typedef enum {
+    RTMP_HANDSHAKE_UNINITIALIZED = 0,
+    RTMP_HANDSHAKE_0,
+    RTMP_HANDSHAKE_1,
+    RTMP_HANDSHAKE_2,
+    RTMP_HANDSHAKE_DONE
+} rtmp_handshake_state_t;
+
+// RTMP Handshake versions
+#define RTMP_HANDSHAKE_VERSION_OLD 0x03
+#define RTMP_HANDSHAKE_VERSION_NEW 0x06
+
+// Handshake packet sizes
+#define RTMP_HANDSHAKE_PACKET_SIZE 1536
+#define RTMP_HANDSHAKE_VERSION_SIZE 1
+
+// Function prototypes
+int rtmp_handshake_server(int socket);
+int rtmp_handshake_client(int socket);
+int rtmp_handshake_verify(const uint8_t* data, size_t len);
 
 #endif // RTMP_HANDSHAKE_H
