@@ -20,11 +20,12 @@ RTMPSession* rtmp_session_create(int socket_fd, struct RTMPServer* server) {
     }
 
     session->socket_fd = socket_fd;
-    session->state = RTMP_SESSION_CREATED;
     session->server = server;
+    session->state = RTMP_SESSION_CREATED;
     session->is_running = false;
     
-    session->chunk_stream = rtmp_chunk_stream_create();
+    // Passa o socket_fd para criar o chunk_stream
+    session->chunk_stream = rtmp_chunk_stream_create(socket_fd);
     if (!session->chunk_stream) {
         free(session);
         rtmp_log(RTMP_LOG_ERROR, "Failed to create chunk stream");
@@ -109,6 +110,7 @@ int rtmp_session_process(RTMPSession* session) {
     RTMPMessage message;
     memset(&message, 0, sizeof(message));
 
+    // Chama rtmp_chunk_read com o chunk_stream
     int ret = rtmp_chunk_read(session->chunk_stream, &message);
     if (ret != RTMP_OK) {
         rtmp_log(RTMP_LOG_ERROR, "Failed to read chunk");
@@ -137,21 +139,24 @@ void rtmp_session_handle_message(RTMPSession* session, RTMPMessage* message) {
             rtmp_session_update_stream_info(session, message);
             break;
 
-        case RTMP_MSG_COMMAND_AMF0:
-            // Processa comandos AMF0
-            RTMPBuffer buffer = {
-                .data = message->payload,
-                .size = message->message_length,
-                .position = 0
-            };
-            
-            char* command_name;
-            uint16_t name_len;
-            if (rtmp_amf0_read_string(&buffer, &command_name, &name_len) == RTMP_OK) {
-                rtmp_log(RTMP_LOG_DEBUG, "Received command: %s", command_name);
-                free(command_name);
+        case RTMP_MSG_COMMAND_AMF0: {
+            // Corrigido: Criação e uso do RTMPBuffer
+            RTMPBuffer* buffer = rtmp_buffer_create(message->message_length);
+            if (buffer) {
+                memcpy(buffer->data, message->payload, message->message_length);
+                buffer->size = message->message_length;
+                
+                char* command_name;
+                uint16_t name_len;
+                if (rtmp_amf0_read_string(buffer, &command_name, &name_len) == RTMP_OK) {
+                    rtmp_log(RTMP_LOG_DEBUG, "Received command: %s", command_name);
+                    free(command_name);
+                }
+                
+                rtmp_buffer_destroy(buffer);
             }
             break;
+        }
     }
 
     pthread_mutex_unlock(&session->mutex);

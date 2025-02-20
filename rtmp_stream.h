@@ -6,6 +6,10 @@
 #include "rtmp_session.h"
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Tipos de pacotes de vídeo
 #define RTMP_VIDEO_KEYFRAME          0x01
 #define RTMP_VIDEO_INTER_FRAME       0x02
@@ -55,5 +59,9 @@ void rtmp_stream_free_audio_packet(RTMPAudioPacket* packet);
 // Funções de análise de qualidade
 void rtmp_stream_analyze_quality(RTMPSession* session, RTMPVideoPacket* packet);
 const char* rtmp_stream_get_codec_name(uint8_t codec);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

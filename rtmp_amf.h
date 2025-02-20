@@ -5,6 +5,10 @@
 #include "rtmp_core.h"
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Tipos AMF0
 #define AMF0_NUMBER      0x00
 #define AMF0_BOOLEAN     0x01
@@ -45,5 +49,9 @@ int rtmp_amf0_read_number(RTMPBuffer* buffer, double* number);
 int rtmp_amf0_read_boolean(RTMPBuffer* buffer, uint8_t* boolean);
 int rtmp_amf0_read_object_start(RTMPBuffer* buffer);
 int rtmp_amf0_read_object_end(RTMPBuffer* buffer);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

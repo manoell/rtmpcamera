@@ -5,6 +5,10 @@
 #include "rtmp_core.h"
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Tipos de mensagens RTMP
 #define RTMP_MSG_CHUNK_SIZE     1
 #define RTMP_MSG_ABORT          2
@@ -53,5 +57,9 @@ void rtmp_message_free(RTMPMessage* message);
 
 // Funções de handshake
 int rtmp_handshake_perform(RTMPSession* session);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

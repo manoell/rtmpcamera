@@ -2,8 +2,9 @@
 #include "rtmp_chunk.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 
-RTMPChunkStream* rtmp_chunk_stream_create(void) {
+RTMPChunkStream* rtmp_chunk_stream_create(int socket_fd) {
     RTMPChunkStream* cs = calloc(1, sizeof(RTMPChunkStream));
     if (!cs) {
         rtmp_log(RTMP_LOG_ERROR, "Failed to allocate chunk stream");
@@ -14,6 +15,7 @@ RTMPChunkStream* rtmp_chunk_stream_create(void) {
     cs->window_size = 2500000; // 2.5MB default window
     cs->bytes_received = 0;
     cs->last_ack = 0;
+    cs->socket_fd = socket_fd;
 
     rtmp_log(RTMP_LOG_DEBUG, "Created chunk stream (size: %u, window: %u)", 
              cs->chunk_size, cs->window_size);
@@ -30,9 +32,9 @@ void rtmp_chunk_stream_destroy(RTMPChunkStream* cs) {
     rtmp_log(RTMP_LOG_DEBUG, "Destroyed chunk stream");
 }
 
-static int read_chunk_basic_header(RTMPSession* session, uint8_t* fmt, uint32_t* csid) {
+static int read_chunk_basic_header(RTMPChunkStream* cs, uint8_t* fmt, uint32_t* csid) {
     uint8_t basic_header;
-    if (recv(session->socket_fd, &basic_header, 1, 0) != 1) {
+    if (recv(cs->socket_fd, &basic_header, 1, 0) != 1) {
         return RTMP_ERROR_SOCKET;
     }
 
@@ -41,13 +43,13 @@ static int read_chunk_basic_header(RTMPSession* session, uint8_t* fmt, uint32_t*
 
     if (*csid == 0) {
         uint8_t byte;
-        if (recv(session->socket_fd, &byte, 1, 0) != 1) {
+        if (recv(cs->socket_fd, &byte, 1, 0) != 1) {
             return RTMP_ERROR_SOCKET;
         }
         *csid = byte + 64;
     } else if (*csid == 1) {
         uint8_t bytes[2];
-        if (recv(session->socket_fd, bytes, 2, 0) != 2) {
+        if (recv(cs->socket_fd, bytes, 2, 0) != 2) {
             return RTMP_ERROR_SOCKET;
         }
         *csid = (bytes[1] << 8) + bytes[0] + 64;
@@ -56,7 +58,7 @@ static int read_chunk_basic_header(RTMPSession* session, uint8_t* fmt, uint32_t*
     return RTMP_OK;
 }
 
-static int read_chunk_message_header(RTMPSession* session, uint8_t fmt, RTMPMessage* message) {
+static int read_chunk_message_header(RTMPChunkStream* cs, uint8_t fmt, RTMPMessage* message) {
     uint8_t header[11] = {0}; // Tamanho máximo do cabeçalho
     int header_size;
 
@@ -78,109 +80,106 @@ static int read_chunk_message_header(RTMPSession* session, uint8_t fmt, RTMPMess
     }
 
     if (header_size > 0) {
-        if (recv(session->socket_fd, header, header_size, 0) != header_size) {
+        if (recv(cs->socket_fd, header, header_size, 0) != header_size) {
             return RTMP_ERROR_SOCKET;
         }
     }
 
-    // Parse de acordo com o formato
-    if (fmt == RTMP_CHUNK_TYPE_0) {
+    if (fmt <= RTMP_CHUNK_TYPE_2) {
         memcpy(&message->timestamp, header, 3);
-        memcpy(&message->message_length, header + 3, 3);
-        message->message_type_id = header[6];
-        memcpy(&message->stream_id, header + 7, 4);
-    } else if (fmt == RTMP_CHUNK_TYPE_1) {
-        memcpy(&message->timestamp, header, 3);
-        memcpy(&message->message_length, header + 3, 3);
-        message->message_type_id = header[6];
-    } else if (fmt == RTMP_CHUNK_TYPE_2) {
-        memcpy(&message->timestamp, header, 3);
+        if (fmt <= RTMP_CHUNK_TYPE_1) {
+            memcpy(&message->message_length, header + 3, 3);
+            message->message_type_id = header[6];
+            if (fmt == RTMP_CHUNK_TYPE_0) {
+                memcpy(&message->stream_id, header + 7, 4);
+            }
+        }
     }
 
     return RTMP_OK;
 }
 
-int rtmp_chunk_read(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message) {
+int rtmp_chunk_read(RTMPChunkStream* cs, RTMPMessage* message) {
+    if (!cs || !message) {
         return RTMP_ERROR_MEMORY;
     }
 
-    RTMPChunkStream* cs = session->chunk_stream;
     uint8_t fmt;
     uint32_t csid;
 
-    int ret = read_chunk_basic_header(session, &fmt, &csid);
+    // Lê o cabeçalho básico
+    int ret = read_chunk_basic_header(cs, &fmt, &csid);
     if (ret != RTMP_OK) {
         return ret;
     }
 
-    ret = read_chunk_message_header(session, fmt, message);
+    // Lê o cabeçalho da mensagem
+    ret = read_chunk_message_header(cs, fmt, message);
     if (ret != RTMP_OK) {
         return ret;
     }
 
-    // Lê o payload do chunk
-    size_t bytes_to_read = message->message_length;
-    message->payload = malloc(bytes_to_read);
+    // Aloca espaço para o payload
+    message->payload = malloc(message->message_length);
     if (!message->payload) {
         return RTMP_ERROR_MEMORY;
     }
 
+    // Lê o payload em chunks
     size_t bytes_read = 0;
-    while (bytes_read < bytes_to_read) {
-        size_t chunk_size = bytes_to_read - bytes_read;
+    while (bytes_read < message->message_length) {
+        size_t chunk_size = message->message_length - bytes_read;
         if (chunk_size > cs->chunk_size) {
             chunk_size = cs->chunk_size;
         }
 
-        if (recv(session->socket_fd, message->payload + bytes_read, chunk_size, 0) != chunk_size) {
+        ssize_t bytes = recv(cs->socket_fd, 
+                           message->payload + bytes_read, 
+                           chunk_size, 
+                           0);
+        
+        if (bytes <= 0) {
             free(message->payload);
+            message->payload = NULL;
             return RTMP_ERROR_SOCKET;
         }
 
-        bytes_read += chunk_size;
-        cs->bytes_received += chunk_size;
+        bytes_read += bytes;
+        cs->bytes_received += bytes;
 
-        // Verifica se precisa enviar acknowledgement
+        // Verifica window ack
         if (cs->window_size > 0 && 
             cs->bytes_received - cs->last_ack >= cs->window_size) {
-            // TODO: Enviar acknowledgement
+            // TODO: Enviar window ack
             cs->last_ack = cs->bytes_received;
         }
     }
 
-    rtmp_log(RTMP_LOG_DEBUG, "Read chunk: fmt=%d, csid=%u, size=%u", 
-             fmt, csid, message->message_length);
+    rtmp_log(RTMP_LOG_DEBUG, "Read chunk: fmt=%d, csid=%u, type=%d, size=%u", 
+             fmt, csid, message->message_type_id, message->message_length);
+
     return RTMP_OK;
 }
 
-int rtmp_chunk_write(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message) {
+int rtmp_chunk_write(RTMPChunkStream* cs, RTMPMessage* message) {
+    if (!cs || !message) {
         return RTMP_ERROR_MEMORY;
     }
 
-    RTMPChunkStream* cs = session->chunk_stream;
-    uint8_t header[12] = {0};
-    size_t header_size = 0;
+    // Prepara o cabeçalho básico (sempre usa fmt 0 para simplicidade)
+    uint8_t basic_header = (RTMP_CHUNK_TYPE_0 << 6);
+    if (send(cs->socket_fd, &basic_header, 1, 0) != 1) {
+        return RTMP_ERROR_SOCKET;
+    }
 
-    // Monta o cabeçalho básico
-    header[0] = (RTMP_CHUNK_TYPE_0 << 6);
-    header_size++;
+    // Prepara o cabeçalho da mensagem
+    uint8_t header[11] = {0};
+    memcpy(header, &message->timestamp, 3);
+    memcpy(header + 3, &message->message_length, 3);
+    header[6] = message->message_type_id;
+    memcpy(header + 7, &message->stream_id, 4);
 
-    // Monta o cabeçalho da mensagem
-    uint32_t timestamp = message->timestamp;
-    memcpy(header + header_size, &timestamp, 3);
-    header_size += 3;
-
-    memcpy(header + header_size, &message->message_length, 3);
-    header_size += 3;
-
-    header[header_size++] = message->message_type_id;
-    memcpy(header + header_size, &message->stream_id, 4);
-    header_size += 4;
-
-    // Envia o cabeçalho
-    if (send(session->socket_fd, header, header_size, 0) != header_size) {
+    if (send(cs->socket_fd, header, 11, 0) != 11) {
         return RTMP_ERROR_SOCKET;
     }
 
@@ -192,15 +191,21 @@ int rtmp_chunk_write(RTMPSession* session, RTMPMessage* message) {
             chunk_size = cs->chunk_size;
         }
 
-        if (send(session->socket_fd, message->payload + bytes_sent, chunk_size, 0) != chunk_size) {
+        ssize_t bytes = send(cs->socket_fd, 
+                           message->payload + bytes_sent, 
+                           chunk_size, 
+                           0);
+        
+        if (bytes <= 0) {
             return RTMP_ERROR_SOCKET;
         }
 
-        bytes_sent += chunk_size;
+        bytes_sent += bytes;
     }
 
-    rtmp_log(RTMP_LOG_DEBUG, "Wrote chunk: size=%u, type=%u", 
-             message->message_length, message->message_type_id);
+    rtmp_log(RTMP_LOG_DEBUG, "Wrote chunk: type=%d, size=%u", 
+             message->message_type_id, message->message_length);
+
     return RTMP_OK;
 }
 
