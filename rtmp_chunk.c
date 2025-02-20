@@ -1,414 +1,224 @@
+// rtmp_chunk.c
 #include "rtmp_chunk.h"
-#include "rtmp_log.h"
-#include "rtmp_util.h"
 #include <stdlib.h>
 #include <string.h>
 
 RTMPChunkStream* rtmp_chunk_stream_create(void) {
     RTMPChunkStream* cs = calloc(1, sizeof(RTMPChunkStream));
     if (!cs) {
-        LOG_ERROR("Failed to allocate chunk stream");
+        rtmp_log(RTMP_LOG_ERROR, "Failed to allocate chunk stream");
         return NULL;
     }
-    
-    cs->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    cs->in_chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    cs->out_chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    cs->ack_window = 2500000;
-    
-    LOG_DEBUG("Created chunk stream with size %u", cs->chunk_size);
+
+    cs->chunk_size = RTMP_CHUNK_SIZE_MIN;
+    cs->window_size = 2500000; // 2.5MB default window
+    cs->bytes_received = 0;
+    cs->last_ack = 0;
+
+    rtmp_log(RTMP_LOG_DEBUG, "Created chunk stream (size: %u, window: %u)", 
+             cs->chunk_size, cs->window_size);
     return cs;
 }
 
 void rtmp_chunk_stream_destroy(RTMPChunkStream* cs) {
     if (!cs) return;
-    
-    for (int i = 0; i < RTMP_MAX_CHUNK_STREAMS; i++) {
-        if (cs->chunks[i]) {
-            rtmp_chunk_destroy(cs->chunks[i]);
-        }
+
+    for (int i = 0; i < 64; i++) {
+        free(cs->chunks[i].data);
     }
-    
     free(cs);
-    LOG_DEBUG("Destroyed chunk stream");
+    rtmp_log(RTMP_LOG_DEBUG, "Destroyed chunk stream");
 }
 
-RTMPChunk* rtmp_chunk_create(void) {
-    RTMPChunk* chunk = calloc(1, sizeof(RTMPChunk));
-    if (!chunk) {
-        LOG_ERROR("Failed to allocate chunk");
-        return NULL;
+static int read_chunk_basic_header(RTMPSession* session, uint8_t* fmt, uint32_t* csid) {
+    uint8_t basic_header;
+    if (recv(session->socket_fd, &basic_header, 1, 0) != 1) {
+        return RTMP_ERROR_SOCKET;
     }
-    return chunk;
-}
 
-void rtmp_chunk_destroy(RTMPChunk* chunk) {
-    if (!chunk) return;
-    buffer_free(chunk->data);
-    free(chunk);
-}
+    *fmt = (basic_header >> 6) & 0x03;
+    *csid = basic_header & 0x3F;
 
-void rtmp_chunk_reset(RTMPChunk* chunk) {
-    if (!chunk) return;
-    
-    chunk->timestamp = 0;
-    chunk->timestamp_delta = 0;
-    chunk->length = 0;
-    chunk->bytes_read = 0;
-    chunk->extended_timestamp = 0;
-    
-    buffer_free(chunk->data);
-    chunk->data = NULL;
-    chunk->data_size = 0;
-}
-
-static int read_basic_header(const uint8_t* data, size_t len, RTMPChunk* chunk, size_t* bytes_read) {
-    if (len < 1) return -1;
-    
-    uint8_t first_byte = data[0];
-    chunk->fmt = (first_byte >> 6) & 0x03;
-    chunk->csid = first_byte & 0x3F;
-    *bytes_read = 1;
-    
-    if (chunk->csid == 0) {
-        // 2 byte form
-        if (len < 2) return -1;
-        chunk->csid = data[1] + 64;
-        *bytes_read = 2;
-    } else if (chunk->csid == 1) {
-        // 3 byte form
-        if (len < 3) return -1;
-        chunk->csid = (data[2] << 8) | data[1] + 64;
-        *bytes_read = 3;
+    if (*csid == 0) {
+        uint8_t byte;
+        if (recv(session->socket_fd, &byte, 1, 0) != 1) {
+            return RTMP_ERROR_SOCKET;
+        }
+        *csid = byte + 64;
+    } else if (*csid == 1) {
+        uint8_t bytes[2];
+        if (recv(session->socket_fd, bytes, 2, 0) != 2) {
+            return RTMP_ERROR_SOCKET;
+        }
+        *csid = (bytes[1] << 8) + bytes[0] + 64;
     }
-    
-    LOG_DEBUG("Read basic header: fmt=%d, csid=%u", chunk->fmt, chunk->csid);
-    return 0;
+
+    return RTMP_OK;
 }
 
-static int read_message_header(RTMPChunkStream* cs, const uint8_t* data, size_t len, RTMPChunk* chunk, size_t* bytes_read) {
-    size_t header_size = 0;
-    *bytes_read = 0;
-    
-    RTMPChunk* prev_chunk = cs->chunks[chunk->csid];
-    
-    switch (chunk->fmt) {
-        case 0: // Type 0 - 11 bytes
-            if (len < 11) return -1;
-            
-            chunk->timestamp = read_uint24(data);
-            chunk->length = read_uint24(data + 3);
-            chunk->type = data[6];
-            chunk->stream_id = read_uint32(data + 7);
-            
+static int read_chunk_message_header(RTMPSession* session, uint8_t fmt, RTMPMessage* message) {
+    uint8_t header[11] = {0}; // Tamanho máximo do cabeçalho
+    int header_size;
+
+    switch (fmt) {
+        case RTMP_CHUNK_TYPE_0:
             header_size = 11;
-            
-            if (chunk->timestamp == 0xFFFFFF) {
-                chunk->extended_timestamp = 1;
-                header_size += 4;
-            }
             break;
-            
-        case 1: // Type 1 - 7 bytes
-            if (len < 7 || !prev_chunk) return -1;
-            
-            chunk->timestamp_delta = read_uint24(data);
-            chunk->length = read_uint24(data + 3);
-            chunk->type = data[6];
-            chunk->stream_id = prev_chunk->stream_id;
-            
+        case RTMP_CHUNK_TYPE_1:
             header_size = 7;
-            
-            if (chunk->timestamp_delta == 0xFFFFFF) {
-                chunk->extended_timestamp = 1;
-                header_size += 4;
-            }
-            
-            chunk->timestamp = prev_chunk->timestamp + chunk->timestamp_delta;
             break;
-            
-        case 2: // Type 2 - 3 bytes
-            if (len < 3 || !prev_chunk) return -1;
-            
-            chunk->timestamp_delta = read_uint24(data);
-            chunk->length = prev_chunk->length;
-            chunk->type = prev_chunk->type;
-            chunk->stream_id = prev_chunk->stream_id;
-            
+        case RTMP_CHUNK_TYPE_2:
             header_size = 3;
-            
-            if (chunk->timestamp_delta == 0xFFFFFF) {
-                chunk->extended_timestamp = 1;
-                header_size += 4;
-            }
-            
-            chunk->timestamp = prev_chunk->timestamp + chunk->timestamp_delta;
             break;
-            
-        case 3: // Type 3 - 0 bytes
-            if (!prev_chunk) return -1;
-            
-            chunk->timestamp = prev_chunk->timestamp + prev_chunk->timestamp_delta;
-            chunk->timestamp_delta = prev_chunk->timestamp_delta;
-            chunk->length = prev_chunk->length;
-            chunk->type = prev_chunk->type;
-            chunk->stream_id = prev_chunk->stream_id;
-            
-            if (prev_chunk->extended_timestamp) {
-                chunk->extended_timestamp = 1;
-                header_size = 4;
-            }
+        case RTMP_CHUNK_TYPE_3:
+            header_size = 0;
             break;
-            
         default:
-            LOG_ERROR("Invalid chunk type: %d", chunk->fmt);
-            return -1;
+            return RTMP_ERROR_PROTOCOL;
     }
-    
-    // Read extended timestamp if present
-    if (chunk->extended_timestamp && len >= header_size) {
-        uint32_t ext_timestamp = read_uint32(data + header_size - 4);
-        
-        if (chunk->fmt == 0) {
-            chunk->timestamp = ext_timestamp;
-        } else {
-            chunk->timestamp_delta = ext_timestamp;
-            chunk->timestamp = (prev_chunk ? prev_chunk->timestamp : 0) + ext_timestamp;
+
+    if (header_size > 0) {
+        if (recv(session->socket_fd, header, header_size, 0) != header_size) {
+            return RTMP_ERROR_SOCKET;
         }
     }
-    
-    *bytes_read = header_size;
-    LOG_DEBUG("Read message header: type=%d, len=%u, timestamp=%u", 
-             chunk->type, chunk->length, chunk->timestamp);
-    return 0;
+
+    // Parse de acordo com o formato
+    if (fmt == RTMP_CHUNK_TYPE_0) {
+        memcpy(&message->timestamp, header, 3);
+        memcpy(&message->message_length, header + 3, 3);
+        message->message_type_id = header[6];
+        memcpy(&message->stream_id, header + 7, 4);
+    } else if (fmt == RTMP_CHUNK_TYPE_1) {
+        memcpy(&message->timestamp, header, 3);
+        memcpy(&message->message_length, header + 3, 3);
+        message->message_type_id = header[6];
+    } else if (fmt == RTMP_CHUNK_TYPE_2) {
+        memcpy(&message->timestamp, header, 3);
+    }
+
+    return RTMP_OK;
 }
 
-int rtmp_chunk_read(RTMPChunkStream* cs, const uint8_t* data, size_t len, RTMPChunk* chunk, size_t* bytes_read) {
-    if (!cs || !data || !len || !chunk || !bytes_read) return -1;
-    
-    *bytes_read = 0;
-    size_t offset = 0;
-    size_t header_bytes = 0;
-    
-    // Read basic header
-    if (read_basic_header(data, len, chunk, &header_bytes) < 0) {
-        LOG_ERROR("Failed to read basic header");
-        return -1;
+int rtmp_chunk_read(RTMPSession* session, RTMPMessage* message) {
+    if (!session || !message) {
+        return RTMP_ERROR_MEMORY;
     }
-    offset += header_bytes;
-    
-    // Read message header
-    if (read_message_header(cs, data + offset, len - offset, chunk, &header_bytes) < 0) {
-        LOG_ERROR("Failed to read message header");
-        return -1;
+
+    RTMPChunkStream* cs = session->chunk_stream;
+    uint8_t fmt;
+    uint32_t csid;
+
+    int ret = read_chunk_basic_header(session, &fmt, &csid);
+    if (ret != RTMP_OK) {
+        return ret;
     }
-    offset += header_bytes;
-    
-    // Allocate or reallocate data buffer if needed
-    if (!chunk->data || chunk->data_size < chunk->length) {
-        uint8_t* new_data = buffer_realloc(chunk->data, chunk->length);
-        if (!new_data) {
-            LOG_ERROR("Failed to allocate chunk data buffer");
-            return -1;
+
+    ret = read_chunk_message_header(session, fmt, message);
+    if (ret != RTMP_OK) {
+        return ret;
+    }
+
+    // Lê o payload do chunk
+    size_t bytes_to_read = message->message_length;
+    message->payload = malloc(bytes_to_read);
+    if (!message->payload) {
+        return RTMP_ERROR_MEMORY;
+    }
+
+    size_t bytes_read = 0;
+    while (bytes_read < bytes_to_read) {
+        size_t chunk_size = bytes_to_read - bytes_read;
+        if (chunk_size > cs->chunk_size) {
+            chunk_size = cs->chunk_size;
         }
-        chunk->data = new_data;
-        chunk->data_size = chunk->length;
-    }
-    
-    // Calculate how many bytes we can read in this chunk
-    size_t bytes_remaining = chunk->length - chunk->bytes_read;
-    size_t can_read = bytes_remaining;
-    if (can_read > cs->in_chunk_size) {
-        can_read = cs->in_chunk_size;
-    }
-    if (can_read > len - offset) {
-        can_read = len - offset;
-    }
-    
-    // Copy data
-    memcpy(chunk->data + chunk->bytes_read, data + offset, can_read);
-    chunk->bytes_read += can_read;
-    offset += can_read;
-    
-    // Update bytes received and check if we need to send acknowledgement
-    cs->bytes_in += offset;
-    if (cs->bytes_in - cs->last_ack >= cs->ack_window) {
-        cs->last_ack = cs->bytes_in;
-        // TODO: Send acknowledgement
-    }
-    
-    // If chunk is complete, replace old chunk in array
-    if (chunk->bytes_read == chunk->length) {
-        RTMPChunk* prev_chunk = cs->chunks[chunk->csid];
-        if (prev_chunk) {
-            rtmp_chunk_destroy(prev_chunk);
+
+        if (recv(session->socket_fd, message->payload + bytes_read, chunk_size, 0) != chunk_size) {
+            free(message->payload);
+            return RTMP_ERROR_SOCKET;
         }
-        cs->chunks[chunk->csid] = chunk;
-        LOG_DEBUG("Completed chunk: csid=%u, type=%u, len=%u", 
-                 chunk->csid, chunk->type, chunk->length);
+
+        bytes_read += chunk_size;
+        cs->bytes_received += chunk_size;
+
+        // Verifica se precisa enviar acknowledgement
+        if (cs->window_size > 0 && 
+            cs->bytes_received - cs->last_ack >= cs->window_size) {
+            // TODO: Enviar acknowledgement
+            cs->last_ack = cs->bytes_received;
+        }
     }
-    
-    *bytes_read = offset;
-    return 0;
+
+    rtmp_log(RTMP_LOG_DEBUG, "Read chunk: fmt=%d, csid=%u, size=%u", 
+             fmt, csid, message->message_length);
+    return RTMP_OK;
 }
 
-static int write_chunk_header(RTMPChunkStream* cs, RTMPChunk* chunk, uint8_t* buffer, size_t len, size_t* bytes_written) {
-    size_t offset = 0;
-    
-    // Write basic header
-    if (chunk->csid < 64) {
-        if (len < 1) return -1;
-        buffer[offset++] = (chunk->fmt << 6) | chunk->csid;
-    } else if (chunk->csid < 320) {
-        if (len < 2) return -1;
-        buffer[offset++] = (chunk->fmt << 6);
-        buffer[offset++] = chunk->csid - 64;
-    } else {
-        if (len < 3) return -1;
-        buffer[offset++] = (chunk->fmt << 6) | 1;
-        buffer[offset++] = (chunk->csid - 64) & 0xFF;
-        buffer[offset++] = (chunk->csid - 64) >> 8;
+int rtmp_chunk_write(RTMPSession* session, RTMPMessage* message) {
+    if (!session || !message) {
+        return RTMP_ERROR_MEMORY;
     }
-    
-    // Write message header
-    switch (chunk->fmt) {
-        case 0:
-            if (len - offset < 11) return -1;
-            
-            write_uint24(buffer + offset, chunk->timestamp >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp);
-            write_uint24(buffer + offset + 3, chunk->length);
-            buffer[offset + 6] = chunk->type;
-            write_uint32(buffer + offset + 7, chunk->stream_id);
-            offset += 11;
-            
-            if (chunk->timestamp >= 0xFFFFFF) {
-                if (len - offset < 4) return -1;
-                write_uint32(buffer + offset, chunk->timestamp);
-                offset += 4;
-            }
-            break;
-            
-        case 1:
-            if (len - offset < 7) return -1;
-            
-            write_uint24(buffer + offset, chunk->timestamp_delta >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp_delta);
-            write_uint24(buffer + offset + 3, chunk->length);
-            buffer[offset + 6] = chunk->type;
-            offset += 7;
-            
-            if (chunk->timestamp_delta >= 0xFFFFFF) {
-                if (len - offset < 4) return -1;
-                write_uint32(buffer + offset, chunk->timestamp_delta);
-                offset += 4;
-            }
-            break;
-            
-        case 2:
-            if (len - offset < 3) return -1;
-            
-            write_uint24(buffer + offset, chunk->timestamp_delta >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp_delta);
-            offset += 3;
-            
-            if (chunk->timestamp_delta >= 0xFFFFFF) {
-                if (len - offset < 4) return -1;
-                write_uint32(buffer + offset, chunk->timestamp_delta);
-                offset += 4;
-            }
-            break;
-            
-        case 3:
-            if (chunk->extended_timestamp) {
-                if (len - offset < 4) return -1;
-                write_uint32(buffer + offset, chunk->timestamp_delta);
-                offset += 4;
-            }
-            break;
+
+    RTMPChunkStream* cs = session->chunk_stream;
+    uint8_t header[12] = {0};
+    size_t header_size = 0;
+
+    // Monta o cabeçalho básico
+    header[0] = (RTMP_CHUNK_TYPE_0 << 6);
+    header_size++;
+
+    // Monta o cabeçalho da mensagem
+    uint32_t timestamp = message->timestamp;
+    memcpy(header + header_size, &timestamp, 3);
+    header_size += 3;
+
+    memcpy(header + header_size, &message->message_length, 3);
+    header_size += 3;
+
+    header[header_size++] = message->message_type_id;
+    memcpy(header + header_size, &message->stream_id, 4);
+    header_size += 4;
+
+    // Envia o cabeçalho
+    if (send(session->socket_fd, header, header_size, 0) != header_size) {
+        return RTMP_ERROR_SOCKET;
     }
-    
-    *bytes_written = offset;
-    return 0;
+
+    // Envia o payload em chunks
+    size_t bytes_sent = 0;
+    while (bytes_sent < message->message_length) {
+        size_t chunk_size = message->message_length - bytes_sent;
+        if (chunk_size > cs->chunk_size) {
+            chunk_size = cs->chunk_size;
+        }
+
+        if (send(session->socket_fd, message->payload + bytes_sent, chunk_size, 0) != chunk_size) {
+            return RTMP_ERROR_SOCKET;
+        }
+
+        bytes_sent += chunk_size;
+    }
+
+    rtmp_log(RTMP_LOG_DEBUG, "Wrote chunk: size=%u, type=%u", 
+             message->message_length, message->message_type_id);
+    return RTMP_OK;
 }
 
-int rtmp_chunk_write(RTMPChunkStream* cs, RTMPChunk* chunk, uint8_t* buffer, size_t len, size_t* bytes_written) {
-    if (!cs || !chunk || !buffer || !len || !bytes_written) return -1;
+void rtmp_chunk_set_size(RTMPChunkStream* cs, uint32_t size) {
+    if (!cs) return;
     
-    *bytes_written = 0;
-    size_t offset = 0;
-    size_t header_bytes = 0;
-    
-    // Write chunk header
-    if (write_chunk_header(cs, chunk, buffer, len, &header_bytes) < 0) {
-        LOG_ERROR("Failed to write chunk header");
-        return -1;
+    if (size < RTMP_CHUNK_SIZE_MIN) {
+        size = RTMP_CHUNK_SIZE_MIN;
+    } else if (size > RTMP_CHUNK_SIZE_MAX) {
+        size = RTMP_CHUNK_SIZE_MAX;
     }
-    offset += header_bytes;
-    
-    // Write chunk data
-    size_t data_size = chunk->length - chunk->bytes_read;
-    if (data_size > cs->out_chunk_size) {
-        data_size = cs->out_chunk_size;
-    }
-    if (data_size > len - offset) {
-        data_size = len - offset;
-    }
-    
-    memcpy(buffer + offset, chunk->data + chunk->bytes_read, data_size);
-    chunk->bytes_read += data_size;
-    offset += data_size;
-    
-    cs->bytes_out += offset;
-    *bytes_written = offset;
-    
-    LOG_DEBUG("Wrote chunk: csid=%u, type=%u, len=%u, bytes=%zu", 
-             chunk->csid, chunk->type, chunk->length, offset);
-             
-    return 0;
-}
-
-int rtmp_chunk_update_size(RTMPChunkStream* cs, uint32_t size) {
-    if (!cs) return -1;
     
     cs->chunk_size = size;
-    cs->in_chunk_size = size;
-    cs->out_chunk_size = size;
-    
-    LOG_INFO("Chunk size updated to %u", size);
-    return 0;
+    rtmp_log(RTMP_LOG_DEBUG, "Set chunk size to %u", size);
 }
 
-int rtmp_chunk_acknowledge(RTMPChunkStream* cs, uint32_t size) {
-    if (!cs) return -1;
-    
-    cs->ack_window = size;
-    LOG_DEBUG("Acknowledgement window updated to %u", size);
-    return 0;
-}
-
-void rtmp_chunk_reset_stream(RTMPChunkStream* cs, uint32_t csid) {
-    if (!cs || csid >= RTMP_MAX_CHUNK_STREAMS) return;
-    
-    if (cs->chunks[csid]) {
-        rtmp_chunk_destroy(cs->chunks[csid]);
-        cs->chunks[csid] = NULL;
-        LOG_DEBUG("Reset chunk stream: csid=%u", csid);
-    }
-}
-
-int rtmp_chunk_process(RTMPChunkStream* cs, RTMPChunk* chunk) {
-    if (!cs || !chunk) return -1;
-
-    if (chunk->type == RTMP_MSG_CHUNK_SIZE) {
-        if (chunk->length >= 4) {
-            uint32_t new_size = read_uint32(chunk->data);
-            rtmp_chunk_update_size(cs, new_size);
-        }
-    }
-    else if (chunk->type == RTMP_MSG_WINDOW_ACK) {
-        if (chunk->length >= 4) {
-            uint32_t ack_size = read_uint32(chunk->data);
-            rtmp_chunk_acknowledge(cs, ack_size);
-        }
-    }
-
-    return 0;
+void rtmp_chunk_update_window(RTMPChunkStream* cs, uint32_t size) {
+    if (!cs) return;
+    cs->window_size = size;
+    rtmp_log(RTMP_LOG_DEBUG, "Updated window size to %u", size);
 }

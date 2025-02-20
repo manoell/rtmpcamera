@@ -1,351 +1,200 @@
+// rtmp_session.c
 #include "rtmp_session.h"
-#include "rtmp_log.h"
-#include "rtmp_preview.h"
 #include "rtmp_amf.h"
-#include "rtmp_chunk.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
+#include <unistd.h>
+#include <sys/time.h>
 
-struct RTMPSession {
-    uint32_t id;
-    int socket;
-    uint8_t state;
-    char app[128];
-    char stream_key[128];
-    uint32_t stream_id;
-    uint32_t chunk_size;
-    uint32_t window_ack_size;
-    uint32_t bytes_received;
-    void* user_data;
+static uint64_t get_current_time() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
-    RTMPChunkStream* chunk_stream;
-    RTMPStream* stream;
-};
-
-static uint32_t next_session_id = 1;
-
-RTMPSession* rtmp_session_create(void) {
+RTMPSession* rtmp_session_create(int socket_fd, struct RTMPServer* server) {
     RTMPSession* session = calloc(1, sizeof(RTMPSession));
     if (!session) {
-        LOG_ERROR("Failed to allocate session");
+        rtmp_log(RTMP_LOG_ERROR, "Failed to allocate session");
         return NULL;
     }
-    
-    session->id = next_session_id++;
-    session->state = RTMP_STATE_INIT;
-    session->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    session->window_ack_size = 2500000;
+
+    session->socket_fd = socket_fd;
+    session->state = RTMP_SESSION_CREATED;
+    session->server = server;
+    session->is_running = false;
     
     session->chunk_stream = rtmp_chunk_stream_create();
     if (!session->chunk_stream) {
-        LOG_ERROR("Failed to create chunk stream");
         free(session);
+        rtmp_log(RTMP_LOG_ERROR, "Failed to create chunk stream");
         return NULL;
     }
-    
-    LOG_INFO("Created new RTMP session %u", session->id);
+
+    pthread_mutex_init(&session->mutex, NULL);
+
+    rtmp_log(RTMP_LOG_INFO, "Created new RTMP session (fd: %d)", socket_fd);
     return session;
 }
 
 void rtmp_session_destroy(RTMPSession* session) {
     if (!session) return;
-    
-    LOG_INFO("Destroying RTMP session %u", session->id);
-    
-    if (session->stream) {
-        rtmp_stream_destroy(session->stream);
-    }
+
+    rtmp_session_stop(session);
     
     if (session->chunk_stream) {
         rtmp_chunk_stream_destroy(session->chunk_stream);
     }
     
-    if (session->socket >= 0) {
-        close(session->socket);
-    }
+    pthread_mutex_destroy(&session->mutex);
     
+    close(session->socket_fd);
     free(session);
+    
+    rtmp_log(RTMP_LOG_INFO, "Destroyed RTMP session");
 }
 
-static int send_chunk(RTMPSession* session, uint8_t type, const uint8_t* data, size_t len) {
-    if (!session || !data || !len) return -1;
+static void* session_thread(void* arg) {
+    RTMPSession* session = (RTMPSession*)arg;
     
-    uint8_t buffer[4096];
-    size_t bytes_written;
-    
-    RTMPChunk chunk = {0};
-    chunk.type = type;
-    chunk.data = (uint8_t*)data;
-    chunk.length = len;
-    
-    if (rtmp_chunk_write(session->chunk_stream, &chunk, buffer, sizeof(buffer), &bytes_written) < 0) {
-        LOG_ERROR("Failed to write chunk");
-        return -1;
+    // Realiza handshake
+    if (rtmp_handshake_perform(session) != RTMP_OK) {
+        rtmp_log(RTMP_LOG_ERROR, "Handshake failed");
+        session->state = RTMP_SESSION_ERROR;
+        return NULL;
     }
     
-    if (send(session->socket, buffer, bytes_written, 0) < 0) {
-        LOG_ERROR("Failed to send chunk");
-        return -1;
-    }
-    
-    return 0;
-}
+    session->state = RTMP_SESSION_HANDSHAKE;
+    rtmp_log(RTMP_LOG_INFO, "Session handshake completed");
 
-static int handle_connect(RTMPSession* session, AMFObject* obj) {
-    if (!session || !obj) return -1;
-    
-    // Extrair app name
-    AMFObject* props = obj->next;
-    if (props && props->value->type == AMF0_OBJECT) {
-        AMFObject* app_prop = props->value->data.object;
-        while (app_prop) {
-            if (strcmp(app_prop->name, "app") == 0 && 
-                app_prop->value->type == AMF0_STRING) {
-                strncpy(session->app, app_prop->value->data.string, sizeof(session->app)-1);
-                break;
-            }
-            app_prop = app_prop->next;
+    // Loop principal de processamento
+    while (session->is_running) {
+        if (rtmp_session_process(session) != RTMP_OK) {
+            break;
         }
     }
-    
-    LOG_INFO("Session %u connect: app=%s", session->id, session->app);
-    
-    // Enviar Window Acknowledgement Size
-    uint8_t ack_size[4];
-    write_uint32(ack_size, session->window_ack_size);
-    if (send_chunk(session, RTMP_MSG_WINDOW_ACK, ack_size, 4) < 0) {
-        return -1;
-    }
-    
-    // Enviar Set Peer Bandwidth
-    uint8_t bw_size[5];
-    write_uint32(bw_size, session->window_ack_size);
-    bw_size[4] = 2; // Dynamic
-    if (send_chunk(session, RTMP_MSG_SET_PEER_BW, bw_size, 5) < 0) {
-        return -1;
-    }
-    
-    // Enviar Stream Begin
-    uint8_t stream_begin[6];
-    write_uint16(stream_begin, RTMP_EVENT_STREAM_BEGIN);
-    write_uint32(stream_begin + 2, 0);
-    if (send_chunk(session, RTMP_MSG_USER_CONTROL, stream_begin, 6) < 0) {
-        return -1;
-    }
-    
-    // Enviar resultado do connect
-    uint8_t response[384];
-    size_t response_len;
-    if (amf_encode_connect_response(response, sizeof(response), &response_len) < 0) {
-        return -1;
-    }
-    
-    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
-        return -1;
-    }
-    
-    session->state = RTMP_STATE_CONNECTED;
-    return 0;
+
+    session->state = RTMP_SESSION_CLOSED;
+    return NULL;
 }
 
-static int handle_createStream(RTMPSession* session, AMFObject* obj) {
-    if (!session) return -1;
+int rtmp_session_start(RTMPSession* session) {
+    if (!session) return RTMP_ERROR_MEMORY;
     
-    session->stream_id = 1;
-    LOG_INFO("Session %u created stream: %u", session->id, session->stream_id);
+    session->is_running = true;
+    session->stream_info.start_time = get_current_time();
     
-    // Enviar resposta
-    uint8_t response[256];
-    size_t response_len;
-    if (amf_encode_create_stream_response(response, sizeof(response), 
-                                        3.0, session->stream_id, 
-                                        &response_len) < 0) {
-        return -1;
+    // Cria thread dedicada para a sessão
+    if (pthread_create(&session->thread, NULL, session_thread, session) != 0) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to create session thread");
+        return RTMP_ERROR_MEMORY;
     }
-    
-    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
-        return -1;
-    }
-    
-    session->state = RTMP_STATE_READY;
-    return 0;
+
+    rtmp_log(RTMP_LOG_INFO, "Started RTMP session");
+    return RTMP_OK;
 }
 
-static int handle_publish(RTMPSession* session, AMFObject* obj) {
-    if (!session) return -1;
+void rtmp_session_stop(RTMPSession* session) {
+    if (!session || !session->is_running) return;
+
+    session->is_running = false;
+    pthread_join(session->thread, NULL);
     
-    // Extrair stream name
-    AMFObject* stream_name = obj->next;
-    if (stream_name && stream_name->value->type == AMF0_STRING) {
-        strncpy(session->stream_key, stream_name->value->data.string,
-                sizeof(session->stream_key)-1);
-    }
-    
-    LOG_INFO("Session %u publish: %s/%s", session->id, session->app, session->stream_key);
-    
-    // Criar stream se necessário
-    if (!session->stream) {
-        session->stream = rtmp_stream_create();
-        if (!session->stream) {
-            return -1;
-        }
-    }
-    
-    // Iniciar stream
-    rtmp_stream_start(session->stream, session->stream_key);
-    
-    // Mostrar preview
-    rtmp_preview_show();
-    
-    // Enviar resposta
-    uint8_t response[384];
-    size_t response_len;
-    if (amf_encode_publish_response(response, sizeof(response), 
-                                  session->stream_key,
-                                  &response_len) < 0) {
-        return -1;
-    }
-    
-    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
-        return -1;
-    }
-    
-    session->state = RTMP_STATE_PUBLISHING;
-    return 0;
+    rtmp_log(RTMP_LOG_INFO, "Stopped RTMP session");
 }
 
-static int handle_play(RTMPSession* session, AMFObject* obj) {
-    if (!session) return -1;
-    
-    // Extrair stream name
-    AMFObject* stream_name = obj->next;
-    if (stream_name && stream_name->value->type == AMF0_STRING) {
-        strncpy(session->stream_key, stream_name->value->data.string,
-                sizeof(session->stream_key)-1);
+int rtmp_session_process(RTMPSession* session) {
+    if (!session) return RTMP_ERROR_MEMORY;
+
+    RTMPMessage message;
+    memset(&message, 0, sizeof(message));
+
+    int ret = rtmp_chunk_read(session->chunk_stream, &message);
+    if (ret != RTMP_OK) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to read chunk");
+        return ret;
     }
+
+    // Processa a mensagem
+    rtmp_session_handle_message(session, &message);
     
-    LOG_INFO("Session %u play: %s/%s", session->id, session->app, session->stream_key);
-    
-    // Enviar User Control - Stream Begin
-    uint8_t stream_begin[6];
-    write_uint16(stream_begin, RTMP_EVENT_STREAM_BEGIN);
-    write_uint32(stream_begin + 2, session->stream_id);
-    if (send_chunk(session, RTMP_MSG_USER_CONTROL, stream_begin, 6) < 0) {
-        return -1;
+    // Libera recursos da mensagem
+    if (message.payload) {
+        free(message.payload);
     }
-    
-    // Enviar resposta
-    uint8_t response[384];
-    size_t response_len;
-    if (amf_encode_play_response(response, sizeof(response), 
-                                session->stream_key,
-                                &response_len) < 0) {
-        return -1;
-    }
-    
-    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
-        return -1;
-    }
-    
-    session->state = RTMP_STATE_PLAYING;
-    return 0;
+
+    return RTMP_OK;
 }
 
-int rtmp_session_process_chunk(RTMPSession* session, RTMPChunk* chunk) {
-    if (!session || !chunk) return -1;
-    
-    switch (chunk->type) {
-        case RTMP_MSG_CHUNK_SIZE:
-            if (chunk->length >= 4) {
-                session->chunk_size = read_uint32(chunk->data);
-                rtmp_chunk_update_size(session->chunk_stream, session->chunk_size);
-                LOG_DEBUG("Session %u: chunk size updated to %u", 
-                         session->id, session->chunk_size);
-            }
-            break;
-            
-        case RTMP_MSG_WINDOW_ACK:
-            if (chunk->length >= 4) {
-                session->window_ack_size = read_uint32(chunk->data);
-                LOG_DEBUG("Session %u: window ack size updated to %u",
-                         session->id, session->window_ack_size);
-            }
-            break;
-            
-        case RTMP_MSG_COMMAND_AMF0:
-            {
-                size_t bytes_read;
-                AMFValue* command = amf_decode(chunk->data, chunk->length, &bytes_read);
-                if (!command || command->type != AMF0_STRING) {
-                    if (command) amf_value_free(command);
-                    return -1;
-                }
-                
-                const char* cmd_name = command->data.string;
-                AMFObject* obj = amf_decode_object(chunk->data + bytes_read,
-                                                 chunk->length - bytes_read,
-                                                 &bytes_read);
-                
-                if (strcmp(cmd_name, RTMP_CMD_CONNECT) == 0) {
-                    handle_connect(session, obj);
-                }
-                else if (strcmp(cmd_name, RTMP_CMD_CREATE_STREAM) == 0) {
-                    handle_createStream(session, obj);
-                }
-                else if (strcmp(cmd_name, RTMP_CMD_PUBLISH) == 0) {
-                    handle_publish(session, obj);
-                }
-                else if (strcmp(cmd_name, RTMP_CMD_PLAY) == 0) {
-                    handle_play(session, obj);
-                }
-                else {
-                    LOG_DEBUG("Session %u: unhandled command: %s",
-                             session->id, cmd_name);
-                }
-                
-                amf_value_free(command);
-                if (obj) amf_object_free(obj);
-            }
-            break;
-            
+void rtmp_session_handle_message(RTMPSession* session, RTMPMessage* message) {
+    if (!session || !message) return;
+
+    pthread_mutex_lock(&session->mutex);
+
+    switch (message->message_type_id) {
         case RTMP_MSG_VIDEO:
-            if (session->stream) {
-                rtmp_stream_process_video(session->stream, chunk->data,
-                                        chunk->length, chunk->timestamp);
-            }
+            session->stream_info.total_frames++;
+            rtmp_session_update_stream_info(session, message);
             break;
+
+        case RTMP_MSG_COMMAND_AMF0:
+            // Processa comandos AMF0
+            RTMPBuffer buffer = {
+                .data = message->payload,
+                .size = message->message_length,
+                .position = 0
+            };
             
-        case RTMP_MSG_AUDIO:
-            if (session->stream) {
-                rtmp_stream_process_audio(session->stream, chunk->data,
-                                        chunk->length, chunk->timestamp);
+            char* command_name;
+            uint16_t name_len;
+            if (rtmp_amf0_read_string(&buffer, &command_name, &name_len) == RTMP_OK) {
+                rtmp_log(RTMP_LOG_DEBUG, "Received command: %s", command_name);
+                free(command_name);
             }
-            break;
-            
-        default:
-            LOG_DEBUG("Session %u: unhandled message type: %d",
-                     session->id, chunk->type);
             break;
     }
-    
-    return 0;
+
+    pthread_mutex_unlock(&session->mutex);
 }
 
-int rtmp_session_send_chunk(RTMPSession* session, RTMPChunk* chunk) {
-    if (!session || !chunk) return -1;
+void rtmp_session_update_stream_info(RTMPSession* session, RTMPMessage* message) {
+    if (!session || !message) return;
+
+    uint64_t current_time = get_current_time();
     
-    uint8_t buffer[4096];
-    size_t bytes_written;
-    
-    if (rtmp_chunk_write(session->chunk_stream, chunk, buffer,
-                        sizeof(buffer), &bytes_written) < 0) {
-        return -1;
+    // Calcula FPS atual
+    if (current_time > session->stream_info.start_time) {
+        double elapsed_seconds = (current_time - session->stream_info.start_time) / 1000.0;
+        session->stream_info.fps = session->stream_info.total_frames / elapsed_seconds;
     }
-    
-    if (send(session->socket, buffer, bytes_written, 0) < 0) {
-        return -1;
+
+    // Calcula latência de rede
+    session->stream_info.network_latency = 
+        (float)(current_time - message->timestamp);
+
+    // Log periódico das estatísticas (a cada 5 segundos)
+    static uint64_t last_log = 0;
+    if (current_time - last_log > 5000) {
+        rtmp_session_log_stats(session);
+        last_log = current_time;
     }
-    
-    return 0;
+}
+
+void rtmp_session_log_stats(RTMPSession* session) {
+    if (!session) return;
+
+    rtmp_log(RTMP_LOG_INFO, "Stream Statistics:");
+    rtmp_log(RTMP_LOG_INFO, "  Resolution: %dx%d", 
+             session->stream_info.width, 
+             session->stream_info.height);
+    rtmp_log(RTMP_LOG_INFO, "  FPS: %.2f", 
+             session->stream_info.fps);
+    rtmp_log(RTMP_LOG_INFO, "  Video Bitrate: %d kbps", 
+             session->stream_info.video_bitrate / 1000);
+    rtmp_log(RTMP_LOG_INFO, "  Audio Bitrate: %d kbps", 
+             session->stream_info.audio_bitrate / 1000);
+    rtmp_log(RTMP_LOG_INFO, "  Network Latency: %.2f ms", 
+             session->stream_info.network_latency);
+    rtmp_log(RTMP_LOG_INFO, "  Total Frames: %u", 
+             session->stream_info.total_frames);
 }

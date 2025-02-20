@@ -1,43 +1,27 @@
+// rtmp_preview.h
 #ifndef RTMP_PREVIEW_H
 #define RTMP_PREVIEW_H
 
-#ifdef __OBJC__
-#import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import "rtmp_core.h"
 
-@interface RTMPPreviewView : UIView {
-    AVSampleBufferDisplayLayer* _previewLayer;
-    UIPanGestureRecognizer* _panGesture;
-    CGPoint _initialPosition;
-    BOOL _isVisible;
-}
+@interface RTMPPreviewView : UIView
 
-@property (nonatomic, readonly) AVSampleBufferDisplayLayer* previewLayer;
-@property (nonatomic, assign, getter=isVisible) BOOL visible;
+// Configuração
+- (void)setupPreviewWithSize:(CGSize)size;
+- (void)startPreview;
+- (void)stopPreview;
 
-+ (instancetype)sharedInstance;
-- (void)showPreview;
-- (void)hidePreview;
-- (void)processVideoData:(uint8_t *)data length:(size_t)length timestamp:(uint32_t)timestamp;
-- (void)processAudioData:(uint8_t *)data length:(size_t)length timestamp:(uint32_t)timestamp;
-- (void)displayDecodedFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp;
+// Controle de display
+- (void)displayVideoFrame:(CMSampleBufferRef)sampleBuffer;
+- (void)handlePan:(UIPanGestureRecognizer *)gesture;
+
+// Status do preview
+@property (nonatomic, readonly) BOOL isPreviewRunning;
+@property (nonatomic, readonly) CGSize streamSize;
+@property (nonatomic, assign) float streamFPS;
 
 @end
+
 #endif
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void rtmp_preview_init(void);
-void rtmp_preview_show(void);
-void rtmp_preview_hide(void);
-void rtmp_preview_process_video(const uint8_t* data, size_t length, uint32_t timestamp);
-void rtmp_preview_process_audio(const uint8_t* data, size_t length, uint32_t timestamp);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // RTMP_PREVIEW_H

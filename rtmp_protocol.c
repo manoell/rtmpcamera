@@ -1,148 +1,147 @@
+// rtmp_protocol.c
 #include "rtmp_protocol.h"
-#include "rtmp_log.h"
-#include "rtmp_amf.h"
+#include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
+#include <sys/time.h>
 
-static void write_uint16(uint8_t* buffer, uint16_t value) {
-    buffer[0] = (value >> 8) & 0xFF;
-    buffer[1] = value & 0xFF;
+#define RTMP_HANDSHAKE_SIZE 1536
+#define RTMP_VERSION 3
+
+static uint32_t get_timestamp() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 }
 
-static void write_uint32(uint8_t* buffer, uint32_t value) {
-    buffer[0] = (value >> 24) & 0xFF;
-    buffer[1] = (value >> 16) & 0xFF;
-    buffer[2] = (value >> 8) & 0xFF;
-    buffer[3] = value & 0xFF;
-}
-
-static uint16_t read_uint16(const uint8_t* data) {
-    return (data[0] << 8) | data[1];
-}
-
-static uint32_t read_uint32(const uint8_t* data) {
-    return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
-}
-
-int rtmp_create_set_chunk_size(uint8_t* buffer, size_t len, uint32_t chunk_size) {
-    if (!buffer || len < 4) return -1;
+int rtmp_handshake_perform(RTMPSession* session) {
+    uint8_t c0c1[RTMP_HANDSHAKE_SIZE + 1];
+    uint8_t s0s1s2[RTMP_HANDSHAKE_SIZE * 2 + 1];
     
-    write_uint32(buffer, chunk_size);
-    return 4;
-}
+    rtmp_log(RTMP_LOG_DEBUG, "Starting RTMP handshake");
 
-int rtmp_create_window_ack_size(uint8_t* buffer, size_t len, uint32_t window_size) {
-    if (!buffer || len < 4) return -1;
-    
-    write_uint32(buffer, window_size);
-    return 4;
-}
-
-int rtmp_create_set_peer_bandwidth(uint8_t* buffer, size_t len, uint32_t window_size, uint8_t limit_type) {
-    if (!buffer || len < 5) return -1;
-    
-    write_uint32(buffer, window_size);
-    buffer[4] = limit_type;
-    return 5;
-}
-
-int rtmp_create_user_control(uint8_t* buffer, size_t len, uint16_t event_type, uint32_t event_data) {
-    if (!buffer || len < 6) return -1;
-    
-    write_uint16(buffer, event_type);
-    write_uint32(buffer + 2, event_data);
-    return 6;
-}
-
-int rtmp_process_chunk_size(const uint8_t* data, size_t len, uint32_t* chunk_size) {
-    if (!data || !chunk_size || len < 4) return -1;
-    
-    *chunk_size = read_uint32(data);
-    if (*chunk_size < 1 || *chunk_size > 16777215) return -1;
-    
-    return 0;
-}
-
-int rtmp_process_window_ack_size(const uint8_t* data, size_t len, uint32_t* window_size) {
-    if (!data || !window_size || len < 4) return -1;
-    
-    *window_size = read_uint32(data);
-    return 0;
-}
-
-int rtmp_process_set_peer_bandwidth(const uint8_t* data, size_t len, uint32_t* window_size, uint8_t* limit_type) {
-    if (!data || !window_size || !limit_type || len < 5) return -1;
-    
-    *window_size = read_uint32(data);
-    *limit_type = data[4];
-    return 0;
-}
-
-int rtmp_process_user_control(const uint8_t* data, size_t len, uint16_t* event_type, uint32_t* event_data) {
-    if (!data || !event_type || !event_data || len < 6) return -1;
-    
-    *event_type = read_uint16(data);
-    *event_data = read_uint32(data + 2);
-    return 0;
-}
-
-int rtmp_create_command(uint8_t* buffer, size_t len, const char* command_name, double transaction_id, ...) {
-    if (!buffer || !command_name || len < 3) return -1;
-    
-    size_t offset = 0;
-    size_t bytes_written;
-    
-    // Codificar nome do comando
-    if (amf_encode_string(buffer + offset, len - offset, command_name, &bytes_written) < 0) {
-        return -1;
+    // Recebe C0 e C1
+    if (recv(session->socket_fd, c0c1, RTMP_HANDSHAKE_SIZE + 1, 0) != RTMP_HANDSHAKE_SIZE + 1) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to receive C0C1");
+        return RTMP_ERROR_HANDSHAKE;
     }
-    offset += bytes_written;
-    
-    // Codificar transaction ID
-    if (amf_encode_number(buffer + offset, len - offset, transaction_id, &bytes_written) < 0) {
-        return -1;
+
+    // Verifica versão
+    if (c0c1[0] != RTMP_VERSION) {
+        rtmp_log(RTMP_LOG_ERROR, "Unsupported RTMP version: %d", c0c1[0]);
+        return RTMP_ERROR_HANDSHAKE;
     }
-    offset += bytes_written;
+
+    // Prepara S0, S1 e S2
+    s0s1s2[0] = RTMP_VERSION;  // S0
     
-    // Codificar command object (null por padrão)
-    buffer[offset++] = AMF0_NULL;
-    
-    va_list args;
-    va_start(args, transaction_id);
-    
-    while (1) {
-        const char* type = va_arg(args, const char*);
-        if (!type) break;
-        
-        if (strcmp(type, "string") == 0) {
-            const char* str = va_arg(args, const char*);
-            if (amf_encode_string(buffer + offset, len - offset, str, &bytes_written) < 0) {
-                va_end(args);
-                return -1;
-            }
-            offset += bytes_written;
-        }
-        else if (strcmp(type, "number") == 0) {
-            double num = va_arg(args, double);
-            if (amf_encode_number(buffer + offset, len - offset, num, &bytes_written) < 0) {
-                va_end(args);
-                return -1;
-            }
-            offset += bytes_written;
-        }
-        else if (strcmp(type, "boolean") == 0) {
-            int boolean = va_arg(args, int);
-            if (amf_encode_boolean(buffer + offset, len - offset, boolean, &bytes_written) < 0) {
-                va_end(args);
-                return -1;
-            }
-            offset += bytes_written;
-        }
-        else if (strcmp(type, "null") == 0) {
-            buffer[offset++] = AMF0_NULL;
-        }
+    // S1: timestamp + zeros + random bytes
+    uint32_t timestamp = get_timestamp();
+    memcpy(s0s1s2 + 1, &timestamp, 4);
+    memset(s0s1s2 + 5, 0, 4);
+    for (int i = 9; i < RTMP_HANDSHAKE_SIZE + 1; i++) {
+        s0s1s2[i] = rand() % 256;
     }
     
-    va_end(args);
-    return offset;
+    // S2: copia C1
+    memcpy(s0s1s2 + RTMP_HANDSHAKE_SIZE + 1, c0c1 + 1, RTMP_HANDSHAKE_SIZE);
+
+    // Envia S0, S1 e S2
+    if (send(session->socket_fd, s0s1s2, RTMP_HANDSHAKE_SIZE * 2 + 1, 0) != RTMP_HANDSHAKE_SIZE * 2 + 1) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to send S0S1S2");
+        return RTMP_ERROR_HANDSHAKE;
+    }
+
+    // Recebe C2
+    uint8_t c2[RTMP_HANDSHAKE_SIZE];
+    if (recv(session->socket_fd, c2, RTMP_HANDSHAKE_SIZE, 0) != RTMP_HANDSHAKE_SIZE) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to receive C2");
+        return RTMP_ERROR_HANDSHAKE;
+    }
+
+    rtmp_log(RTMP_LOG_INFO, "RTMP handshake completed successfully");
+    return RTMP_OK;
+}
+
+int rtmp_protocol_parse_message(uint8_t* data, size_t len, RTMPMessage* message) {
+    if (!data || !message || len < 1) {
+        return RTMP_ERROR_MEMORY;
+    }
+
+    // Parse basic header
+    message->type = data[0] & 0x3F;
+    
+    // Parse message header
+    size_t offset = 1;
+    memcpy(&message->timestamp, data + offset, 4);
+    offset += 4;
+    memcpy(&message->message_length, data + offset, 3);
+    offset += 3;
+    message->message_type_id = data[offset++];
+    memcpy(&message->stream_id, data + offset, 4);
+    offset += 4;
+
+    // Copy payload
+    size_t payload_size = len - offset;
+    message->payload = malloc(payload_size);
+    if (!message->payload) {
+        return RTMP_ERROR_MEMORY;
+    }
+    memcpy(message->payload, data + offset, payload_size);
+
+    return RTMP_OK;
+}
+
+int rtmp_protocol_create_message(RTMPMessage* message, uint8_t* buffer, size_t* len) {
+    if (!message || !buffer || !len) {
+        return RTMP_ERROR_MEMORY;
+    }
+
+    size_t total_len = 12 + message->message_length; // Header + payload
+    if (*len < total_len) {
+        return RTMP_ERROR_MEMORY;
+    }
+
+    // Write header
+    buffer[0] = message->type;
+    memcpy(buffer + 1, &message->timestamp, 4);
+    memcpy(buffer + 5, &message->message_length, 3);
+    buffer[8] = message->message_type_id;
+    memcpy(buffer + 9, &message->stream_id, 4);
+
+    // Write payload
+    memcpy(buffer + 13, message->payload, message->message_length);
+    *len = total_len;
+
+    return RTMP_OK;
+}
+
+void rtmp_protocol_handle_message(RTMPSession* session, RTMPMessage* message) {
+    switch (message->message_type_id) {
+        case RTMP_MSG_VIDEO:
+            rtmp_log(RTMP_LOG_DEBUG, "Received video message (size: %u)", message->message_length);
+            // Log video stats for analysis
+            rtmp_log(RTMP_LOG_INFO, "Video Frame - Size: %u bytes, Timestamp: %u", 
+                     message->message_length, message->timestamp);
+            break;
+
+        case RTMP_MSG_AUDIO:
+            rtmp_log(RTMP_LOG_DEBUG, "Received audio message (size: %u)", message->message_length);
+            break;
+
+        case RTMP_MSG_DATA_AMF0:
+        case RTMP_MSG_DATA_AMF3:
+            rtmp_log(RTMP_LOG_DEBUG, "Received metadata message");
+            break;
+
+        default:
+            rtmp_log(RTMP_LOG_DEBUG, "Received message type: %d", message->message_type_id);
+            break;
+    }
+}
+
+void rtmp_message_free(RTMPMessage* message) {
+    if (message) {
+        free(message->payload);
+        message->payload = NULL;
+    }
 }
