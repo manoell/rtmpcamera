@@ -2,7 +2,7 @@ Package: com.example.rtmpcamera
 Name: RTMPCamera
 Version: 0.0.1
 Architecture: iphoneos-arm
-Description: RTMP Camera Tweak
+Description: RTMP Camera stream capture and preview
 Maintainer: Your Name
 Author: Your Name
 Section: Tweaks

@@ -1,12 +1,14 @@
 #include "rtmp_handshake.h"
 #include "rtmp_log.h"
+#include "rtmp_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
 
-#define RTMP_HANDSHAKE_TOTAL_SIZE (RTMP_HANDSHAKE_VERSION_SIZE + RTMP_HANDSHAKE_PACKET_SIZE)
+#define RTMP_HANDSHAKE_PKT_SIZE (1 + RTMP_HANDSHAKE_PACKET_SIZE)
+#define RTMP_HANDSHAKE_RAND_OFFSET 8
 
 static int read_exact(int socket, uint8_t* buffer, size_t size) {
     size_t total_read = 0;
@@ -39,37 +41,37 @@ static int write_exact(int socket, const uint8_t* buffer, size_t size) {
 }
 
 static void generate_handshake_data(uint8_t* data) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
+    // Zero o buffer
+    memset(data, 0, RTMP_HANDSHAKE_PACKET_SIZE);
     
-    // First 4 bytes are timestamp
-    uint32_t timestamp = tv.tv_sec;
-    data[0] = (timestamp >> 24) & 0xFF;
-    data[1] = (timestamp >> 16) & 0xFF;
-    data[2] = (timestamp >> 8) & 0xFF;
-    data[3] = timestamp & 0xFF;
+    // Timestamp
+    uint32_t timestamp = get_timestamp();
+    write_uint32(data, timestamp);
     
-    // Next 4 bytes are zeros for Flash player compatibility
-    memset(data + 4, 0, 4);
+    // Versão do Flash (zeros)
+    write_uint32(data + 4, 0);
     
-    // Remaining bytes are random
-    for (int i = 8; i < RTMP_HANDSHAKE_PACKET_SIZE; i++) {
-        data[i] = rand() & 0xFF;
+    // Random data
+    for (int i = RTMP_HANDSHAKE_RAND_OFFSET; i < RTMP_HANDSHAKE_PACKET_SIZE; i++) {
+        data[i] = rand() % 256;
     }
 }
 
 int rtmp_handshake_server(int socket) {
     uint8_t version;
+    uint8_t s0[1];
     uint8_t s1[RTMP_HANDSHAKE_PACKET_SIZE];
-    uint8_t c1[RTMP_HANDSHAKE_PACKET_SIZE];
     uint8_t s2[RTMP_HANDSHAKE_PACKET_SIZE];
+    uint8_t c1[RTMP_HANDSHAKE_PACKET_SIZE];
+    uint8_t c2[RTMP_HANDSHAKE_PACKET_SIZE];
     
-    // Read C0 (version)
+    // Ler C0 (versão)
     if (read_exact(socket, &version, 1) < 0) {
         LOG_ERROR("Failed to read C0");
         return -1;
     }
     
+    // Verificar versão
     if (version != RTMP_HANDSHAKE_VERSION_OLD) {
         LOG_ERROR("Unsupported RTMP version: %d", version);
         return -1;
@@ -77,15 +79,15 @@ int rtmp_handshake_server(int socket) {
     
     LOG_DEBUG("RTMP handshake version: %d", version);
     
-    // Read C1
+    // Ler C1
     if (read_exact(socket, c1, RTMP_HANDSHAKE_PACKET_SIZE) < 0) {
         LOG_ERROR("Failed to read C1");
         return -1;
     }
     
-    // Generate and send S0+S1
-    version = RTMP_HANDSHAKE_VERSION_OLD;
-    if (write_exact(socket, &version, 1) < 0) {
+    // Gerar e enviar S0+S1
+    s0[0] = RTMP_HANDSHAKE_VERSION_OLD;
+    if (write_exact(socket, s0, 1) < 0) {
         LOG_ERROR("Failed to write S0");
         return -1;
     }
@@ -96,23 +98,22 @@ int rtmp_handshake_server(int socket) {
         return -1;
     }
     
-    // Generate and send S2 (echo of C1)
+    // Gerar e enviar S2 (eco de C1)
     memcpy(s2, c1, RTMP_HANDSHAKE_PACKET_SIZE);
     if (write_exact(socket, s2, RTMP_HANDSHAKE_PACKET_SIZE) < 0) {
         LOG_ERROR("Failed to write S2");
         return -1;
     }
     
-    // Read C2
-    uint8_t c2[RTMP_HANDSHAKE_PACKET_SIZE];
+    // Ler C2
     if (read_exact(socket, c2, RTMP_HANDSHAKE_PACKET_SIZE) < 0) {
         LOG_ERROR("Failed to read C2");
         return -1;
     }
     
-    // Verify C2 matches S1
+    // Verificar C2 corresponde a S1
     if (memcmp(c2, s1, RTMP_HANDSHAKE_PACKET_SIZE) != 0) {
-        LOG_WARNING("C2 does not match S1, but continuing anyway");
+        LOG_WARNING("C2 does not match S1 - continuing anyway");
     }
     
     LOG_INFO("RTMP handshake completed successfully");
@@ -120,7 +121,8 @@ int rtmp_handshake_server(int socket) {
 }
 
 int rtmp_handshake_client(int socket) {
-    // Cliente não implementado pois não é necessário para o servidor
+    // Não é necessário para o servidor
+    (void)socket;
     return -1;
 }
 
@@ -130,16 +132,15 @@ int rtmp_handshake_verify(const uint8_t* data, size_t len) {
     }
     
     // Verificar timestamp
-    uint32_t timestamp = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+    uint32_t timestamp = read_uint32(data);
     if (timestamp == 0) {
         return -1;
     }
     
-    // Verificar zeros
-    for (int i = 4; i < 8; i++) {
-        if (data[i] != 0) {
-            return -1;
-        }
+    // Verificar zeros da versão do Flash
+    uint32_t flash_version = read_uint32(data + 4);
+    if (flash_version != 0) {
+        return -1;
     }
     
     return 0;

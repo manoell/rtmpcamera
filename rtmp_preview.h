@@ -6,10 +6,15 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 
-@interface RTMPPreviewView : UIView
+@interface RTMPPreviewView : UIView {
+    AVSampleBufferDisplayLayer* _previewLayer;
+    UIPanGestureRecognizer* _panGesture;
+    CGPoint _initialPosition;
+    BOOL _isVisible;
+}
 
-@property (nonatomic, strong) AVSampleBufferDisplayLayer *previewLayer;
-@property (nonatomic, assign) BOOL isVisible;
+@property (nonatomic, readonly) AVSampleBufferDisplayLayer* previewLayer;
+@property (nonatomic, assign, getter=isVisible) BOOL visible;
 
 + (instancetype)sharedInstance;
 - (void)showPreview;
@@ -21,7 +26,6 @@
 @end
 #endif
 
-// C interface for the preview system
 #ifdef __cplusplus
 extern "C" {
 #endif

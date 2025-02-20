@@ -1,41 +1,32 @@
 #import "rtmp_preview.h"
 #import "rtmp_log.h"
+#import "rtmp_util.h"
 #import <VideoToolbox/VideoToolbox.h>
 
-static const float PREVIEW_WIDTH = 180.0f;
-static const float PREVIEW_HEIGHT = 320.0f;
-
-static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
-                                             void *sourceFrameRefCon,
-                                             OSStatus status,
-                                             VTDecodeInfoFlags infoFlags,
-                                             CVImageBufferRef imageBuffer,
-                                             CMTime presentationTimeStamp,
-                                             CMTime presentationDuration) {
-    if (status != noErr) {
-        LOG_ERROR("Decompression error: %d", (int)status);
-        return;
-    }
-    
-    RTMPPreviewView *preview = (__bridge RTMPPreviewView *)decompressionOutputRefCon;
-    [preview displayDecodedFrame:imageBuffer withTimestamp:presentationTimeStamp];
-}
+#define PREVIEW_WIDTH 180.0f
+#define PREVIEW_HEIGHT 320.0f
 
 @interface RTMPPreviewView () {
     VTDecompressionSessionRef _decompressionSession;
     CMVideoFormatDescriptionRef _videoFormat;
-    dispatch_queue_t _decompressionQueue;
-    NSMutableArray *_audioQueue;
+    dispatch_queue_t _videoQueue;
+    dispatch_queue_t _audioQueue;
     
-    uint8_t *_sps;
+    uint8_t* _sps;
     size_t _spsSize;
-    uint8_t *_pps;
+    uint8_t* _pps;
     size_t _ppsSize;
     BOOL _hasVideoFormat;
+    
+    float _lastVolume;
+    BOOL _muted;
 }
 
 @property (nonatomic, strong) UIPanGestureRecognizer *panGesture;
+@property (nonatomic, strong) UITapGestureRecognizer *doubleTapGesture;
+@property (nonatomic, strong) UIPinchGestureRecognizer *pinchGesture;
 @property (nonatomic, assign) CGPoint initialPosition;
+@property (nonatomic, assign) CGFloat initialScale;
 
 @end
 
@@ -45,7 +36,12 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
     static RTMPPreviewView *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        instance = [[RTMPPreviewView alloc] initWithFrame:CGRectMake(20, 40, PREVIEW_WIDTH, PREVIEW_HEIGHT)];
+        CGRect screenBounds = [UIScreen mainScreen].bounds;
+        CGRect frame = CGRectMake(screenBounds.size.width - PREVIEW_WIDTH - 20,
+                                 40,
+                                 PREVIEW_WIDTH,
+                                 PREVIEW_HEIGHT);
+        instance = [[RTMPPreviewView alloc] initWithFrame:frame];
     });
     return instance;
 }
@@ -57,53 +53,86 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
         self.layer.cornerRadius = 10.0f;
         self.clipsToBounds = YES;
         
+        // Configurar layer de preview
         _previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
         _previewLayer.frame = self.bounds;
         _previewLayer.videoGravity = AVLayerVideoGravityResizeAspect;
         [self.layer addSublayer:_previewLayer];
         
-        _panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:_panGesture];
+        // Configurar gestos
+        [self setupGestures];
         
-        _decompressionQueue = dispatch_queue_create("com.rtmp.preview.decompress", DISPATCH_QUEUE_SERIAL);
-        _audioQueue = [NSMutableArray array];
+        // Configurar filas
+        _videoQueue = dispatch_queue_create("com.rtmp.preview.video", DISPATCH_QUEUE_SERIAL);
+        _audioQueue = dispatch_queue_create("com.rtmp.preview.audio", DISPATCH_QUEUE_SERIAL);
         
-        _hasVideoFormat = NO;
-        
+        // Estilo
         self.layer.shadowColor = [UIColor blackColor].CGColor;
         self.layer.shadowOffset = CGSizeMake(0, 2);
         self.layer.shadowRadius = 4.0;
         self.layer.shadowOpacity = 0.5;
+        
+        // Status inicial
+        _hasVideoFormat = NO;
+        _muted = NO;
+        _lastVolume = 1.0;
+        
+        LOG_INFO("Preview view initialized with frame: %.0f,%.0f,%.0f,%.0f",
+                 frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
     }
     return self;
 }
 
-- (void)displayDecodedFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
-    if (!imageBuffer) return;
+- (void)setupGestures {
+    // Pan gesture
+    _panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [self addGestureRecognizer:_panGesture];
     
-    CMSampleBufferRef sampleBuffer = NULL;
-    CMSampleTimingInfo timing = {CMTimeMake(1, 1000), timestamp, timestamp};
+    // Double tap gesture
+    _doubleTapGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
+    _doubleTapGesture.numberOfTapsRequired = 2;
+    [self addGestureRecognizer:_doubleTapGesture];
     
-    OSStatus status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
-                                                        imageBuffer,
-                                                        true,
-                                                        NULL,
-                                                        NULL,
-                                                        _videoFormat,
-                                                        &timing,
-                                                        &sampleBuffer);
+    // Pinch gesture
+    _pinchGesture = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
+    [self addGestureRecognizer:_pinchGesture];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    CGPoint translation = [gesture translationInView:self.superview];
     
-    if (status != noErr) {
-        LOG_ERROR("Failed to create sample buffer: %d", (int)status);
-        return;
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        _initialPosition = self.center;
     }
     
-    if (self.previewLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-        [self.previewLayer flush];
+    CGPoint newCenter = CGPointMake(_initialPosition.x + translation.x,
+                                   _initialPosition.y + translation.y);
+    
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    newCenter.x = MAX(self.frame.size.width/2,
+                     MIN(newCenter.x, bounds.size.width - self.frame.size.width/2));
+    newCenter.y = MAX(self.frame.size.height/2,
+                     MIN(newCenter.y, bounds.size.height - self.frame.size.height/2));
+    
+    self.center = newCenter;
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)gesture {
+    [UIView animateWithDuration:0.3 animations:^{
+        _muted = !_muted;
+        self.alpha = _muted ? 0.2 : 1.0;
+    }];
+}
+
+- (void)handlePinch:(UIPinchGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        _initialScale = self.transform.a;
     }
     
-    [self.previewLayer enqueueSampleBuffer:sampleBuffer];
-    CFRelease(sampleBuffer);
+    CGFloat scale = _initialScale * gesture.scale;
+    scale = MAX(0.5, MIN(scale, 2.0));
+    
+    self.transform = CGAffineTransformMakeScale(scale, scale);
 }
 
 - (void)setupDecompressionSessionWithSPS:(const uint8_t *)sps spsSize:(size_t)spsSize
@@ -118,89 +147,162 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
         _videoFormat = NULL;
     }
     
-    const uint8_t* const parameterSetPointers[2] = { sps, pps };
+    const uint8_t* parameterSetPointers[2] = { sps, pps };
     const size_t parameterSetSizes[2] = { spsSize, ppsSize };
     
-    OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault,
-                                                                         2,
-                                                                         parameterSetPointers,
-                                                                         parameterSetSizes,
-                                                                         4,
-                                                                         &_videoFormat);
+    OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        kCFAllocatorDefault,
+        2,
+        parameterSetPointers,
+        parameterSetSizes,
+        4,
+        &_videoFormat
+    );
     
     if (status != noErr) {
         LOG_ERROR("Failed to create video format description: %d", (int)status);
         return;
     }
     
-    // Setup decompression settings
-    CFDictionaryRef attrs = NULL;
-    const void *keys[] = { kCVPixelBufferPixelFormatTypeKey };
-    uint32_t v = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    const void *values[] = { CFNumberCreate(NULL, kCFNumberSInt32Type, &v) };
-    attrs = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+    // Setup decompression properties
+    VTDecompressionOutputCallbackRecord callback;
+    callback.decompressionOutputCallback = DecompressionSessionDecodeCallback;
+    callback.decompressionOutputRefCon = (__bridge void *)self;
     
-    VTDecompressionOutputCallbackRecord callbackRecord;
-    callbackRecord.decompressionOutputCallback = DecompressionSessionDecodeCallback;
-    callbackRecord.decompressionOutputRefCon = (__bridge void *)self;
+    NSDictionary* attributes = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
+    };
     
-    status = VTDecompressionSessionCreate(kCFAllocatorDefault,
-                                         _videoFormat,
-                                         NULL,
-                                         attrs,
-                                         &callbackRecord,
-                                         &_decompressionSession);
+    status = VTDecompressionSessionCreate(
+        kCFAllocatorDefault,
+        _videoFormat,
+        NULL,
+        (__bridge CFDictionaryRef)attributes,
+        &callback,
+        &_decompressionSession
+    );
     
     if (status != noErr) {
         LOG_ERROR("Failed to create decompression session: %d", (int)status);
-        CFRelease(attrs);
         return;
     }
     
-    CFRelease(attrs);
     _hasVideoFormat = YES;
+    LOG_INFO("Video decompression session created");
+}
+
+- (void)showPreview {
+    if (!_isVisible) {
+        _isVisible = YES;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindow *window = [[UIApplication sharedApplication] keyWindow];
+            if (window) {
+                [window addSubview:self];
+                LOG_INFO("Preview window added to keyWindow");
+            } else {
+                LOG_ERROR("Failed to get keyWindow");
+            }
+        });
+    }
+}
+
+- (void)hidePreview {
+    if (_isVisible) {
+        _isVisible = NO;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self removeFromSuperview];
+            LOG_INFO("Preview window removed");
+        });
+    }
+}
+
+- (void)displayDecodedFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
+    if (!imageBuffer) return;
+    
+    @try {
+        CMSampleBufferRef sampleBuffer = NULL;
+        CMSampleTimingInfo timing = {CMTimeMake(1, 1000), timestamp, timestamp};
+        
+        OSStatus status = CMSampleBufferCreateForImageBuffer(
+            kCFAllocatorDefault,
+            imageBuffer,
+            true,
+            NULL,
+            NULL,
+            _videoFormat,
+            &timing,
+            &sampleBuffer
+        );
+        
+        if (status != noErr) {
+            LOG_ERROR("Failed to create sample buffer: %d", (int)status);
+            return;
+        }
+        
+        if (_previewLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            [_previewLayer flush];
+        }
+        
+        [_previewLayer enqueueSampleBuffer:sampleBuffer];
+        CFRelease(sampleBuffer);
+        
+    } @catch (NSException *exception) {
+        LOG_ERROR("Exception in displayDecodedFrame: %s", [exception.description UTF8String]);
+    }
 }
 
 - (void)processVideoData:(uint8_t *)data length:(size_t)length timestamp:(uint32_t)timestamp {
     if (!data || length == 0) return;
     
-    dispatch_async(_decompressionQueue, ^{
+    dispatch_async(_videoQueue, ^{
         // Parse NAL units
+        if (length < 4) return;
+        
         uint8_t naluType = data[4] & 0x1F;
         
+        // Process SPS/PPS
         if (naluType == 7) { // SPS
             free(_sps);
             _spsSize = length - 4;
             _sps = malloc(_spsSize);
-            memcpy(_sps, data + 4, _spsSize);
-            
-            if (_pps) {
-                [self setupDecompressionSessionWithSPS:_sps spsSize:_spsSize
-                                                 PPS:_pps ppsSize:_ppsSize];
+            if (_sps) {
+                memcpy(_sps, data + 4, _spsSize);
+                
+                if (_pps) {
+                    [self setupDecompressionSessionWithSPS:_sps spsSize:_spsSize
+                                                     PPS:_pps ppsSize:_ppsSize];
+                }
             }
         }
         else if (naluType == 8) { // PPS
             free(_pps);
             _ppsSize = length - 4;
             _pps = malloc(_ppsSize);
-            memcpy(_pps, data + 4, _ppsSize);
-            
-            if (_sps) {
-                [self setupDecompressionSessionWithSPS:_sps spsSize:_spsSize
-                                                 PPS:_pps ppsSize:_ppsSize];
+            if (_pps) {
+                memcpy(_pps, data + 4, _ppsSize);
+                
+                if (_sps) {
+                    [self setupDecompressionSessionWithSPS:_sps spsSize:_spsSize
+                                                     PPS:_pps ppsSize:_ppsSize];
+                }
             }
         }
         else if (_hasVideoFormat && (naluType == 1 || naluType == 5)) { // IDR or non-IDR
             CMBlockBufferRef blockBuffer = NULL;
-            OSStatus status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,
-                                                               data,
-                                                               length,
-                                                               kCFAllocatorNull,
-                                                               NULL,
-                                                               0,
-                                                               length,
-                                                               0,
-                                                               &blockBuffer);
+            OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+                kCFAllocatorDefault,
+                data,
+                length,
+                kCFAllocatorNull,
+                NULL,
+                0,
+                length,
+                0,
+                &blockBuffer
+            );
             
             if (status != noErr) {
                 LOG_ERROR("Failed to create block buffer: %d", (int)status);
@@ -209,16 +311,17 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
             
             CMSampleBufferRef sampleBuffer = NULL;
             const size_t sampleSizesArray[] = {length};
-            
-            status = CMSampleBufferCreateReady(kCFAllocatorDefault,
-                                             blockBuffer,
-                                             _videoFormat,
-                                             1,
-                                             0,
-                                             NULL,
-                                             1,
-                                             sampleSizesArray,
-                                             &sampleBuffer);
+            status = CMSampleBufferCreateReady(
+                kCFAllocatorDefault,
+                blockBuffer,
+                _videoFormat,
+                1,
+                0,
+                NULL,
+                1,
+                sampleSizesArray,
+                &sampleBuffer
+            );
             
             if (status != noErr) {
                 LOG_ERROR("Failed to create sample buffer: %d", (int)status);
@@ -227,11 +330,13 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
             }
             
             VTDecodeFrameFlags flags = kVTDecodeFrame_EnableAsynchronousDecompression;
-            VTDecompressionSessionDecodeFrame(_decompressionSession,
-                                            sampleBuffer,
-                                            flags,
-                                            NULL,
-                                            NULL);
+            VTDecompressionSessionDecodeFrame(
+                _decompressionSession,
+                sampleBuffer,
+                flags,
+                NULL,
+                NULL
+            );
             
             CFRelease(sampleBuffer);
             CFRelease(blockBuffer);
@@ -240,39 +345,12 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
 }
 
 - (void)processAudioData:(uint8_t *)data length:(size_t)length timestamp:(uint32_t)timestamp {
-    // Audio processing implementation
-}
-
-- (void)showPreview {
-    if (!self.isVisible) {
-        self.isVisible = YES;
-        UIWindow *window = [UIApplication sharedApplication].keyWindow;
-        [window addSubview:self];
-    }
-}
-
-- (void)hidePreview {
-    if (self.isVisible) {
-        self.isVisible = NO;
-        [self removeFromSuperview];
-    }
-}
-
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.superview];
+    if (!data || length == 0 || _muted) return;
     
-    if (gesture.state == UIGestureRecognizerStateBegan) {
-        self.initialPosition = self.center;
-    }
-    
-    CGPoint newCenter = CGPointMake(self.initialPosition.x + translation.x,
-                                   self.initialPosition.y + translation.y);
-    
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    newCenter.x = MAX(self.frame.size.width/2, MIN(newCenter.x, bounds.size.width - self.frame.size.width/2));
-    newCenter.y = MAX(self.frame.size.height/2, MIN(newCenter.y, bounds.size.height - self.frame.size.height/2));
-    
-    self.center = newCenter;
+    dispatch_async(_audioQueue, ^{
+        // TODO: Implementar processamento de áudio
+        LOG_DEBUG("Received audio data: %zu bytes", length);
+    });
 }
 
 - (void)dealloc {
@@ -288,21 +366,29 @@ static void DecompressionSessionDecodeCallback(void *decompressionOutputRefCon,
     
     free(_sps);
     free(_pps);
+    
+    LOG_INFO("Preview view destroyed");
 }
 
 @end
 
-// C interface implementation
+// Interface C
 void rtmp_preview_init(void) {
-    [[RTMPPreviewView sharedInstance] showPreview];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[RTMPPreviewView sharedInstance] showPreview];
+    });
 }
 
 void rtmp_preview_show(void) {
-    [[RTMPPreviewView sharedInstance] showPreview];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[RTMPPreviewView sharedInstance] showPreview];
+    });
 }
 
 void rtmp_preview_hide(void) {
-    [[RTMPPreviewView sharedInstance] hidePreview];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[RTMPPreviewView sharedInstance] hidePreview];
+    });
 }
 
 void rtmp_preview_process_video(const uint8_t* data, size_t length, uint32_t timestamp) {

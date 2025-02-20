@@ -14,7 +14,8 @@ $(TWEAK_NAME)_FILES = RTMPCameraTweak.xm \
                      rtmp_stream.c \
                      rtmp_amf.c \
                      rtmp_protocol.c \
-                     rtmp_preview.m
+                     rtmp_preview.m \
+                     rtmp_util.c
 
 $(TWEAK_NAME)_FRAMEWORKS = UIKit AVFoundation Foundation VideoToolbox
 $(TWEAK_NAME)_CFLAGS = -I. -fobjc-arc

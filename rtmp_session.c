@@ -2,18 +2,10 @@
 #include "rtmp_log.h"
 #include "rtmp_preview.h"
 #include "rtmp_amf.h"
+#include "rtmp_chunk.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-
-#define RTMP_STATE_INIT          0
-#define RTMP_STATE_HANDSHAKE     1
-#define RTMP_STATE_CONNECTED     2
-#define RTMP_STATE_READY         3
-#define RTMP_STATE_PUBLISHING    4
-#define RTMP_STATE_PLAYING       5
 
 struct RTMPSession {
     uint32_t id;
@@ -26,6 +18,9 @@ struct RTMPSession {
     uint32_t window_ack_size;
     uint32_t bytes_received;
     void* user_data;
+
+    RTMPChunkStream* chunk_stream;
+    RTMPStream* stream;
 };
 
 static uint32_t next_session_id = 1;
@@ -39,8 +34,15 @@ RTMPSession* rtmp_session_create(void) {
     
     session->id = next_session_id++;
     session->state = RTMP_STATE_INIT;
-    session->chunk_size = 128;
+    session->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
     session->window_ack_size = 2500000;
+    
+    session->chunk_stream = rtmp_chunk_stream_create();
+    if (!session->chunk_stream) {
+        LOG_ERROR("Failed to create chunk stream");
+        free(session);
+        return NULL;
+    }
     
     LOG_INFO("Created new RTMP session %u", session->id);
     return session;
@@ -50,13 +52,50 @@ void rtmp_session_destroy(RTMPSession* session) {
     if (!session) return;
     
     LOG_INFO("Destroying RTMP session %u", session->id);
+    
+    if (session->stream) {
+        rtmp_stream_destroy(session->stream);
+    }
+    
+    if (session->chunk_stream) {
+        rtmp_chunk_stream_destroy(session->chunk_stream);
+    }
+    
+    if (session->socket >= 0) {
+        close(session->socket);
+    }
+    
     free(session);
+}
+
+static int send_chunk(RTMPSession* session, uint8_t type, const uint8_t* data, size_t len) {
+    if (!session || !data || !len) return -1;
+    
+    uint8_t buffer[4096];
+    size_t bytes_written;
+    
+    RTMPChunk chunk = {0};
+    chunk.type = type;
+    chunk.data = (uint8_t*)data;
+    chunk.length = len;
+    
+    if (rtmp_chunk_write(session->chunk_stream, &chunk, buffer, sizeof(buffer), &bytes_written) < 0) {
+        LOG_ERROR("Failed to write chunk");
+        return -1;
+    }
+    
+    if (send(session->socket, buffer, bytes_written, 0) < 0) {
+        LOG_ERROR("Failed to send chunk");
+        return -1;
+    }
+    
+    return 0;
 }
 
 static int handle_connect(RTMPSession* session, AMFObject* obj) {
     if (!session || !obj) return -1;
     
-    // Extrair app name do comando connect
+    // Extrair app name
     AMFObject* props = obj->next;
     if (props && props->value->type == AMF0_OBJECT) {
         AMFObject* app_prop = props->value->data.object;
@@ -70,56 +109,39 @@ static int handle_connect(RTMPSession* session, AMFObject* obj) {
         }
     }
     
-    LOG_INFO("RTMP session %u connect to app: %s", session->id, session->app);
+    LOG_INFO("Session %u connect: app=%s", session->id, session->app);
     
-    // Enviar respostas necessárias
-    // _result para connect
-    uint8_t response[1024];
-    size_t offset = 0;
+    // Enviar Window Acknowledgement Size
+    uint8_t ack_size[4];
+    write_uint32(ack_size, session->window_ack_size);
+    if (send_chunk(session, RTMP_MSG_WINDOW_ACK, ack_size, 4) < 0) {
+        return -1;
+    }
     
-    // AMF0 String "_result"
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 7;
-    memcpy(response + offset, "_result", 7);
-    offset += 7;
+    // Enviar Set Peer Bandwidth
+    uint8_t bw_size[5];
+    write_uint32(bw_size, session->window_ack_size);
+    bw_size[4] = 2; // Dynamic
+    if (send_chunk(session, RTMP_MSG_SET_PEER_BW, bw_size, 5) < 0) {
+        return -1;
+    }
     
-    // Transaction ID (mesmo do request)
-    response[offset++] = AMF0_NUMBER;
-    memcpy(response + offset, "\x00\x00\x00\x00\x00\x00\x00\x01", 8);
-    offset += 8;
+    // Enviar Stream Begin
+    uint8_t stream_begin[6];
+    write_uint16(stream_begin, RTMP_EVENT_STREAM_BEGIN);
+    write_uint32(stream_begin + 2, 0);
+    if (send_chunk(session, RTMP_MSG_USER_CONTROL, stream_begin, 6) < 0) {
+        return -1;
+    }
     
-    // Properties object
-    response[offset++] = AMF0_OBJECT;
+    // Enviar resultado do connect
+    uint8_t response[384];
+    size_t response_len;
+    if (amf_encode_connect_response(response, sizeof(response), &response_len) < 0) {
+        return -1;
+    }
     
-    // fmsVer
-    response[offset++] = 0;
-    response[offset++] = 7;
-    memcpy(response + offset, "fmsVer", 6);
-    offset += 6;
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 10;
-    memcpy(response + offset, "FMS/3,0,1,123", 10);
-    offset += 10;
-    
-    // capabilities
-    response[offset++] = 0;
-    response[offset++] = 12;
-    memcpy(response + offset, "capabilities", 12);
-    offset += 12;
-    response[offset++] = AMF0_NUMBER;
-    memcpy(response + offset, "\x00\x00\x00\x00\x00\x00\x00\x7F", 8);
-    offset += 8;
-    
-    // Object end marker
-    response[offset++] = 0;
-    response[offset++] = 0;
-    response[offset++] = 9;
-    
-    // Enviar resposta
-    if (send(session->socket, response, offset, 0) < 0) {
-        LOG_ERROR("Failed to send connect response");
+    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
         return -1;
     }
     
@@ -131,35 +153,18 @@ static int handle_createStream(RTMPSession* session, AMFObject* obj) {
     if (!session) return -1;
     
     session->stream_id = 1;
-    LOG_INFO("RTMP session %u created stream: %u", session->id, session->stream_id);
+    LOG_INFO("Session %u created stream: %u", session->id, session->stream_id);
     
-    // Enviar _result
-    uint8_t response[128];
-    size_t offset = 0;
+    // Enviar resposta
+    uint8_t response[256];
+    size_t response_len;
+    if (amf_encode_create_stream_response(response, sizeof(response), 
+                                        3.0, session->stream_id, 
+                                        &response_len) < 0) {
+        return -1;
+    }
     
-    // AMF0 String "_result"
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 7;
-    memcpy(response + offset, "_result", 7);
-    offset += 7;
-    
-    // Transaction ID (mesmo do request)
-    response[offset++] = AMF0_NUMBER;
-    memcpy(response + offset, "\x00\x00\x00\x00\x00\x00\x00\x02", 8);
-    offset += 8;
-    
-    // Null
-    response[offset++] = AMF0_NULL;
-    
-    // Stream ID
-    response[offset++] = AMF0_NUMBER;
-    uint64_t stream_id = 1;
-    memcpy(response + offset, &stream_id, 8);
-    offset += 8;
-    
-    if (send(session->socket, response, offset, 0) < 0) {
-        LOG_ERROR("Failed to send createStream response");
+    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
         return -1;
     }
     
@@ -170,66 +175,39 @@ static int handle_createStream(RTMPSession* session, AMFObject* obj) {
 static int handle_publish(RTMPSession* session, AMFObject* obj) {
     if (!session) return -1;
     
-    // Extrair stream key
+    // Extrair stream name
     AMFObject* stream_name = obj->next;
     if (stream_name && stream_name->value->type == AMF0_STRING) {
-        strncpy(session->stream_key, stream_name->value->data.string, sizeof(session->stream_key)-1);
+        strncpy(session->stream_key, stream_name->value->data.string,
+                sizeof(session->stream_key)-1);
     }
     
-    LOG_INFO("RTMP session %u start publish: %s/%s", 
-             session->id, session->app, session->stream_key);
+    LOG_INFO("Session %u publish: %s/%s", session->id, session->app, session->stream_key);
     
-    // Enviar onStatus
-    uint8_t response[256];
-    size_t offset = 0;
+    // Criar stream se necessário
+    if (!session->stream) {
+        session->stream = rtmp_stream_create();
+        if (!session->stream) {
+            return -1;
+        }
+    }
     
-    // AMF0 String "onStatus"
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 8;
-    memcpy(response + offset, "onStatus", 8);
-    offset += 8;
+    // Iniciar stream
+    rtmp_stream_start(session->stream, session->stream_key);
     
-    // Transaction ID = 0
-    response[offset++] = AMF0_NUMBER;
-    memcpy(response + offset, "\x00\x00\x00\x00\x00\x00\x00\x00", 8);
-    offset += 8;
+    // Mostrar preview
+    rtmp_preview_show();
     
-    // Null
-    response[offset++] = AMF0_NULL;
+    // Enviar resposta
+    uint8_t response[384];
+    size_t response_len;
+    if (amf_encode_publish_response(response, sizeof(response), 
+                                  session->stream_key,
+                                  &response_len) < 0) {
+        return -1;
+    }
     
-    // Info object
-    response[offset++] = AMF0_OBJECT;
-    
-    // level : status
-    response[offset++] = 0;
-    response[offset++] = 5;
-    memcpy(response + offset, "level", 5);
-    offset += 5;
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 6;
-    memcpy(response + offset, "status", 6);
-    offset += 6;
-    
-    // code : NetStream.Publish.Start
-    response[offset++] = 0;
-    response[offset++] = 4;
-    memcpy(response + offset, "code", 4);
-    offset += 4;
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 23;
-    memcpy(response + offset, "NetStream.Publish.Start", 23);
-    offset += 23;
-    
-    // Object end marker
-    response[offset++] = 0;
-    response[offset++] = 0;
-    response[offset++] = 9;
-    
-    if (send(session->socket, response, offset, 0) < 0) {
-        LOG_ERROR("Failed to send publish response");
+    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
         return -1;
     }
     
@@ -240,66 +218,33 @@ static int handle_publish(RTMPSession* session, AMFObject* obj) {
 static int handle_play(RTMPSession* session, AMFObject* obj) {
     if (!session) return -1;
     
-    // Extrair stream key
+    // Extrair stream name
     AMFObject* stream_name = obj->next;
     if (stream_name && stream_name->value->type == AMF0_STRING) {
-        strncpy(session->stream_key, stream_name->value->data.string, sizeof(session->stream_key)-1);
+        strncpy(session->stream_key, stream_name->value->data.string,
+                sizeof(session->stream_key)-1);
     }
     
-    LOG_INFO("RTMP session %u start play: %s/%s", 
-             session->id, session->app, session->stream_key);
+    LOG_INFO("Session %u play: %s/%s", session->id, session->app, session->stream_key);
     
-    // Enviar onStatus
-    uint8_t response[256];
-    size_t offset = 0;
+    // Enviar User Control - Stream Begin
+    uint8_t stream_begin[6];
+    write_uint16(stream_begin, RTMP_EVENT_STREAM_BEGIN);
+    write_uint32(stream_begin + 2, session->stream_id);
+    if (send_chunk(session, RTMP_MSG_USER_CONTROL, stream_begin, 6) < 0) {
+        return -1;
+    }
     
-    // AMF0 String "onStatus"
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 8;
-    memcpy(response + offset, "onStatus", 8);
-    offset += 8;
+    // Enviar resposta
+    uint8_t response[384];
+    size_t response_len;
+    if (amf_encode_play_response(response, sizeof(response), 
+                                session->stream_key,
+                                &response_len) < 0) {
+        return -1;
+    }
     
-    // Transaction ID = 0
-    response[offset++] = AMF0_NUMBER;
-    memcpy(response + offset, "\x00\x00\x00\x00\x00\x00\x00\x00", 8);
-    offset += 8;
-    
-    // Null
-    response[offset++] = AMF0_NULL;
-    
-    // Info object
-    response[offset++] = AMF0_OBJECT;
-    
-    // level : status
-    response[offset++] = 0;
-    response[offset++] = 5;
-    memcpy(response + offset, "level", 5);
-    offset += 5;
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 6;
-    memcpy(response + offset, "status", 6);
-    offset += 6;
-    
-    // code : NetStream.Play.Start
-    response[offset++] = 0;
-    response[offset++] = 4;
-    memcpy(response + offset, "code", 4);
-    offset += 4;
-    response[offset++] = AMF0_STRING;
-    response[offset++] = 0;
-    response[offset++] = 20;
-    memcpy(response + offset, "NetStream.Play.Start", 20);
-    offset += 20;
-    
-    // Object end marker
-    response[offset++] = 0;
-    response[offset++] = 0;
-    response[offset++] = 9;
-    
-    if (send(session->socket, response, offset, 0) < 0) {
-        LOG_ERROR("Failed to send play response");
+    if (send_chunk(session, RTMP_MSG_COMMAND_AMF0, response, response_len) < 0) {
         return -1;
     }
     
@@ -307,63 +252,99 @@ static int handle_play(RTMPSession* session, AMFObject* obj) {
     return 0;
 }
 
-int rtmp_session_process_command(RTMPSession* session, const uint8_t* data, size_t len) {
-    if (!session || !data || len == 0) return -1;
-    
-    size_t bytes_read;
-    AMFValue* command_name = amf_decode(data, len, &bytes_read);
-    if (!command_name || command_name->type != AMF0_STRING) {
-        LOG_ERROR("Invalid command format");
-        return -1;
-    }
-    
-    data += bytes_read;
-    len -= bytes_read;
-    
-    if (strcmp(command_name->data.string, "connect") == 0) {
-        AMFObject* obj = amf_decode_object(data, len, &bytes_read);
-        int result = handle_connect(session, obj);
-        amf_object_free(obj);
-        return result;
-    }
-    else if (strcmp(command_name->data.string, "createStream") == 0) {
-        return handle_createStream(session, NULL);
-    }
-    else if (strcmp(command_name->data.string, "publish") == 0) {
-        AMFObject* obj = amf_decode_object(data, len, &bytes_read);
-        int result = handle_publish(session, obj);
-        amf_object_free(obj);
-        return result;
-    }
-    else if (strcmp(command_name->data.string, "play") == 0) {
-        AMFObject* obj = amf_decode_object(data, len, &bytes_read);
-        int result = handle_play(session, obj);
-        amf_object_free(obj);
-        return result;
-    }
-    
-    LOG_WARNING("Unknown command: %s", command_name->data.string);
-    return 0;
-}
-
 int rtmp_session_process_chunk(RTMPSession* session, RTMPChunk* chunk) {
     if (!session || !chunk) return -1;
     
     switch (chunk->type) {
+        case RTMP_MSG_CHUNK_SIZE:
+            if (chunk->length >= 4) {
+                session->chunk_size = read_uint32(chunk->data);
+                rtmp_chunk_update_size(session->chunk_stream, session->chunk_size);
+                LOG_DEBUG("Session %u: chunk size updated to %u", 
+                         session->id, session->chunk_size);
+            }
+            break;
+            
+        case RTMP_MSG_WINDOW_ACK:
+            if (chunk->length >= 4) {
+                session->window_ack_size = read_uint32(chunk->data);
+                LOG_DEBUG("Session %u: window ack size updated to %u",
+                         session->id, session->window_ack_size);
+            }
+            break;
+            
         case RTMP_MSG_COMMAND_AMF0:
-            return rtmp_session_process_command(session, chunk->data, chunk->length);
+            {
+                size_t bytes_read;
+                AMFValue* command = amf_decode(chunk->data, chunk->length, &bytes_read);
+                if (!command || command->type != AMF0_STRING) {
+                    if (command) amf_value_free(command);
+                    return -1;
+                }
+                
+                const char* cmd_name = command->data.string;
+                AMFObject* obj = amf_decode_object(chunk->data + bytes_read,
+                                                 chunk->length - bytes_read,
+                                                 &bytes_read);
+                
+                if (strcmp(cmd_name, RTMP_CMD_CONNECT) == 0) {
+                    handle_connect(session, obj);
+                }
+                else if (strcmp(cmd_name, RTMP_CMD_CREATE_STREAM) == 0) {
+                    handle_createStream(session, obj);
+                }
+                else if (strcmp(cmd_name, RTMP_CMD_PUBLISH) == 0) {
+                    handle_publish(session, obj);
+                }
+                else if (strcmp(cmd_name, RTMP_CMD_PLAY) == 0) {
+                    handle_play(session, obj);
+                }
+                else {
+                    LOG_DEBUG("Session %u: unhandled command: %s",
+                             session->id, cmd_name);
+                }
+                
+                amf_value_free(command);
+                if (obj) amf_object_free(obj);
+            }
+            break;
             
         case RTMP_MSG_VIDEO:
-            if (session->state == RTMP_STATE_PUBLISHING) {
-                rtmp_preview_process_video(chunk->data, chunk->length, chunk->timestamp);
+            if (session->stream) {
+                rtmp_stream_process_video(session->stream, chunk->data,
+                                        chunk->length, chunk->timestamp);
             }
             break;
             
         case RTMP_MSG_AUDIO:
-            if (session->state == RTMP_STATE_PUBLISHING) {
-                rtmp_preview_process_audio(chunk->data, chunk->length, chunk->timestamp);
+            if (session->stream) {
+                rtmp_stream_process_audio(session->stream, chunk->data,
+                                        chunk->length, chunk->timestamp);
             }
             break;
+            
+        default:
+            LOG_DEBUG("Session %u: unhandled message type: %d",
+                     session->id, chunk->type);
+            break;
+    }
+    
+    return 0;
+}
+
+int rtmp_session_send_chunk(RTMPSession* session, RTMPChunk* chunk) {
+    if (!session || !chunk) return -1;
+    
+    uint8_t buffer[4096];
+    size_t bytes_written;
+    
+    if (rtmp_chunk_write(session->chunk_stream, chunk, buffer,
+                        sizeof(buffer), &bytes_written) < 0) {
+        return -1;
+    }
+    
+    if (send(session->socket, buffer, bytes_written, 0) < 0) {
+        return -1;
     }
     
     return 0;

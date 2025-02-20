@@ -10,40 +10,65 @@
 static RTMPStream* rtmpStream = NULL;
 static int serverStarted = 0;
 
-%group RTMPCameraTweak
+// Função auxiliar para obter o bundle identifier
+static NSString* getCurrentBundleID() {
+    NSBundle* mainBundle = [NSBundle mainBundle];
+    return mainBundle ? [mainBundle bundleIdentifier] : @"Unknown";
+}
 
 %hook AVCaptureSession
 
+- (id)init {
+    id result = %orig;
+    NSString* bundleID = getCurrentBundleID();
+    LOG_INFO("AVCaptureSession init in process: %@", bundleID);
+    return result;
+}
+
 - (void)startRunning {
-    %orig;
+    NSString* bundleID = getCurrentBundleID();
+    LOG_INFO("AVCaptureSession startRunning in process: %@", bundleID);
     
     if (!serverStarted) {
+        LOG_INFO("Initializing RTMP Server...");
+        
         // Inicializar logger
         init_logger();
-        LOG_INFO("RTMPCamera tweak initialized");
         
         // Inicializar server RTMP
         if (rtmp_server_start(1935) != 0) {
-            LOG_ERROR("Failed to start RTMP server");
+            LOG_ERROR("Failed to start RTMP server on port 1935");
+            %orig;
             return;
         }
         serverStarted = 1;
+        LOG_INFO("RTMP server started successfully on port 1935");
         
         // Criar stream RTMP
         rtmpStream = rtmp_stream_create();
         if (!rtmpStream) {
             LOG_ERROR("Failed to create RTMP stream");
+            rtmp_server_stop();
+            serverStarted = 0;
+            %orig;
             return;
         }
+        LOG_INFO("RTMP stream created successfully");
         
         // Inicializar preview
-        rtmp_preview_init();
-        
-        LOG_INFO("RTMP Server started on port 1935");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            rtmp_preview_init();
+            LOG_INFO("Preview window initialized");
+        });
     }
+    
+    %orig;
 }
 
 - (void)stopRunning {
+    NSString* bundleID = getCurrentBundleID();
+    LOG_INFO("AVCaptureSession stopRunning in process: %@", bundleID);
+    
     if (serverStarted) {
         LOG_INFO("Stopping RTMP server...");
         rtmp_server_stop();
@@ -54,7 +79,12 @@ static int serverStarted = 0;
             rtmpStream = NULL;
         }
         
+        dispatch_async(dispatch_get_main_queue(), ^{
+            rtmp_preview_hide();
+        });
+        
         close_logger();
+        LOG_INFO("RTMP server stopped successfully");
     }
     
     %orig;
@@ -62,39 +92,37 @@ static int serverStarted = 0;
 
 %end
 
-// Hook para capturar o output da camera
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    NSString* bundleID = getCurrentBundleID();
+    LOG_DEBUG("Video delegate set in process: %@", bundleID);
     %orig;
-    LOG_DEBUG("Video delegate set for process: %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
 
 %end
 
-// Hook para capturar o output de audio
 %hook AVCaptureAudioDataOutput
 
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    NSString* bundleID = getCurrentBundleID();
+    LOG_DEBUG("Audio delegate set in process: %@", bundleID);
     %orig;
-    LOG_DEBUG("Audio delegate set for process: %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
-
-%end
 
 %end
 
 %ctor {
     @autoreleasepool {
-        // Inicializar logger para ver se o tweak está sendo carregado
-        init_logger();
+        NSString* bundleID = getCurrentBundleID();
         
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        // Inicializar logger primeiro para capturar todos os logs
+        init_logger();
         LOG_INFO("RTMPCamera tweak loading in process: %@", bundleID);
         
-        // Inicializar tweak
-        %init(RTMPCameraTweak);
+        // Inicializar hooks
+        %init;
         
-        LOG_INFO("RTMPCamera tweak initialized successfully");
+        LOG_INFO("RTMPCamera tweak initialized successfully in: %@", bundleID);
     }
 }
