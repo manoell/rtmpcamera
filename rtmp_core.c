@@ -104,7 +104,13 @@ int rtmp_server_start(RTMPServer* server) {
         return RTMP_ERROR_SOCKET;
     }
 
-    set_socket_options(server->socket_fd);
+    // Importante: Permite reutilizar o endereço/porta
+    int opt = 1;
+    setsockopt(server->socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    // Configura socket para não bloquear
+    int flags = fcntl(server->socket_fd, F_GETFL, 0);
+    fcntl(server->socket_fd, F_SETFL, flags | O_NONBLOCK);
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -113,11 +119,13 @@ int rtmp_server_start(RTMPServer* server) {
 
     if (bind(server->socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         rtmp_log(RTMP_LOG_ERROR, "Failed to bind socket: %s", strerror(errno));
+        close(server->socket_fd);
         return RTMP_ERROR_BIND;
     }
 
     if (listen(server->socket_fd, RTMP_MAX_CONNECTIONS) < 0) {
         rtmp_log(RTMP_LOG_ERROR, "Failed to listen: %s", strerror(errno));
+        close(server->socket_fd);
         return RTMP_ERROR_LISTEN;
     }
 
