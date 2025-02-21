@@ -17,36 +17,36 @@ static RTMPServer* rtmpServer = nil;
 @implementation RTMPPreviewWindow
 
 - (instancetype)init {
-    self = [super initWithFrame:CGRectMake(20, 60, 160, 90)];
+    // Aumentar o tamanho da janela
+    self = [super initWithFrame:CGRectMake(20, 60, 240, 135)]; // 16:9 aspect ratio
     if (self) {
         self.windowLevel = UIWindowLevelAlert + 1;
         self.backgroundColor = [UIColor blackColor];
         self.layer.cornerRadius = 8;
         self.clipsToBounds = YES;
         
-        // Preview ImageView
-        self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, self.frame.size.width, 70)];
+        // Ajustar o preview para ocupar mais espaço
+        self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, self.frame.size.width, 105)];
         self.previewImageView.contentMode = UIViewContentModeScaleAspectFit;
         self.previewImageView.backgroundColor = [UIColor clearColor];
         [self addSubview:self.previewImageView];
         
-        // Status label
-        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 70, self.frame.size.width, 10)];
+        // Ajustar posição dos labels
+        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 105, self.frame.size.width, 15)];
         self.statusLabel.textColor = [UIColor whiteColor];
         self.statusLabel.textAlignment = NSTextAlignmentCenter;
-        self.statusLabel.font = [UIFont systemFontOfSize:8];
+        self.statusLabel.font = [UIFont systemFontOfSize:10];
         self.statusLabel.text = @"Aguardando conexão RTMP...";
         [self addSubview:self.statusLabel];
         
-        // Stats label
-        self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 80, self.frame.size.width, 10)];
+        self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 120, self.frame.size.width, 15)];
         self.statsLabel.textColor = [UIColor whiteColor];
         self.statsLabel.textAlignment = NSTextAlignmentCenter;
-        self.statsLabel.font = [UIFont systemFontOfSize:8];
+        self.statsLabel.font = [UIFont systemFontOfSize:10];
         self.statsLabel.text = @"0 KB/s | 0 FPS";
         [self addSubview:self.statsLabel];
         
-        // Pan gesture
+        // Pan gesture permanece igual
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] 
             initWithTarget:self action:@selector(handlePan:)];
         [self addGestureRecognizer:pan];
