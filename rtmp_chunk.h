@@ -1,4 +1,3 @@
-// rtmp_chunk.h
 #ifndef RTMP_CHUNK_H
 #define RTMP_CHUNK_H
 
@@ -11,19 +10,22 @@
 #define RTMP_CHUNK_SIZE_MIN 128
 
 // Formatos de chunk
-#define RTMP_CHUNK_TYPE_0 0
-#define RTMP_CHUNK_TYPE_1 1
-#define RTMP_CHUNK_TYPE_2 2
-#define RTMP_CHUNK_TYPE_3 3
+#define RTMP_CHUNK_TYPE_0 0  // Chunk com cabeçalho completo
+#define RTMP_CHUNK_TYPE_1 1  // Chunk com timestamp delta
+#define RTMP_CHUNK_TYPE_2 2  // Chunk com timestamp delta reduzido
+#define RTMP_CHUNK_TYPE_3 3  // Chunk sem cabeçalho
 
-// Funções principais
-RTMPChunkStream* rtmp_chunk_stream_create(int socket_fd);
-void rtmp_chunk_stream_destroy(RTMPChunkStream* cs);
+// Estrutura do header do chunk
+typedef struct {
+    uint8_t fmt;           // Formato do chunk (0-3)
+    uint32_t csid;         // Chunk Stream ID
+    uint32_t timestamp;    // Timestamp absoluto ou delta
+    uint32_t length;       // Tamanho da mensagem
+    uint8_t type_id;       // Tipo da mensagem
+    uint32_t stream_id;    // ID do stream
+} RTMPChunkHeader;
 
-int rtmp_chunk_read(RTMPChunkStream* cs, RTMPMessage* message);
-int rtmp_chunk_write(RTMPChunkStream* cs, RTMPMessage* message);
-
-void rtmp_chunk_set_size(RTMPChunkStream* cs, uint32_t size);
-void rtmp_chunk_update_window(RTMPChunkStream* cs, uint32_t size);
+// Funções
+int rtmp_read_chunk_header(RTMPClient *client, RTMPChunkHeader *header);
 
 #endif

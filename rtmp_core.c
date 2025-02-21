@@ -1,6 +1,6 @@
-// rtmp_core.c
 #include "rtmp_core.h"
 #include <stdarg.h>
+#include <time.h>
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -39,95 +39,82 @@ void rtmp_log(RTMPLogLevel level, const char* format, ...) {
     pthread_mutex_unlock(&log_mutex);
 }
 
-void rtmp_client_handle(RTMPClient* client) {
-    if (!client || !client->buffer) return;
+static RTMPClient* rtmp_client_create(int socket_fd, struct sockaddr_in addr) {
+    RTMPClient* client = (RTMPClient*)calloc(1, sizeof(RTMPClient));
+    if (!client) return NULL;
 
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client->addr.sin_addr, client_ip, sizeof(client_ip));
-    rtmp_log(RTMP_LOG_INFO, "Handling client %s:%d", client_ip, ntohs(client->addr.sin_port));
+    client->socket_fd = socket_fd;
+    client->addr = addr;
+    client->state = RTMP_STATE_HANDSHAKE_S0S1;
+    client->running = true;
 
-    while (client->connected) {
-        ssize_t bytes_read = recv(client->socket_fd, client->buffer, RTMP_BUFFER_SIZE, 0);
+    client->in_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
+    client->out_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
+
+    if (!client->in_buffer || !client->out_buffer) {
+        free(client->in_buffer);
+        free(client->out_buffer);
+        free(client);
+        return NULL;
+    }
+
+    return client;
+}
+
+static void rtmp_client_destroy(RTMPClient* client) {
+    if (!client) return;
+
+    client->running = false;
+    if (client->socket_fd >= 0) {
+        close(client->socket_fd);
+    }
+    
+    pthread_join(client->thread, NULL);
+    
+    free(client->in_buffer);
+    free(client->out_buffer);
+    free(client);
+}
+
+static void* handle_client(void *arg) {
+    RTMPClient *client = (RTMPClient *)arg;
+    rtmp_log(RTMP_LOG_INFO, "Handling client %s:%d",
+             inet_ntoa(client->addr.sin_addr),
+             ntohs(client->addr.sin_port));
+
+    if (rtmp_handshake_handle(client) != RTMP_OK) {
+        rtmp_log(RTMP_LOG_ERROR, "Handshake failed");
+        goto cleanup;
+    }
+
+    client->state = RTMP_STATE_CONNECT;
+    rtmp_log(RTMP_LOG_INFO, "Client ready for RTMP commands");
+
+    uint8_t buffer[RTMP_BUFFER_SIZE];
+    while (client->running) {
+        ssize_t bytes = read_with_timeout(client->socket_fd, buffer, sizeof(buffer), 5000); // 5 segundos
         
-        if (bytes_read > 0) {
-            rtmp_log(RTMP_LOG_DEBUG, "Received %zd bytes from client", bytes_read);
-            // TODO: Processar dados RTMP
-        } 
-        else if (bytes_read == 0) {
+        if (bytes > 0) {
+            rtmp_log(RTMP_LOG_DEBUG, "Received %zd bytes from client", bytes);
+            if (rtmp_handle_packet(client, buffer, bytes) != RTMP_OK) {
+                rtmp_log(RTMP_LOG_ERROR, "Failed to handle packet");
+                break;
+            }
+        } else if (bytes == 0) {
             rtmp_log(RTMP_LOG_INFO, "Client disconnected");
             break;
-        }
-        else {
+        } else {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 rtmp_log(RTMP_LOG_ERROR, "Error reading from client: %s", strerror(errno));
                 break;
             }
         }
-        
-        usleep(1000); // Pequena pausa para não sobrecarregar CPU
     }
 
-    client->connected = false;
-}
-
-static void* client_thread(void* arg) {
-    RTMPClient* client = (RTMPClient*)arg;
-    rtmp_client_handle(client);
+cleanup:
+    rtmp_log(RTMP_LOG_INFO, "Client handler exiting");
+    rtmp_client_destroy(client);
     return NULL;
-}
-
-int rtmp_server_add_client(RTMPServer* server, int client_fd, struct sockaddr_in addr) {
-    pthread_mutex_lock(&server->clients_mutex);
-    
-    if (server->client_count >= RTMP_MAX_CONNECTIONS) {
-        pthread_mutex_unlock(&server->clients_mutex);
-        return -1;
-    }
-
-    int index = server->client_count++;
-    server->clients[index].socket_fd = client_fd;
-    server->clients[index].addr = addr;
-    server->clients[index].connected = true;
-    server->clients[index].buffer = malloc(RTMP_BUFFER_SIZE);
-
-    if (!server->clients[index].buffer) {
-        pthread_mutex_unlock(&server->clients_mutex);
-        return -1;
-    }
-
-    if (pthread_create(&server->clients[index].thread, NULL, client_thread, &server->clients[index]) != 0) {
-        free(server->clients[index].buffer);
-        pthread_mutex_unlock(&server->clients_mutex);
-        return -1;
-    }
-
-    pthread_mutex_unlock(&server->clients_mutex);
-    return index;
-}
-
-void rtmp_server_remove_client(RTMPServer* server, int client_index) {
-    pthread_mutex_lock(&server->clients_mutex);
-    
-    if (client_index < 0 || client_index >= server->client_count) {
-        pthread_mutex_unlock(&server->clients_mutex);
-        return;
-    }
-
-    RTMPClient* client = &server->clients[client_index];
-    client->connected = false;
-    pthread_join(client->thread, NULL);
-    close(client->socket_fd);
-    free(client->buffer);
-
-    // Remover cliente movendo o último para sua posição
-    if (client_index < server->client_count - 1) {
-        memcpy(&server->clients[client_index], 
-               &server->clients[server->client_count - 1], 
-               sizeof(RTMPClient));
-    }
-    server->client_count--;
-
-    pthread_mutex_unlock(&server->clients_mutex);
 }
 
 static void* accept_thread(void* arg) {
@@ -138,13 +125,14 @@ static void* accept_thread(void* arg) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         
+        // Usar select para espera não-bloqueante
         fd_set readfds;
         struct timeval tv;
         
         FD_ZERO(&readfds);
         FD_SET(server->socket_fd, &readfds);
         
-        tv.tv_sec = 1;
+        tv.tv_sec = 1;  // 1 segundo timeout
         tv.tv_usec = 0;
         
         int ret = select(server->socket_fd + 1, &readfds, NULL, NULL, &tv);
@@ -167,17 +155,24 @@ static void* accept_thread(void* arg) {
             int flags = fcntl(client_fd, F_GETFL, 0);
             fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
             
-            // Adicionar cliente
-            if (rtmp_server_add_client(server, client_fd, client_addr) < 0) {
-                rtmp_log(RTMP_LOG_ERROR, "Failed to add client");
+            // Criar cliente
+            RTMPClient* client = rtmp_client_create(client_fd, client_addr);
+            if (!client) {
+                rtmp_log(RTMP_LOG_ERROR, "Failed to create client");
                 close(client_fd);
                 continue;
             }
             
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            rtmp_log(RTMP_LOG_INFO, "New client connected from %s:%d", 
-                     client_ip, ntohs(client_addr.sin_port));
+            // Iniciar thread do cliente
+            if (pthread_create(&client->thread, NULL, handle_client, client) != 0) {
+                rtmp_log(RTMP_LOG_ERROR, "Failed to create client thread");
+                rtmp_client_destroy(client);
+                continue;
+            }
+            
+            rtmp_log(RTMP_LOG_INFO, "New client connected from %s:%d",
+                     inet_ntoa(client_addr.sin_addr),
+                     ntohs(client_addr.sin_port));
         }
     }
     
@@ -192,18 +187,10 @@ RTMPServer* rtmp_server_create(int port) {
         return NULL;
     }
 
-    server->clients = (RTMPClient*)calloc(RTMP_MAX_CONNECTIONS, sizeof(RTMPClient));
-    if (!server->clients) {
-        free(server);
-        rtmp_log(RTMP_LOG_ERROR, "Failed to allocate clients array");
-        return NULL;
-    }
-
     server->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->socket_fd < 0) {
-        free(server->clients);
-        free(server);
         rtmp_log(RTMP_LOG_ERROR, "Failed to create socket: %s", strerror(errno));
+        free(server);
         return NULL;
     }
 
@@ -219,7 +206,7 @@ RTMPServer* rtmp_server_create(int port) {
     server->addr.sin_family = AF_INET;
     server->addr.sin_addr.s_addr = INADDR_ANY;
     server->addr.sin_port = htons(port);
-
+    
     pthread_mutex_init(&server->clients_mutex, NULL);
 
     return server;
@@ -253,17 +240,15 @@ void rtmp_server_stop(RTMPServer* server) {
     if (!server) return;
 
     server->running = false;
-    
-    // Esperar thread de aceitação terminar
     pthread_join(server->accept_thread, NULL);
     
-    // Fechar todos os clientes
+    // Limpar clientes
     pthread_mutex_lock(&server->clients_mutex);
-    for (int i = 0; i < server->client_count; i++) {
-        server->clients[i].connected = false;
-        pthread_join(server->clients[i].thread, NULL);
-        close(server->clients[i].socket_fd);
-        free(server->clients[i].buffer);
+    for (int i = 0; i < RTMP_MAX_CONNECTIONS; i++) {
+        if (server->clients[i]) {
+            rtmp_client_destroy(server->clients[i]);
+            server->clients[i] = NULL;
+        }
     }
     pthread_mutex_unlock(&server->clients_mutex);
     
@@ -275,6 +260,5 @@ void rtmp_server_destroy(RTMPServer* server) {
 
     rtmp_server_stop(server);
     pthread_mutex_destroy(&server->clients_mutex);
-    free(server->clients);
     free(server);
 }

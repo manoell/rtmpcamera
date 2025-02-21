@@ -1,19 +1,14 @@
-// rtmp_amf.h
 #ifndef RTMP_AMF_H
 #define RTMP_AMF_H
 
 #include "rtmp_core.h"
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 // Tipos AMF0
 #define AMF0_NUMBER      0x00
 #define AMF0_BOOLEAN     0x01
 #define AMF0_STRING      0x02
 #define AMF0_OBJECT      0x03
+#define AMF0_MOVIECLIP   0x04
 #define AMF0_NULL        0x05
 #define AMF0_UNDEFINED   0x06
 #define AMF0_REFERENCE   0x07
@@ -23,35 +18,36 @@ extern "C" {
 #define AMF0_DATE        0x0B
 #define AMF0_LONG_STRING 0x0C
 
+// Estruturas para valores AMF
 typedef struct {
-    uint8_t* data;
-    size_t size;
-    size_t capacity;
-    size_t position;
-} RTMPBuffer;
+    uint8_t type;
+    union {
+        double number;
+        bool boolean;
+        struct {
+            char* data;
+            uint16_t length;
+        } string;
+        struct {
+            char* name;
+            void* value;
+        }* object;
+    } value;
+} AMFValue;
 
-// Funções do buffer
-RTMPBuffer* rtmp_buffer_create(size_t initial_size);
-void rtmp_buffer_destroy(RTMPBuffer* buffer);
-int rtmp_buffer_ensure_space(RTMPBuffer* buffer, size_t additional);
+// Funções de decode
+int amf0_decode_string(uint8_t* data, size_t size, char** str, uint16_t* length);
+int amf0_decode_number(uint8_t* data, size_t size, double* number);
+int amf0_decode_boolean(uint8_t* data, size_t size, bool* boolean);
+int amf0_decode_null(uint8_t* data, size_t size);
 
-// Funções de encoding
-int rtmp_amf0_write_string(RTMPBuffer* buffer, const char* str);
-int rtmp_amf0_write_number(RTMPBuffer* buffer, double number);
-int rtmp_amf0_write_boolean(RTMPBuffer* buffer, uint8_t boolean);
-int rtmp_amf0_write_null(RTMPBuffer* buffer);
-int rtmp_amf0_write_object_start(RTMPBuffer* buffer);
-int rtmp_amf0_write_object_end(RTMPBuffer* buffer);
+// Funções de encode
+int amf0_encode_string(char* str, uint8_t* buffer, size_t* size);
+int amf0_encode_number(double number, uint8_t* buffer, size_t* size);
+int amf0_encode_boolean(bool boolean, uint8_t* buffer, size_t* size);
+int amf0_encode_null(uint8_t* buffer, size_t* size);
 
-// Funções de decoding
-int rtmp_amf0_read_string(RTMPBuffer* buffer, char** str, uint16_t* len);
-int rtmp_amf0_read_number(RTMPBuffer* buffer, double* number);
-int rtmp_amf0_read_boolean(RTMPBuffer* buffer, uint8_t* boolean);
-int rtmp_amf0_read_object_start(RTMPBuffer* buffer);
-int rtmp_amf0_read_object_end(RTMPBuffer* buffer);
-
-#ifdef __cplusplus
-}
-#endif
+// Função para liberar recursos
+void amf_value_free(AMFValue* value);
 
 #endif
