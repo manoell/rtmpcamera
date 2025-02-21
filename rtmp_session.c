@@ -1,15 +1,21 @@
 // rtmp_session.c
+#include "rtmp_core.h"
 #include "rtmp_session.h"
-#include "rtmp_amf.h"
+#include "rtmp_protocol.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/time.h>
 
 static uint64_t get_current_time() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void* session_thread(void* arg) {
+    RTMPSession* session = (RTMPSession*)arg;
+    rtmp_log(RTMP_LOG_INFO, "Session thread started");
+    return NULL;
 }
 
 RTMPSession* rtmp_session_create(int socket_fd, struct RTMPServer* server) {
@@ -24,7 +30,6 @@ RTMPSession* rtmp_session_create(int socket_fd, struct RTMPServer* server) {
     session->state = RTMP_SESSION_CREATED;
     session->is_running = false;
     
-    // Passa o socket_fd para criar o chunk_stream
     session->chunk_stream = rtmp_chunk_stream_create(socket_fd);
     if (!session->chunk_stream) {
         free(session);
@@ -32,7 +37,16 @@ RTMPSession* rtmp_session_create(int socket_fd, struct RTMPServer* server) {
         return NULL;
     }
 
-    pthread_mutex_init(&session->mutex, NULL);
+    if (pthread_mutex_init(&session->mutex, NULL) != 0) {
+        rtmp_chunk_stream_destroy(session->chunk_stream);
+        free(session);
+        rtmp_log(RTMP_LOG_ERROR, "Failed to init mutex");
+        return NULL;
+    }
+
+    // Inicializar stream info
+    memset(&session->stream_info, 0, sizeof(RTMPStreamInfo));
+    session->stream_info.start_time = get_current_time();
 
     rtmp_log(RTMP_LOG_INFO, "Created new RTMP session (fd: %d)", socket_fd);
     return session;
@@ -49,26 +63,46 @@ void rtmp_session_destroy(RTMPSession* session) {
     
     pthread_mutex_destroy(&session->mutex);
     
-    close(session->socket_fd);
     free(session);
-    
-    rtmp_log(RTMP_LOG_INFO, "Destroyed RTMP session");
+    rtmp_log(RTMP_LOG_INFO, "Session destroyed");
 }
 
-static void* session_thread(void* arg) {
-    RTMPSession* session = (RTMPSession*)arg;
+int rtmp_session_process(RTMPSession* session) {
+    if (!session) return RTMP_ERROR_MEMORY;
+
+    RTMPMessage message;
+    memset(&message, 0, sizeof(message));
+
+    int ret = rtmp_chunk_read(session->chunk_stream, &message);
+    if (ret != RTMP_OK) {
+        rtmp_log(RTMP_LOG_ERROR, "Failed to read chunk");
+        return ret;
+    }
+
+    // Processar mensagem
+    rtmp_protocol_handle_message(session, &message);
     
-    // Realiza handshake
-    if (rtmp_handshake_perform(session) != RTMP_OK) {
+    // Liberar recursos da mensagem
+    rtmp_message_free(&message);
+
+    return RTMP_OK;
+}
+
+void rtmp_session_handle_connect(RTMPSession* session) {
+    if (!session) return;
+
+    // Processar handshake
+    int ret = rtmp_handshake_perform(session);
+    if (ret != RTMP_OK) {
         rtmp_log(RTMP_LOG_ERROR, "Handshake failed");
         session->state = RTMP_SESSION_ERROR;
-        return NULL;
+        return;
     }
-    
+
     session->state = RTMP_SESSION_HANDSHAKE;
     rtmp_log(RTMP_LOG_INFO, "Session handshake completed");
 
-    // Loop principal de processamento
+    // Loop principal
     while (session->is_running) {
         if (rtmp_session_process(session) != RTMP_OK) {
             break;
@@ -76,7 +110,6 @@ static void* session_thread(void* arg) {
     }
 
     session->state = RTMP_SESSION_CLOSED;
-    return NULL;
 }
 
 int rtmp_session_start(RTMPSession* session) {
@@ -85,13 +118,12 @@ int rtmp_session_start(RTMPSession* session) {
     session->is_running = true;
     session->stream_info.start_time = get_current_time();
     
-    // Cria thread dedicada para a sessão
     if (pthread_create(&session->thread, NULL, session_thread, session) != 0) {
         rtmp_log(RTMP_LOG_ERROR, "Failed to create session thread");
         return RTMP_ERROR_MEMORY;
     }
 
-    rtmp_log(RTMP_LOG_INFO, "Started RTMP session");
+    rtmp_log(RTMP_LOG_INFO, "Session started");
     return RTMP_OK;
 }
 
@@ -101,105 +133,19 @@ void rtmp_session_stop(RTMPSession* session) {
     session->is_running = false;
     pthread_join(session->thread, NULL);
     
-    rtmp_log(RTMP_LOG_INFO, "Stopped RTMP session");
+    rtmp_log(RTMP_LOG_INFO, "Session stopped");
 }
 
-int rtmp_session_process(RTMPSession* session) {
-    if (!session) return RTMP_ERROR_MEMORY;
-
-    RTMPMessage message;
-    memset(&message, 0, sizeof(message));
-
-    // Chama rtmp_chunk_read com o chunk_stream
-    int ret = rtmp_chunk_read(session->chunk_stream, &message);
-    if (ret != RTMP_OK) {
-        rtmp_log(RTMP_LOG_ERROR, "Failed to read chunk");
-        return ret;
-    }
-
-    // Processa a mensagem
-    rtmp_session_handle_message(session, &message);
-    
-    // Libera recursos da mensagem
-    if (message.payload) {
-        free(message.payload);
-    }
-
-    return RTMP_OK;
-}
-
-void rtmp_session_handle_message(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message) return;
+void rtmp_session_update_stats(RTMPSession* session) {
+    if (!session) return;
 
     pthread_mutex_lock(&session->mutex);
 
-    switch (message->message_type_id) {
-        case RTMP_MSG_VIDEO:
-            session->stream_info.total_frames++;
-            rtmp_session_update_stream_info(session, message);
-            break;
-
-        case RTMP_MSG_COMMAND_AMF0: {
-            // Corrigido: Criação e uso do RTMPBuffer
-            RTMPBuffer* buffer = rtmp_buffer_create(message->message_length);
-            if (buffer) {
-                memcpy(buffer->data, message->payload, message->message_length);
-                buffer->size = message->message_length;
-                
-                char* command_name;
-                uint16_t name_len;
-                if (rtmp_amf0_read_string(buffer, &command_name, &name_len) == RTMP_OK) {
-                    rtmp_log(RTMP_LOG_DEBUG, "Received command: %s", command_name);
-                    free(command_name);
-                }
-                
-                rtmp_buffer_destroy(buffer);
-            }
-            break;
-        }
+    uint64_t current_time = get_current_time();
+    if (current_time > session->stream_info.start_time) {
+        double elapsed = (current_time - session->stream_info.start_time) / 1000.0;
+        session->stream_info.fps = session->stream_info.total_frames / elapsed;
     }
 
     pthread_mutex_unlock(&session->mutex);
-}
-
-void rtmp_session_update_stream_info(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message) return;
-
-    uint64_t current_time = get_current_time();
-    
-    // Calcula FPS atual
-    if (current_time > session->stream_info.start_time) {
-        double elapsed_seconds = (current_time - session->stream_info.start_time) / 1000.0;
-        session->stream_info.fps = session->stream_info.total_frames / elapsed_seconds;
-    }
-
-    // Calcula latência de rede
-    session->stream_info.network_latency = 
-        (float)(current_time - message->timestamp);
-
-    // Log periódico das estatísticas (a cada 5 segundos)
-    static uint64_t last_log = 0;
-    if (current_time - last_log > 5000) {
-        rtmp_session_log_stats(session);
-        last_log = current_time;
-    }
-}
-
-void rtmp_session_log_stats(RTMPSession* session) {
-    if (!session) return;
-
-    rtmp_log(RTMP_LOG_INFO, "Stream Statistics:");
-    rtmp_log(RTMP_LOG_INFO, "  Resolution: %dx%d", 
-             session->stream_info.width, 
-             session->stream_info.height);
-    rtmp_log(RTMP_LOG_INFO, "  FPS: %.2f", 
-             session->stream_info.fps);
-    rtmp_log(RTMP_LOG_INFO, "  Video Bitrate: %d kbps", 
-             session->stream_info.video_bitrate / 1000);
-    rtmp_log(RTMP_LOG_INFO, "  Audio Bitrate: %d kbps", 
-             session->stream_info.audio_bitrate / 1000);
-    rtmp_log(RTMP_LOG_INFO, "  Network Latency: %.2f ms", 
-             session->stream_info.network_latency);
-    rtmp_log(RTMP_LOG_INFO, "  Total Frames: %u", 
-             session->stream_info.total_frames);
 }

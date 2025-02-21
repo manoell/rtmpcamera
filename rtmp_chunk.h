@@ -6,10 +6,6 @@
 #include "rtmp_protocol.h"
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // Tamanhos de chunk
 #define RTMP_CHUNK_SIZE_MAX 65536
 #define RTMP_CHUNK_SIZE_MIN 128
@@ -29,9 +25,5 @@ int rtmp_chunk_write(RTMPChunkStream* cs, RTMPMessage* message);
 
 void rtmp_chunk_set_size(RTMPChunkStream* cs, uint32_t size);
 void rtmp_chunk_update_window(RTMPChunkStream* cs, uint32_t size);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif
