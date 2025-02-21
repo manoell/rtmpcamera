@@ -1,213 +1,321 @@
 #include "rtmp_commands.h"
 #include "rtmp_amf.h"
+#include "rtmp_core.h"
+#include "rtmp_utils.h"
 #include <string.h>
-#include <errno.h>
+#include <stdlib.h>
 
-static int send_amf_command_response(RTMPClient* client, const char* command_name, 
-                                   double transaction_id, const char* description) {
-    uint8_t response[1024];  // Buffer grande o suficiente
-    size_t offset = 0;
+// Command Names
+#define RTMP_CMD_CONNECT        "connect"
+#define RTMP_CMD_CREATE_STREAM  "createStream"
+#define RTMP_CMD_PLAY          "play"
+#define RTMP_CMD_PAUSE         "pause"
+#define RTMP_CMD_RELEASE       "releaseStream"
+#define RTMP_CMD_FC_PUBLISH    "FCPublish"
+#define RTMP_CMD_PUBLISH       "publish"
+#define RTMP_CMD_DELETE_STREAM "deleteStream"
+#define RTMP_CMD_CLOSE        "close"
+
+// Response Status
+#define RTMP_STATUS_OK         "NetStream.Play.Start"
+#define RTMP_STATUS_STREAM_NOT_FOUND "NetStream.Play.StreamNotFound"
+#define RTMP_STATUS_PUBLISH_START "NetStream.Publish.Start"
+#define RTMP_STATUS_UNPUBLISH_SUCCESS "NetStream.Unpublish.Success"
+
+typedef struct {
+    double transaction_id;
+    char *command_name;
+    rtmp_amf_t *response;
+} rtmp_command_t;
+
+static rtmp_command_t* rtmp_command_create(void) {
+    rtmp_command_t *cmd = (rtmp_command_t*)malloc(sizeof(rtmp_command_t));
+    if (!cmd) return NULL;
+    
+    cmd->command_name = NULL;
+    cmd->transaction_id = 0;
+    cmd->response = rtmp_amf_create();
+    
+    if (!cmd->response) {
+        free(cmd);
+        return NULL;
+    }
+    
+    return cmd;
+}
+
+static void rtmp_command_destroy(rtmp_command_t *cmd) {
+    if (cmd) {
+        if (cmd->command_name) free(cmd->command_name);
+        if (cmd->response) rtmp_amf_destroy(cmd->response);
+        free(cmd);
+    }
+}
+
+static int rtmp_send_error(rtmp_session_t *session, double transaction_id, 
+                          const char *level, const char *code, const char *desc) {
+    rtmp_amf_t *amf = rtmp_amf_create();
+    if (!amf) return -1;
+    
+    rtmp_amf_encode_string(amf, "_error");
+    rtmp_amf_encode_number(amf, transaction_id);
+    rtmp_amf_encode_null(amf);
+    
+    rtmp_amf_begin_object(amf);
+    rtmp_amf_encode_string(amf, "level");
+    rtmp_amf_encode_string(amf, level);
+    rtmp_amf_encode_string(amf, "code");
+    rtmp_amf_encode_string(amf, code);
+    rtmp_amf_encode_string(amf, "description");
+    rtmp_amf_encode_string(amf, desc);
+    rtmp_amf_end_object(amf);
+    
     size_t size;
-
-    // Command name
-    size = sizeof(response) - offset;
-    if (amf0_encode_string((char*)command_name, response + offset, &size) != RTMP_OK) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-    offset += size;
-
-    // Transaction ID
-    size = sizeof(response) - offset;
-    if (amf0_encode_number(transaction_id, response + offset, &size) != RTMP_OK) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-    offset += size;
-
-    // Command info object
-    response[offset++] = AMF0_OBJECT;
-
-    // Add properties
-    const char* props[] = {"level", "code", "description"};
-    const char* values[] = {"status", "_Result", description};
+    const uint8_t *data = rtmp_amf_get_data(amf, &size);
+    int result = rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, data, size);
     
-    for (int i = 0; i < 3; i++) {
-        size = sizeof(response) - offset;
-        if (amf0_encode_string((char*)props[i], response + offset, &size) != RTMP_OK) {
-            return RTMP_ERROR_PROTOCOL;
-        }
-        offset += size;
-
-        size = sizeof(response) - offset;
-        if (amf0_encode_string((char*)values[i], response + offset, &size) != RTMP_OK) {
-            return RTMP_ERROR_PROTOCOL;
-        }
-        offset += size;
-    }
-
-    // Object end marker
-    response[offset++] = 0x00;
-    response[offset++] = 0x00;
-    response[offset++] = AMF0_OBJECT_END;
-
-    // Criar header RTMP
-    uint8_t header[12] = {
-        0x03,  // fmt = 0, csid = 3
-        0x00, 0x00, 0x00,  // timestamp
-        (offset >> 16) & 0xFF, (offset >> 8) & 0xFF, offset & 0xFF,  // message length
-        0x14,  // message type (20 = AMF0 Command)
-        0x00, 0x00, 0x00, 0x00  // message stream id
-    };
-
-    // Enviar header e payload
-    if (write_with_timeout(client->socket_fd, header, sizeof(header), 5000) < 0) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-    if (write_with_timeout(client->socket_fd, response, offset, 5000) < 0) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    rtmp_log(RTMP_LOG_DEBUG, "Sent command response: %s", command_name);
-    return RTMP_OK;
+    rtmp_amf_destroy(amf);
+    return result;
 }
 
-static int send_connect_response(RTMPClient* client) {
-    // Enviar configurações iniciais
-    uint8_t win_ack[] = {
-        0x02,  // fmt = 0, csid = 2
-        0x00, 0x00, 0x00,  // timestamp
-        0x00, 0x00, 0x04,  // message length
-        0x05,  // message type (5 = Window Acknowledgement Size)
-        0x00, 0x00, 0x00, 0x00,  // stream id
-        0x00, 0x26, 0x25, 0xA0  // window size (2.5MB)
-    };
-
-    uint8_t set_peer_bw[] = {
-        0x02,  // fmt = 0, csid = 2
-        0x00, 0x00, 0x00,  // timestamp
-        0x00, 0x00, 0x05,  // message length
-        0x06,  // message type (6 = Set Peer Bandwidth)
-        0x00, 0x00, 0x00, 0x00,  // stream id
-        0x00, 0x26, 0x25, 0xA0,  // window size (2.5MB)
-        0x02  // dynamic
-    };
-
-    uint8_t set_chunk_size[] = {
-        0x02,  // fmt = 0, csid = 2
-        0x00, 0x00, 0x00,  // timestamp
-        0x00, 0x00, 0x04,  // message length
-        0x01,  // message type (1 = Set Chunk Size)
-        0x00, 0x00, 0x00, 0x00,  // stream id
-        0x00, 0x00, 0x10, 0x00  // chunk size (4096)
-    };
-
-    if (write_with_timeout(client->socket_fd, win_ack, sizeof(win_ack), 5000) < 0 ||
-        write_with_timeout(client->socket_fd, set_peer_bw, sizeof(set_peer_bw), 5000) < 0 ||
-        write_with_timeout(client->socket_fd, set_chunk_size, sizeof(set_chunk_size), 5000) < 0) {
-        return RTMP_ERROR_PROTOCOL;
+static int rtmp_send_result(rtmp_session_t *session, double transaction_id, 
+                           const char *command, const char *code, 
+                           const char *level, const char *description) {
+    rtmp_amf_t *amf = rtmp_amf_create();
+    if (!amf) return -1;
+    
+    rtmp_amf_encode_string(amf, "_result");
+    rtmp_amf_encode_number(amf, transaction_id);
+    rtmp_amf_encode_null(amf);
+    
+    rtmp_amf_begin_object(amf);
+    if (code) {
+        rtmp_amf_encode_string(amf, "code");
+        rtmp_amf_encode_string(amf, code);
     }
-
-    return send_amf_command_response(client, "_result", 1, "Connection succeeded");
+    if (level) {
+        rtmp_amf_encode_string(amf, "level");
+        rtmp_amf_encode_string(amf, level);
+    }
+    if (description) {
+        rtmp_amf_encode_string(amf, "description");
+        rtmp_amf_encode_string(amf, description);
+    }
+    rtmp_amf_end_object(amf);
+    
+    size_t size;
+    const uint8_t *data = rtmp_amf_get_data(amf, &size);
+    int result = rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, data, size);
+    
+    rtmp_amf_destroy(amf);
+    return result;
 }
 
-static int handle_connect_command(RTMPClient* client, uint8_t* data, size_t size) {
-    char* command_name;
-    uint16_t name_len;
+int rtmp_handle_connect(rtmp_session_t *session, const uint8_t *payload, size_t size) {
     size_t offset = 0;
+    char *command_name = NULL;
+    double transaction_id = 0;
     
-    // Decode command name
-    int ret = amf0_decode_string(data, size, &command_name, &name_len);
-    if (ret < 0) return ret;
-    offset += ret;
-
-    // Decode transaction ID
-    double transaction_id;
-    ret = amf0_decode_number(data + offset, size - offset, &transaction_id);
-    if (ret < 0) {
-        free(command_name);
-        return ret;
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &transaction_id) < 0) {
+        if (command_name) free(command_name);
+        return -1;
     }
-
-    rtmp_log(RTMP_LOG_INFO, "Received connect command (transaction_id: %f)", transaction_id);
-
+    
+    // Skip properties object parsing for now
+    
+    // Send window acknowledgement size
+    rtmp_send_window_acknowledgement_size(session, RTMP_DEFAULT_WINDOW_SIZE);
+    
+    // Send set peer bandwidth
+    rtmp_send_set_peer_bandwidth(session, RTMP_DEFAULT_WINDOW_SIZE, 2);
+    
+    // Send stream begin
+    rtmp_send_user_control(session, RTMP_USER_STREAM_BEGIN, 0);
+    
+    // Send connect result
+    int result = rtmp_send_result(session, transaction_id, 
+                                 "_result",
+                                 "NetConnection.Connect.Success",
+                                 "status",
+                                 "Connection succeeded.");
+    
     free(command_name);
-    return send_connect_response(client);
+    return result;
 }
 
-static int handle_createStream_command(RTMPClient* client, uint8_t* data, size_t size) {
-    char* command_name;
-    uint16_t name_len;
+int rtmp_handle_create_stream(rtmp_session_t *session, const uint8_t *payload, size_t size) {
     size_t offset = 0;
+    char *command_name = NULL;
+    double transaction_id = 0;
     
-    int ret = amf0_decode_string(data, size, &command_name, &name_len);
-    if (ret < 0) return ret;
-    offset += ret;
-
-    double transaction_id;
-    ret = amf0_decode_number(data + offset, size - offset, &transaction_id);
-    if (ret < 0) {
-        free(command_name);
-        return ret;
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &transaction_id) < 0) {
+        if (command_name) free(command_name);
+        return -1;
     }
-
-    rtmp_log(RTMP_LOG_INFO, "Received createStream command (transaction_id: %f)", transaction_id);
-
-    ret = send_amf_command_response(client, "_result", transaction_id, "Stream created");
+    
+    // Create new stream ID
+    uint32_t stream_id = rtmp_session_create_stream(session);
+    
+    rtmp_amf_t *amf = rtmp_amf_create();
+    if (!amf) {
+        free(command_name);
+        return -1;
+    }
+    
+    rtmp_amf_encode_string(amf, "_result");
+    rtmp_amf_encode_number(amf, transaction_id);
+    rtmp_amf_encode_null(amf);
+    rtmp_amf_encode_number(amf, stream_id);
+    
+    size_t resp_size;
+    const uint8_t *data = rtmp_amf_get_data(amf, &resp_size);
+    int result = rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, data, resp_size);
+    
+    rtmp_amf_destroy(amf);
     free(command_name);
-    return ret;
+    return result;
 }
 
-int rtmp_handle_packet(RTMPClient* client, uint8_t* data, size_t size) {
-    if (!client || !data || size < 1) return RTMP_ERROR_PROTOCOL;
-
-    RTMPChunkHeader header = {0};
-    int ret = rtmp_read_chunk_header(client, &header);
-    if (ret != RTMP_OK) return ret;
-
-    // Alocar buffer para o payload
-    uint8_t* payload = malloc(header.length);
-    if (!payload) return RTMP_ERROR_MEMORY;
-
-    if (read_with_timeout(client->socket_fd, payload, header.length, 5000) != header.length) {
-        free(payload);
-        return RTMP_ERROR_PROTOCOL;
+int rtmp_handle_publish(rtmp_session_t *session, const uint8_t *payload, size_t size) {
+    size_t offset = 0;
+    char *command_name = NULL;
+    double transaction_id = 0;
+    char *stream_name = NULL;
+    
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &transaction_id) < 0 ||
+        rtmp_amf_decode_null(payload, size, &offset) < 0 ||
+        rtmp_amf_decode_string(payload, size, &offset, &stream_name) < 0) {
+        if (command_name) free(command_name);
+        if (stream_name) free(stream_name);
+        return -1;
     }
-
-    switch (header.type_id) {
-        case RTMP_MSG_COMMAND_AMF0: {
-            // Verificar o tipo de comando
-            char* command_name;
-            uint16_t name_len;
-            if (amf0_decode_string(payload, header.length, &command_name, &name_len) > 0) {
-                rtmp_log(RTMP_LOG_DEBUG, "Received command: %s", command_name);
-                
-                if (strcmp(command_name, "connect") == 0) {
-                    ret = handle_connect_command(client, payload, header.length);
-                } else if (strcmp(command_name, "createStream") == 0) {
-                    ret = handle_createStream_command(client, payload, header.length);
-                } else {
-                    rtmp_log(RTMP_LOG_DEBUG, "Unknown command: %s", command_name);
-                }
-                
-                free(command_name);
-            }
-            break;
-        }
-
-        case RTMP_MSG_VIDEO:
-            rtmp_log(RTMP_LOG_DEBUG, "Received video packet: %u bytes", header.length);
-            // TODO: Implementar processamento de vídeo
-            break;
-
-        case RTMP_MSG_AUDIO:
-            rtmp_log(RTMP_LOG_DEBUG, "Received audio packet: %u bytes", header.length);
-            // TODO: Implementar processamento de áudio
-            break;
-
-        default:
-            rtmp_log(RTMP_LOG_DEBUG, "Unhandled message type: %d", header.type_id);
-            break;
+    
+    // Setup publish stream
+    if (rtmp_session_set_publish_stream(session, stream_name) < 0) {
+        rtmp_send_error(session, transaction_id,
+                       "error",
+                       "NetStream.Publish.BadName",
+                       "Stream name already in use.");
+        free(command_name);
+        free(stream_name);
+        return -1;
     }
+    
+    // Send publish success response
+    int result = rtmp_send_result(session, transaction_id,
+                                 "onStatus",
+                                 RTMP_STATUS_PUBLISH_START,
+                                 "status",
+                                 "Stream is now published.");
+    
+    free(command_name);
+    free(stream_name);
+    return result;
+}
 
-    free(payload);
-    return ret;
+int rtmp_handle_play(rtmp_session_t *session, const uint8_t *payload, size_t size) {
+    size_t offset = 0;
+    char *command_name = NULL;
+    double transaction_id = 0;
+    char *stream_name = NULL;
+    
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &transaction_id) < 0 ||
+        rtmp_amf_decode_null(payload, size, &offset) < 0 ||
+        rtmp_amf_decode_string(payload, size, &offset, &stream_name) < 0) {
+        if (command_name) free(command_name);
+        if (stream_name) free(stream_name);
+        return -1;
+    }
+    
+    // Setup play stream
+    if (rtmp_session_set_play_stream(session, stream_name) < 0) {
+        rtmp_send_error(session, transaction_id,
+                       "error",
+                       RTMP_STATUS_STREAM_NOT_FOUND,
+                       "Stream not found.");
+        free(command_name);
+        free(stream_name);
+        return -1;
+    }
+    
+    // Send stream begin
+    rtmp_send_user_control(session, RTMP_USER_STREAM_BEGIN, session->stream_id);
+    
+    // Send play reset
+    rtmp_send_result(session, 0,
+                     "onStatus",
+                     "NetStream.Play.Reset",
+                     "status",
+                     "Playing and resetting stream.");
+    
+    // Send play start
+    int result = rtmp_send_result(session, 0,
+                                 "onStatus",
+                                 RTMP_STATUS_OK,
+                                 "status",
+                                 "Started playing stream.");
+    
+    free(command_name);
+    free(stream_name);
+    return result;
+}
+
+int rtmp_handle_delete_stream(rtmp_session_t *session, const uint8_t *payload, size_t size) {
+    size_t offset = 0;
+    char *command_name = NULL;
+    double transaction_id = 0;
+    double stream_id = 0;
+    
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &transaction_id) < 0 ||
+        rtmp_amf_decode_null(payload, size, &offset) < 0 ||
+        rtmp_amf_decode_number(payload, size, &offset, &stream_id) < 0) {
+        if (command_name) free(command_name);
+        return -1;
+    }
+    
+    rtmp_session_delete_stream(session, (uint32_t)stream_id);
+    
+    free(command_name);
+    return 0;
+}
+
+int rtmp_handle_command(rtmp_session_t *session, const uint8_t *payload, size_t size) {
+    if (!size) return -1;
+    
+    size_t offset = 0;
+    char *command_name = NULL;
+    
+    if (rtmp_amf_decode_string(payload, size, &offset, &command_name) < 0) {
+        return -1;
+    }
+    
+    int result = -1;
+    
+    if (strcmp(command_name, RTMP_CMD_CONNECT) == 0) {
+        result = rtmp_handle_connect(session, payload, size);
+    }
+    else if (strcmp(command_name, RTMP_CMD_CREATE_STREAM) == 0) {
+        result = rtmp_handle_create_stream(session, payload, size);
+    }
+    else if (strcmp(command_name, RTMP_CMD_PUBLISH) == 0) {
+        result = rtmp_handle_publish(session, payload, size);
+    }
+    else if (strcmp(command_name, RTMP_CMD_PLAY) == 0) {
+        result = rtmp_handle_play(session, payload, size);
+    }
+    else if (strcmp(command_name, RTMP_CMD_DELETE_STREAM) == 0) {
+        result = rtmp_handle_delete_stream(session, payload, size);
+    }
+    // Outros comandos podem ser ignorados por enquanto
+    else {
+        result = 0;
+    }
+    
+    free(command_name);
+    return result;
 }

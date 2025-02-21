@@ -13,7 +13,7 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <arpa/inet.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,8 +22,34 @@ extern "C" {
 // Definições de log
 #define RTMP_LOG_FILE "/var/tmp/rtmp_debug.log"
 #define RTMP_MAX_CONNECTIONS 10
-#define RTMP_BUFFER_SIZE 65536
 
+// Tipos de mensagens RTMP
+#define RTMP_MSG_CHUNK_SIZE        1
+#define RTMP_MSG_ABORT            2
+#define RTMP_MSG_ACK              3
+#define RTMP_MSG_USER_CONTROL     4
+#define RTMP_MSG_WINDOW_ACK_SIZE  5
+#define RTMP_MSG_SET_PEER_BW      6
+#define RTMP_MSG_AUDIO            8
+#define RTMP_MSG_VIDEO            9
+#define RTMP_MSG_AMF3_DATA       15
+#define RTMP_MSG_AMF3_SHARED     16
+#define RTMP_MSG_AMF3_CMD        17
+#define RTMP_MSG_AMF0_DATA       18
+#define RTMP_MSG_AMF0_SHARED     19
+#define RTMP_MSG_AMF0_CMD        20
+
+// Estados RTMP
+#define RTMP_STATE_UNINITIALIZED   0
+#define RTMP_STATE_VERSION_SENT    1
+#define RTMP_STATE_ACK_SENT       2
+#define RTMP_STATE_HANDSHAKE_DONE 3
+#define RTMP_STATE_CONNECT        4
+#define RTMP_STATE_CONNECTED      5
+#define RTMP_STATE_CREATE_STREAM  6
+#define RTMP_STATE_READY         7
+
+// Tipos de log
 typedef enum {
     RTMP_LOG_DEBUG,
     RTMP_LOG_INFO,
@@ -31,33 +57,45 @@ typedef enum {
     RTMP_LOG_ERROR
 } RTMPLogLevel;
 
-// Estados do cliente RTMP
-#define RTMP_STATE_HANDSHAKE_S0S1 0
-#define RTMP_STATE_HANDSHAKE_S2   1
-#define RTMP_STATE_CONNECT        2
-#define RTMP_STATE_READY          3
+// Estrutura da mensagem RTMP
+typedef struct {
+    uint8_t type;
+    uint32_t timestamp;
+    uint32_t message_length;
+    uint8_t message_type_id;
+    uint32_t stream_id;
+    uint8_t* payload;
+    size_t payload_size;
+} RTMPMessage;
 
-// Estrutura do cliente
-typedef struct RTMPClient {
+// Estrutura do cliente RTMP
+typedef struct {
     int socket_fd;
     struct sockaddr_in addr;
-    uint8_t *in_buffer;
-    uint8_t *out_buffer;
+    uint8_t* in_buffer;
+    uint8_t* out_buffer;
     size_t in_buffer_size;
     size_t out_buffer_size;
     int state;
     pthread_t thread;
     bool running;
-    void *user_data;
+    void* user_data;
+    uint32_t chunk_size;
+    uint32_t window_size;
+    uint32_t bandwidth;
+    uint8_t bandwidth_limit_type;
+    uint32_t bytes_in;
+    uint32_t bytes_out;
+    RTMPMessage* current_message;
 } RTMPClient;
 
 // Estrutura do servidor
-typedef struct RTMPServer {
+typedef struct {
     int socket_fd;
     bool running;
     pthread_t accept_thread;
     struct sockaddr_in addr;
-    RTMPClient *clients[RTMP_MAX_CONNECTIONS];
+    RTMPClient* clients[RTMP_MAX_CONNECTIONS];
     int client_count;
     pthread_mutex_t clients_mutex;
 } RTMPServer;
@@ -78,15 +116,8 @@ void rtmp_server_destroy(RTMPServer* server);
 int rtmp_server_start(RTMPServer* server);
 void rtmp_server_stop(RTMPServer* server);
 
-// Funções de handshake
-int rtmp_handshake_handle(RTMPClient *client);
-
-// Funções de leitura/escrita com timeout
-ssize_t read_with_timeout(int fd, void *buf, size_t count, int timeout_ms);
-ssize_t write_with_timeout(int fd, const void *buf, size_t count, int timeout_ms);
-
-// Função de processamento de pacotes
-int rtmp_handle_packet(RTMPClient *client, uint8_t *data, size_t size);
+// Função de handshake
+int rtmp_handshake_perform(RTMPClient* client);
 
 #ifdef __cplusplus
 }

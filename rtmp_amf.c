@@ -1,163 +1,212 @@
 #include "rtmp_amf.h"
+#include "rtmp_utils.h"
 #include <string.h>
-#include <arpa/inet.h>
+#include <stdlib.h>
 
-// Helpers
-static uint16_t read_uint16(uint8_t* data) {
-    return (data[0] << 8) | data[1];
-}
+// AMF0 type markers
+#define AMF0_NUMBER      0x00
+#define AMF0_BOOLEAN     0x01
+#define AMF0_STRING      0x02
+#define AMF0_OBJECT      0x03
+#define AMF0_NULL        0x05
+#define AMF0_UNDEFINED   0x06
+#define AMF0_REFERENCE   0x07
+#define AMF0_ECMA_ARRAY  0x08
+#define AMF0_OBJECT_END  0x09
+#define AMF0_STRICT_ARRAY 0x0A
+#define AMF0_DATE        0x0B
+#define AMF0_LONG_STRING 0x0C
 
-static void write_uint16(uint8_t* buffer, uint16_t value) {
-    buffer[0] = (value >> 8) & 0xFF;
-    buffer[1] = value & 0xFF;
-}
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+    size_t position;
+} amf_buffer_t;
 
-// Decode functions
-int amf0_decode_string(uint8_t* data, size_t size, char** str, uint16_t* length) {
-    if (size < 3) return RTMP_ERROR_PROTOCOL; // Tipo + tamanho
-
-    uint8_t type = data[0];
-    if (type != AMF0_STRING && type != AMF0_LONG_STRING) {
-        rtmp_log(RTMP_LOG_ERROR, "Expected string type, got %02x", type);
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    uint16_t str_len = read_uint16(data + 1);
-    if (size < 3 + str_len) return RTMP_ERROR_PROTOCOL;
-
-    *str = malloc(str_len + 1);
-    if (!*str) return RTMP_ERROR_MEMORY;
-
-    memcpy(*str, data + 3, str_len);
-    (*str)[str_len] = '\0';
-    *length = str_len;
-
-    rtmp_log(RTMP_LOG_DEBUG, "Decoded string: %s (len: %d)", *str, str_len);
-    return 3 + str_len; // Retorna bytes consumidos
-}
-
-int amf0_decode_number(uint8_t* data, size_t size, double* number) {
-    if (size < 9) return RTMP_ERROR_PROTOCOL; // Tipo + 8 bytes
-
-    if (data[0] != AMF0_NUMBER) {
-        rtmp_log(RTMP_LOG_ERROR, "Expected number type, got %02x", data[0]);
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    uint64_t bits = ((uint64_t)data[1] << 56) |
-                    ((uint64_t)data[2] << 48) |
-                    ((uint64_t)data[3] << 40) |
-                    ((uint64_t)data[4] << 32) |
-                    ((uint64_t)data[5] << 24) |
-                    ((uint64_t)data[6] << 16) |
-                    ((uint64_t)data[7] << 8) |
-                    data[8];
-    memcpy(number, &bits, 8);
-
-    rtmp_log(RTMP_LOG_DEBUG, "Decoded number: %f", *number);
-    return 9; // Tipo + 8 bytes
-}
-
-int amf0_decode_boolean(uint8_t* data, size_t size, bool* boolean) {
-    if (size < 2) return RTMP_ERROR_PROTOCOL; // Tipo + valor
-
-    if (data[0] != AMF0_BOOLEAN) {
-        rtmp_log(RTMP_LOG_ERROR, "Expected boolean type, got %02x", data[0]);
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    *boolean = data[1] != 0;
-    rtmp_log(RTMP_LOG_DEBUG, "Decoded boolean: %d", *boolean);
-    return 2;
-}
-
-int amf0_decode_null(uint8_t* data, size_t size) {
-    if (size < 1) return RTMP_ERROR_PROTOCOL;
-
-    if (data[0] != AMF0_NULL) {
-        rtmp_log(RTMP_LOG_ERROR, "Expected null type, got %02x", data[0]);
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    rtmp_log(RTMP_LOG_DEBUG, "Decoded null");
-    return 1;
-}
-
-// Encode functions
-int amf0_encode_string(char* str, uint8_t* buffer, size_t* size) {
-    uint16_t str_len = strlen(str);
-    size_t needed = 3 + str_len; // Tipo + tamanho + string
-
-    if (buffer && *size >= needed) {
-        buffer[0] = AMF0_STRING;
-        write_uint16(buffer + 1, str_len);
-        memcpy(buffer + 3, str, str_len);
+static amf_buffer_t* amf_buffer_create(size_t initial_capacity) {
+    amf_buffer_t *buffer = (amf_buffer_t*)malloc(sizeof(amf_buffer_t));
+    if (!buffer) return NULL;
+    
+    buffer->data = (uint8_t*)malloc(initial_capacity);
+    if (!buffer->data) {
+        free(buffer);
+        return NULL;
     }
     
-    *size = needed;
-    return RTMP_OK;
+    buffer->size = 0;
+    buffer->capacity = initial_capacity;
+    buffer->position = 0;
+    return buffer;
 }
 
-int amf0_encode_number(double number, uint8_t* buffer, size_t* size) {
-    size_t needed = 9; // Tipo + 8 bytes
-    
-    if (buffer && *size >= needed) {
-        buffer[0] = AMF0_NUMBER;
-        uint64_t bits;
-        memcpy(&bits, &number, 8);
+static void amf_buffer_destroy(amf_buffer_t *buffer) {
+    if (buffer) {
+        free(buffer->data);
+        free(buffer);
+    }
+}
+
+static int amf_buffer_ensure_capacity(amf_buffer_t *buffer, size_t additional) {
+    if (buffer->size + additional > buffer->capacity) {
+        size_t new_capacity = buffer->capacity * 2;
+        if (new_capacity < buffer->size + additional) {
+            new_capacity = buffer->size + additional;
+        }
         
-        // Big endian
-        buffer[1] = (bits >> 56) & 0xFF;
-        buffer[2] = (bits >> 48) & 0xFF;
-        buffer[3] = (bits >> 40) & 0xFF;
-        buffer[4] = (bits >> 32) & 0xFF;
-        buffer[5] = (bits >> 24) & 0xFF;
-        buffer[6] = (bits >> 16) & 0xFF;
-        buffer[7] = (bits >> 8) & 0xFF;
-        buffer[8] = bits & 0xFF;
+        uint8_t *new_data = (uint8_t*)realloc(buffer->data, new_capacity);
+        if (!new_data) return -1;
+        
+        buffer->data = new_data;
+        buffer->capacity = new_capacity;
     }
-    
-    *size = needed;
-    return RTMP_OK;
+    return 0;
 }
 
-int amf0_encode_boolean(bool boolean, uint8_t* buffer, size_t* size) {
-    size_t needed = 2; // Tipo + valor
+// AMF0 Encoding Functions
+static int amf0_encode_number(amf_buffer_t *buffer, double value) {
+    if (amf_buffer_ensure_capacity(buffer, 9) < 0) return -1;
     
-    if (buffer && *size >= needed) {
-        buffer[0] = AMF0_BOOLEAN;
-        buffer[1] = boolean ? 1 : 0;
-    }
-    
-    *size = needed;
-    return RTMP_OK;
+    buffer->data[buffer->size++] = AMF0_NUMBER;
+    uint64_t be_value;
+    memcpy(&be_value, &value, 8);
+    be_value = RTMP_HTONLL(be_value);
+    memcpy(buffer->data + buffer->size, &be_value, 8);
+    buffer->size += 8;
+    return 0;
 }
 
-int amf0_encode_null(uint8_t* buffer, size_t* size) {
-    size_t needed = 1; // Só tipo
+static int amf0_encode_boolean(amf_buffer_t *buffer, uint8_t value) {
+    if (amf_buffer_ensure_capacity(buffer, 2) < 0) return -1;
     
-    if (buffer && *size >= needed) {
-        buffer[0] = AMF0_NULL;
-    }
-    
-    *size = needed;
-    return RTMP_OK;
+    buffer->data[buffer->size++] = AMF0_BOOLEAN;
+    buffer->data[buffer->size++] = value ? 1 : 0;
+    return 0;
 }
 
-void amf_value_free(AMFValue* value) {
-    if (!value) return;
+static int amf0_encode_string(amf_buffer_t *buffer, const char *str, uint16_t len) {
+    if (len > 0xFFFF) return -1;
+    if (amf_buffer_ensure_capacity(buffer, len + 3) < 0) return -1;
     
-    switch (value->type) {
-        case AMF0_STRING:
-            free(value->value.string.data);
-            break;
-        case AMF0_OBJECT:
-            // Limpar objeto recursivamente
-            if (value->value.object) {
-                free(value->value.object->name);
-                amf_value_free(value->value.object->value);
-                free(value->value.object);
-            }
-            break;
-    }
+    buffer->data[buffer->size++] = AMF0_STRING;
+    buffer->data[buffer->size++] = (len >> 8) & 0xFF;
+    buffer->data[buffer->size++] = len & 0xFF;
+    memcpy(buffer->data + buffer->size, str, len);
+    buffer->size += len;
+    return 0;
+}
+
+static int amf0_encode_null(amf_buffer_t *buffer) {
+    if (amf_buffer_ensure_capacity(buffer, 1) < 0) return -1;
+    buffer->data[buffer->size++] = AMF0_NULL;
+    return 0;
+}
+
+// AMF0 Decoding Functions
+static int amf0_decode_number(const uint8_t *data, size_t size, size_t *offset, double *value) {
+    if (size - *offset < 9) return -1;
+    if (data[*offset] != AMF0_NUMBER) return -1;
+    
+    (*offset)++;
+    uint64_t be_value;
+    memcpy(&be_value, data + *offset, 8);
+    be_value = RTMP_NTOHLL(be_value);
+    memcpy(value, &be_value, 8);
+    *offset += 8;
+    return 0;
+}
+
+static int amf0_decode_boolean(const uint8_t *data, size_t size, size_t *offset, uint8_t *value) {
+    if (size - *offset < 2) return -1;
+    if (data[*offset] != AMF0_BOOLEAN) return -1;
+    
+    (*offset)++;
+    *value = data[*offset] != 0;
+    (*offset)++;
+    return 0;
+}
+
+static int amf0_decode_string(const uint8_t *data, size_t size, size_t *offset, char **str, uint16_t *len) {
+    if (size - *offset < 3) return -1;
+    if (data[*offset] != AMF0_STRING) return -1;
+    
+    (*offset)++;
+    *len = (data[*offset] << 8) | data[*offset + 1];
+    *offset += 2;
+    
+    if (size - *offset < *len) return -1;
+    
+    *str = (char*)malloc(*len + 1);
+    if (!*str) return -1;
+    
+    memcpy(*str, data + *offset, *len);
+    (*str)[*len] = '\0';
+    *offset += *len;
+    return 0;
+}
+
+// Public API Implementation
+rtmp_amf_t* rtmp_amf_create(void) {
+    amf_buffer_t *buffer = amf_buffer_create(1024);
+    return (rtmp_amf_t*)buffer;
+}
+
+void rtmp_amf_destroy(rtmp_amf_t *amf) {
+    amf_buffer_destroy((amf_buffer_t*)amf);
+}
+
+int rtmp_amf_encode_number(rtmp_amf_t *amf, double value) {
+    return amf0_encode_number((amf_buffer_t*)amf, value);
+}
+
+int rtmp_amf_encode_boolean(rtmp_amf_t *amf, int value) {
+    return amf0_encode_boolean((amf_buffer_t*)amf, value ? 1 : 0);
+}
+
+int rtmp_amf_encode_string(rtmp_amf_t *amf, const char *str) {
+    uint16_t len = (uint16_t)strlen(str);
+    return amf0_encode_string((amf_buffer_t*)amf, str, len);
+}
+
+int rtmp_amf_encode_null(rtmp_amf_t *amf) {
+    return amf0_encode_null((amf_buffer_t*)amf);
+}
+
+const uint8_t* rtmp_amf_get_data(rtmp_amf_t *amf, size_t *size) {
+    amf_buffer_t *buffer = (amf_buffer_t*)amf;
+    if (size) *size = buffer->size;
+    return buffer->data;
+}
+
+int rtmp_amf_decode_number(const uint8_t *data, size_t size, size_t *offset, double *value) {
+    return amf0_decode_number(data, size, offset, value);
+}
+
+int rtmp_amf_decode_boolean(const uint8_t *data, size_t size, size_t *offset, int *value) {
+    uint8_t bool_value;
+    int result = amf0_decode_boolean(data, size, offset, &bool_value);
+    if (result == 0) *value = bool_value != 0;
+    return result;
+}
+
+int rtmp_amf_decode_string(const uint8_t *data, size_t size, size_t *offset, char **str) {
+    uint16_t len;
+    return amf0_decode_string(data, size, offset, str, &len);
+}
+
+// Object handling
+int rtmp_amf_begin_object(rtmp_amf_t *amf) {
+    amf_buffer_t *buffer = (amf_buffer_t*)amf;
+    if (amf_buffer_ensure_capacity(buffer, 1) < 0) return -1;
+    buffer->data[buffer->size++] = AMF0_OBJECT;
+    return 0;
+}
+
+int rtmp_amf_end_object(rtmp_amf_t *amf) {
+    amf_buffer_t *buffer = (amf_buffer_t*)amf;
+    if (amf_buffer_ensure_capacity(buffer, 3) < 0) return -1;
+    buffer->data[buffer->size++] = 0x00;
+    buffer->data[buffer->size++] = 0x00;
+    buffer->data[buffer->size++] = AMF0_OBJECT_END;
+    return 0;
 }

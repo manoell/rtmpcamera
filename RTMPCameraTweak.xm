@@ -1,136 +1,213 @@
-#import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
-#import <CoreImage/CoreImage.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import "rtmp_core.h"
+#import "substrate.h"
 
-static BOOL serverInitialized = NO;
-static RTMPServer* rtmpServer = nil;
+// RTMP Server Configuration
+#define RTMP_SERVER_PORT 1935
+#define RTMP_PREVIEW_ENABLED 1
 
-// Janela de Preview
-@interface RTMPPreviewWindow : UIWindow
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UIImageView *previewImageView;
-@property (nonatomic, strong) UILabel *statsLabel;
+@interface RTMPCameraManager : NSObject
+
+@property (nonatomic, strong) RTMPPreviewController *previewController;
+@property (nonatomic, assign) rtmp_server_t *rtmpServer;
+@property (nonatomic, assign) BOOL isActive;
+@property (nonatomic, strong) NSString *streamKey;
+@property (nonatomic, strong) dispatch_queue_t serverQueue;
+
++ (instancetype)sharedManager;
+- (void)startServer;
+- (void)stopServer;
+- (void)setupPreviewWithView:(UIView *)containerView;
+- (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer;
+
 @end
 
-@implementation RTMPPreviewWindow
+@implementation RTMPCameraManager
+
++ (instancetype)sharedManager {
+    static RTMPCameraManager *sharedManager = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sharedManager = [[self alloc] init];
+    });
+    return sharedManager;
+}
 
 - (instancetype)init {
-    // Aumentar o tamanho da janela
-    self = [super initWithFrame:CGRectMake(20, 60, 240, 135)]; // 16:9 aspect ratio
+    self = [super init];
     if (self) {
-        self.windowLevel = UIWindowLevelAlert + 1;
-        self.backgroundColor = [UIColor blackColor];
-        self.layer.cornerRadius = 8;
-        self.clipsToBounds = YES;
-        
-        // Ajustar o preview para ocupar mais espaço
-        self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, self.frame.size.width, 105)];
-        self.previewImageView.contentMode = UIViewContentModeScaleAspectFit;
-        self.previewImageView.backgroundColor = [UIColor clearColor];
-        [self addSubview:self.previewImageView];
-        
-        // Ajustar posição dos labels
-        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 105, self.frame.size.width, 15)];
-        self.statusLabel.textColor = [UIColor whiteColor];
-        self.statusLabel.textAlignment = NSTextAlignmentCenter;
-        self.statusLabel.font = [UIFont systemFontOfSize:10];
-        self.statusLabel.text = @"Aguardando conexão RTMP...";
-        [self addSubview:self.statusLabel];
-        
-        self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 120, self.frame.size.width, 15)];
-        self.statsLabel.textColor = [UIColor whiteColor];
-        self.statsLabel.textAlignment = NSTextAlignmentCenter;
-        self.statsLabel.font = [UIFont systemFontOfSize:10];
-        self.statsLabel.text = @"0 KB/s | 0 FPS";
-        [self addSubview:self.statsLabel];
-        
-        // Pan gesture permanece igual
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] 
-            initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:pan];
-        
-        rtmp_log(RTMP_LOG_INFO, "Preview window initialized");
+        _serverQueue = dispatch_queue_create("com.rtmpcamera.server", DISPATCH_QUEUE_SERIAL);
+        _isActive = NO;
+        _streamKey = @"live";
+        _previewController = [[RTMPPreviewController alloc] init];
     }
     return self;
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self];
-    self.center = CGPointMake(self.center.x + translation.x, 
-                             self.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self];
-}
-
-- (void)updateStatus:(NSString *)status {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.text = status;
+- (void)startServer {
+    if (self.isActive) return;
+    
+    dispatch_async(self.serverQueue, ^{
+        // Initialize RTMP server
+        self.rtmpServer = rtmp_server_create();
+        if (!self.rtmpServer) {
+            NSLog(@"[RTMPCamera] Failed to create RTMP server");
+            return;
+        }
+        
+        // Configure server
+        rtmp_server_config_t config = {
+            .port = RTMP_SERVER_PORT,
+            .chunk_size = 4096,
+            .window_size = 2500000,
+            .peer_bandwidth = 2500000
+        };
+        
+        if (rtmp_server_configure(self.rtmpServer, &config) < 0) {
+            NSLog(@"[RTMPCamera] Failed to configure RTMP server");
+            rtmp_server_destroy(self.rtmpServer);
+            self.rtmpServer = NULL;
+            return;
+        }
+        
+        // Start server
+        if (rtmp_server_start(self.rtmpServer) < 0) {
+            NSLog(@"[RTMPCamera] Failed to start RTMP server");
+            rtmp_server_destroy(self.rtmpServer);
+            self.rtmpServer = NULL;
+            return;
+        }
+        
+        self.isActive = YES;
+        NSLog(@"[RTMPCamera] RTMP server started on port %d", RTMP_SERVER_PORT);
     });
 }
 
-- (void)updateStats:(NSString *)stats {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.statsLabel.text = stats;
+- (void)stopServer {
+    if (!self.isActive) return;
+    
+    dispatch_async(self.serverQueue, ^{
+        if (self.rtmpServer) {
+            rtmp_server_stop(self.rtmpServer);
+            rtmp_server_destroy(self.rtmpServer);
+            self.rtmpServer = NULL;
+        }
+        self.isActive = NO;
+        NSLog(@"[RTMPCamera] RTMP server stopped");
     });
 }
 
-- (void)updatePreviewImage:(UIImage *)image {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.previewImageView.image = image;
+- (void)setupPreviewWithView:(UIView *)containerView {
+#if RTMP_PREVIEW_ENABLED
+    if (!containerView) return;
+    
+    // Setup preview controller
+    self.previewController.view.frame = containerView.bounds;
+    self.previewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [containerView addSubview:self.previewController.view];
+    [self.previewController startPreview];
+#endif
+}
+
+- (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer {
+    if (!self.isActive || !sampleBuffer) return;
+    
+    // Get video format
+    CMVideoFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
+    if (!formatDescription) return;
+    
+    // Get dimension
+    CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
+    
+    // Get raw buffer
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) return;
+    
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    // Get data pointers
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    size_t dataSize = bytesPerRow * height;
+    
+    // Create copy of frame data
+    uint8_t *frameData = malloc(dataSize);
+    memcpy(frameData, baseAddress, dataSize);
+    
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    // Get timestamp
+    CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    uint32_t timestamp = (uint32_t)(CMTimeGetSeconds(presentationTime) * 1000);
+    
+    // Send frame to RTMP server
+    dispatch_async(self.serverQueue, ^{
+        if (self.rtmpServer && self.isActive) {
+            rtmp_server_send_video(self.rtmpServer,
+                                 frameData,
+                                 dataSize,
+                                 dimensions.width,
+                                 dimensions.height,
+                                 timestamp);
+        }
+        free(frameData);
     });
+    
+#if RTMP_PREVIEW_ENABLED
+    // Update preview if enabled
+    [self.previewController processVideoData:frameData size:dataSize timestamp:timestamp];
+#endif
 }
 
 @end
 
-static RTMPPreviewWindow* previewWindow = nil;
+// Hooks for Camera Integration
+%hook AVCaptureSession
 
-%hook SpringBoard
-
-- (void)applicationDidFinishLaunching:(id)application {
+- (void)startRunning {
     %orig;
-    
-    if (serverInitialized) return;
-    serverInitialized = YES;
-    
-    rtmp_log(RTMP_LOG_INFO, "Initializing RTMP server...");
-    
-    // Inicializar servidor RTMP
-    rtmpServer = rtmp_server_create(1935);
-    if (!rtmpServer) {
-        rtmp_log(RTMP_LOG_ERROR, "Failed to create RTMP server");
-        return;
-    }
-    
-    int status = rtmp_server_start(rtmpServer);
-    if (status != RTMP_OK) {
-        rtmp_log(RTMP_LOG_ERROR, "Failed to start RTMP server: %d", status);
-        rtmp_server_destroy(rtmpServer);
-        rtmpServer = nil;
-        return;
-    }
-    
-    rtmp_log(RTMP_LOG_INFO, "RTMP server started successfully");
-    
-    // Criar e mostrar preview window
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 
-                  dispatch_get_main_queue(), ^{
-        if (!previewWindow) {
-            previewWindow = [[RTMPPreviewWindow alloc] init];
-            [previewWindow makeKeyAndVisible];
-            rtmp_log(RTMP_LOG_INFO, "Preview window created and displayed");
-        }
-    });
+    [[RTMPCameraManager sharedManager] startServer];
+}
+
+- (void)stopRunning {
+    [[RTMPCameraManager sharedManager] stopServer];
+    %orig;
 }
 
 %end
 
+%hook AVCaptureVideoDataOutput
+
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)queue {
+    %orig(sampleBufferDelegate, queue);
+    
+    // Hook the sample buffer delegate to intercept frames
+    if (sampleBufferDelegate && [sampleBufferDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        MSHookMessageEx(object_getClass(sampleBufferDelegate),
+                       @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
+                       (IMP)&replaced_captureOutput,
+                       (IMP*)&original_captureOutput);
+    }
+}
+
+%end
+
+// Replacement method for capturing video frames
+static void replaced_captureOutput(id self, SEL _cmd, AVCaptureOutput *captureOutput, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+    // Call original method
+    original_captureOutput(self, _cmd, captureOutput, sampleBuffer, connection);
+    
+    // Process frame
+    [[RTMPCameraManager sharedManager] injectVideoFrame:sampleBuffer];
+}
+
 %ctor {
     @autoreleasepool {
-        NSString *processName = [NSProcessInfo processInfo].processName;
-        if ([processName isEqualToString:@"SpringBoard"]) {
-            rtmp_log(RTMP_LOG_INFO, "RTMPCamera tweak initialized in SpringBoard");
-            %init;
-        }
+        // Initialize when tweak loads
+        NSLog(@"[RTMPCamera] Tweak initialized");
+        [RTMPCameraManager sharedManager];
     }
 }
