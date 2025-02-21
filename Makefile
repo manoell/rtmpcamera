@@ -14,7 +14,6 @@ RTMPCamera_FILES = \
     rtmp_amf.c \
     rtmp_session.c \
     rtmp_stream.c \
-    rtmp_preview.m \
     RTMPCameraTweak.xm
 
 RTMPCamera_CFLAGS = -fobjc-arc \

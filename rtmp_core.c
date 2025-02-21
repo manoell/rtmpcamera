@@ -94,6 +94,7 @@ static void set_socket_options(int socket_fd) {
     setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 }
 
+// rtmp_core.c
 int rtmp_server_start(RTMPServer* server) {
     if (!server) return RTMP_ERROR_MEMORY;
 
