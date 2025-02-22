@@ -30,7 +30,7 @@ static void stopPreview(void);
 static void handleRTMPEvent(const RTMPCoreEvent *event, void *context);
 static void handleServerEvent(const RTMPServerEvent *event, void *context);
 
-// Main server event handler
+// Server event handler
 static void handleServerEvent(const RTMPServerEvent *event, void *context) {
     dispatch_async(rtmpQueue, ^{
         switch (event->type) {
@@ -60,7 +60,7 @@ static void handleServerEvent(const RTMPServerEvent *event, void *context) {
                 
             case RTMP_SERVER_EVENT_ERROR:
                 NSLog(@"[RTMPCamera] Server error: %s", event->error_message);
-                // Try to recover server on error
+                // Attempt recovery
                 if (!isServerReady) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), rtmpQueue, ^{
                         setupRTMPServer();
@@ -106,10 +106,8 @@ static void setupRTMPServer(void) {
         return;
     }
     
-    // Set up server callback
     rtmp_server_set_callback(serverContext, handleServerEvent, NULL);
     
-    // Configure server
     if (!rtmp_server_configure(serverContext, 
                              [kDefaultRtmpPort UTF8String], 
                              [kDefaultStreamPath UTF8String])) {
@@ -119,7 +117,6 @@ static void setupRTMPServer(void) {
         return;
     }
     
-    // Start server
     if (!rtmp_server_start(serverContext)) {
         NSLog(@"[RTMPCamera] Failed to start RTMP server");
         rtmp_server_destroy(serverContext);
@@ -127,10 +124,10 @@ static void setupRTMPServer(void) {
         return;
     }
     
-    NSLog(@"[RTMPCamera] RTMP Server initialization started");
+    NSLog(@"[RTMPCamera] RTMP Server initialized");
 }
 
-// Initialize RTMP stream handling
+// Initialize RTMP stream
 static void setupRTMPStream(void) {
     if (rtmpContext) {
         rtmp_core_destroy(rtmpContext);
@@ -143,11 +140,9 @@ static void setupRTMPStream(void) {
         return;
     }
     
-    // Set up diagnostics
     rtmp_diagnostic_init();
-    rtmp_diagnostic_set_level(1); // INFO level
+    rtmp_diagnostic_set_level(1);
     
-    // Create RTMP stream
     NSString *rtmpUrl = [NSString stringWithFormat:@"rtmp://localhost:%@%@", 
                         kDefaultRtmpPort, kDefaultStreamPath];
     rtmpStream = rtmp_stream_create([rtmpUrl UTF8String]);
@@ -158,21 +153,15 @@ static void setupRTMPStream(void) {
         return;
     }
     
-    // Configure stream quality
-    rtmp_stream_set_video_params(rtmpStream, 1920, 1080, 30, 2000000); // 1080p30 @ 2Mbps
-    
-    // Add stream to core
+    rtmp_stream_set_video_params(rtmpStream, 1920, 1080, 30, 2000000);
     rtmp_core_add_stream(rtmpContext, rtmpStream);
-    
-    // Set callback
     rtmp_core_set_callback(rtmpContext, handleRTMPEvent, NULL);
     
-    // Create camera compatibility layer
     if (!cameraCompat) {
         cameraCompat = [[RTMPCameraCompat alloc] init];
     }
     
-    NSLog(@"[RTMPCamera] RTMP Stream setup completed");
+    NSLog(@"[RTMPCamera] RTMP Stream initialized");
 }
 
 static void startPreview(void) {
@@ -193,7 +182,6 @@ static void stopPreview(void) {
     }
 }
 
-// Camera hooks
 %hook AVCaptureDevice
 
 - (AVCaptureDeviceInput *)deviceInputWithError:(NSError **)outError {
@@ -201,7 +189,6 @@ static void stopPreview(void) {
         return %orig;
     }
     
-    // Use RTMP feed when stream is active
     [cameraCompat configureVirtualCameraWithStream:rtmpStream];
     return [cameraCompat createVirtualDeviceInput];
 }
@@ -211,10 +198,8 @@ static void stopPreview(void) {
 %hook AVCaptureSession
 
 - (void)startRunning {
-    // Start original session
     %orig;
     
-    // Update camera settings if using RTMP
     if (isStreamActive && cameraCompat) {
         [cameraCompat updateStreamMetadata:rtmpStream];
     }
@@ -225,10 +210,8 @@ static void stopPreview(void) {
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)sampleBufferCallbackQueue {
-    // Create frame interceptor
     id originalDelegate = sampleBufferDelegate;
     id interceptor = ^(CMSampleBufferRef sampleBuffer) {
-        // Use original camera if stream not active
         if (!isStreamActive) {
             if ([originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
                 [originalDelegate captureOutput:nil didOutputSampleBuffer:sampleBuffer fromConnection:nil];
@@ -236,16 +219,13 @@ static void stopPreview(void) {
             return;
         }
         
-        // Process frame through RTMP when stream is active
         if (rtmpStream && rtmpStream->connected) {
             CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (imageBuffer) {
-                // Update preview
                 if (previewEnabled) {
                     rtmp_preview_update_frame(imageBuffer);
                 }
                 
-                // Push frame to stream
                 CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
                 void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
                 size_t size = CVPixelBufferGetDataSize(imageBuffer);
@@ -268,15 +248,11 @@ static void stopPreview(void) {
     @autoreleasepool {
         NSLog(@"[RTMPCamera] Initializing tweak");
         
-        // Create serial queue for RTMP operations
         rtmpQueue = dispatch_queue_create("com.rtmpcamera.queue", DISPATCH_QUEUE_SERIAL);
         
-        // Initialize components in order
         dispatch_async(rtmpQueue, ^{
-            // Start server first
             setupRTMPServer();
             
-            // Wait for server to be ready before setting up stream
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), rtmpQueue, ^{
                 setupRTMPStream();
             });
@@ -287,7 +263,6 @@ static void stopPreview(void) {
 }
 
 %dtor {
-    // Cleanup
     stopPreview();
     
     if (serverContext) {
