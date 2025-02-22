@@ -214,9 +214,59 @@
             parameterSets:(const uint8_t **)parameterSets
         parameterSetSizes:(size_t *)parameterSetSizes
                    count:(int *)count {
-    // Implement NAL unit parsing and SPS/PPS extraction
-    // This is a placeholder - you'll need to implement proper H.264 NAL parsing
-    return NO;
+    if (!data || !size || !parameterSets || !parameterSetSizes || !count) return NO;
+    
+    *count = 0;
+    size_t offset = 0;
+    
+    // Find start codes
+    while (offset + 4 <= size) {
+        // Look for start code
+        if (data[offset] == 0x00 && data[offset + 1] == 0x00 &&
+            data[offset + 2] == 0x00 && data[offset + 3] == 0x01) {
+            
+            // Skip start code
+            offset += 4;
+            if (offset >= size) break;
+            
+            // Get NAL unit type
+            uint8_t nal_unit_type = data[offset] & 0x1F;
+            
+            // Find next start code
+            size_t next_offset = offset + 1;
+            while (next_offset + 3 < size) {
+                if (data[next_offset] == 0x00 && data[next_offset + 1] == 0x00 &&
+                    ((data[next_offset + 2] == 0x01) ||
+                     (data[next_offset + 2] == 0x00 && data[next_offset + 3] == 0x01))) {
+                    break;
+                }
+                next_offset++;
+            }
+            
+            // Calculate NAL unit size
+            size_t nal_size = next_offset - offset;
+            
+            // Store SPS or PPS
+            if (nal_unit_type == 7) { // SPS
+                if (*count >= 2) break;
+                parameterSets[*count] = data + offset;
+                parameterSetSizes[*count] = nal_size;
+                (*count)++;
+            }
+            else if (nal_unit_type == 8) { // PPS
+                if (*count >= 2) break;
+                parameterSets[*count] = data + offset;
+                parameterSetSizes[*count] = nal_size;
+                (*count)++;
+            }
+            
+            offset = next_offset;
+        } else {
+            offset++;
+        }
+    }
+    
+    return *count > 0;
 }
 
 @end

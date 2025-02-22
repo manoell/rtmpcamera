@@ -114,52 +114,68 @@
 - (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer {
     if (!self.isActive || !sampleBuffer) return;
     
-    // Get video format
-    CMVideoFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
-    if (!formatDescription) return;
-    
-    // Get dimension
-    CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
-    
-    // Get raw buffer
-    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!imageBuffer) return;
-    
-    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-    
-    // Get data pointers
-    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
-    size_t height = CVPixelBufferGetHeight(imageBuffer);
-    size_t dataSize = bytesPerRow * height;
-    
-    // Create copy of frame data
-    uint8_t *frameData = malloc(dataSize);
-    memcpy(frameData, baseAddress, dataSize);
-    
-    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-    
-    // Get timestamp
-    CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    uint32_t timestamp = (uint32_t)(CMTimeGetSeconds(presentationTime) * 1000);
-    
-    // Send frame to RTMP server
-    dispatch_async(self.serverQueue, ^{
-        if (self.rtmpServer && self.isActive) {
-            rtmp_server_send_video(self.rtmpServer,
-                                 frameData,
-                                 dataSize,
-                                 dimensions.width,
-                                 dimensions.height,
-                                 timestamp);
-        }
-        free(frameData);
-    });
-    
+    @autoreleasepool {
+        // Get video format
+        CMVideoFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
+        if (!formatDescription) return;
+        
+        // Get dimension
+        CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
+        
+        // Get raw buffer
+        CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (!imageBuffer) return;
+        
+        CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        
+        @try {
+            // Get data pointers
+            void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+            size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+            size_t height = CVPixelBufferGetHeight(imageBuffer);
+            size_t dataSize = bytesPerRow * height;
+            
+            // Create copy of frame data
+            uint8_t *frameData = malloc(dataSize);
+            if (frameData) {
+                memcpy(frameData, baseAddress, dataSize);
+                
+                // Get timestamp
+                CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+                uint32_t timestamp = (uint32_t)(CMTimeGetSeconds(presentationTime) * 1000);
+                
+                // Send frame to RTMP server
+                dispatch_async(self.serverQueue, ^{
+                    if (self.rtmpServer && self.isActive) {
+                        rtmp_server_send_video(self.rtmpServer,
+                                             frameData,
+                                             dataSize,
+                                             dimensions.width,
+                                             dimensions.height,
+                                             timestamp);
+                    }
+                    free(frameData);
+                });
+                
 #if RTMP_PREVIEW_ENABLED
-    // Update preview if enabled
-    [self.previewController processVideoData:frameData size:dataSize timestamp:timestamp];
+                // Update preview if enabled - cópia separada para o preview
+                uint8_t *previewData = malloc(dataSize);
+                if (previewData) {
+                    memcpy(previewData, baseAddress, dataSize);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self.previewController processVideoData:previewData 
+                                                          size:dataSize 
+                                                    timestamp:timestamp];
+                        free(previewData);
+                    });
+                }
 #endif
+            }
+        }
+        @finally {
+            CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        }
+    }
 }
 
 @end
@@ -197,11 +213,21 @@
 
 // Replacement method for capturing video frames
 static void replaced_captureOutput(id self, SEL _cmd, AVCaptureOutput *captureOutput, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
-    // Call original method
-    original_captureOutput(self, _cmd, captureOutput, sampleBuffer, connection);
-    
-    // Process frame
-    [[RTMPCameraManager sharedManager] injectVideoFrame:sampleBuffer];
+    @autoreleasepool {
+        // Retain buffer antes de passar para o processamento assíncrono
+        CFRetain(sampleBuffer);
+        
+        // Call original method
+        original_captureOutput(self, _cmd, captureOutput, sampleBuffer, connection);
+        
+        // Process frame em uma closure que gerencia a vida útil do buffer
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+            @autoreleasepool {
+                [[RTMPCameraManager sharedManager] injectVideoFrame:sampleBuffer];
+                CFRelease(sampleBuffer);
+            }
+        });
+    }
 }
 
 %ctor {
