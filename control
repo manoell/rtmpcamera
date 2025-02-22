@@ -1,9 +1,9 @@
-Package: com.yourdomain.rtmpcamera
+Package: com.yourname.rtmpcamera
 Name: RTMPCamera
 Version: 1.0.0
 Architecture: iphoneos-arm
-Description: RTMP Server and Camera Feed Integration
+Description: RTMP Camera feed replacement for iOS
 Maintainer: Your Name
 Author: Your Name
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 7.0)
