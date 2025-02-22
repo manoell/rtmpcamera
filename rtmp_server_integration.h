@@ -3,48 +3,44 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
-// Eventos do servidor
+// Forward declarations
+typedef struct RTMPServerContext RTMPServerContext;
+typedef struct RTMPPacket RTMPPacket;
+
+// Event types for server callbacks
 typedef enum {
-    SERVER_CONNECTED,
-    SERVER_DISCONNECTED,
-    SERVER_STREAM_START,
-    SERVER_STREAM_END,
-    SERVER_ERROR
-} server_event_t;
+    RTMP_SERVER_EVENT_STARTED,
+    RTMP_SERVER_EVENT_CLIENT_CONNECTED,
+    RTMP_SERVER_EVENT_CLIENT_DISCONNECTED,
+    RTMP_SERVER_EVENT_STREAM_STARTED,
+    RTMP_SERVER_EVENT_STREAM_ENDED,
+    RTMP_SERVER_EVENT_ERROR
+} RTMPServerEventType;
 
-// Configuração do servidor
+// Event structure for callbacks
 typedef struct {
-    uint32_t chunk_size;
-    uint32_t window_ack_size;
-    uint32_t peer_bandwidth;
-    uint32_t max_bitrate;
-    uint32_t min_bitrate;
-    uint32_t target_latency;
-    float quality_priority;
-    const char *backup_url;
-    void (*callback)(server_event_t event, void *data, void *ctx);
-    void *callback_ctx;
-} server_config_t;
+    RTMPServerEventType type;
+    const char *error_message;  // Only valid for RTMP_SERVER_EVENT_ERROR
+} RTMPServerEvent;
 
-// Estatísticas do servidor
-typedef struct {
-    bool is_connected;
-    uint32_t current_bitrate;
-    float buffer_health;
-    float current_fps;
-    uint32_t failover_count;
-} server_stats_t;
+// Callback function type
+typedef void (*rtmp_server_callback_t)(const RTMPServerEvent *event, void *context);
 
-// Handle opaco para o contexto do servidor
-typedef struct rtmp_server_context rtmp_server_context_t;
+// Server management functions
+RTMPServerContext* rtmp_server_create(void);
+void rtmp_server_destroy(RTMPServerContext *server);
 
-// Funções principais
-rtmp_server_context_t *rtmp_server_create(const char *url, uint16_t port);
-int rtmp_server_connect(rtmp_server_context_t *context);
-int rtmp_server_reconnect(rtmp_server_context_t *context);
-void rtmp_server_configure(rtmp_server_context_t *context, const server_config_t *config);
-server_stats_t rtmp_server_get_stats(rtmp_server_context_t *context);
-void rtmp_server_destroy(rtmp_server_context_t *context);
+// Server configuration and control
+bool rtmp_server_configure(RTMPServerContext *server, const char *port, const char *stream_path);
+bool rtmp_server_start(RTMPServerContext *server);
+bool rtmp_server_is_running(RTMPServerContext *server);
+
+// Callback management
+void rtmp_server_set_callback(RTMPServerContext *server, rtmp_server_callback_t callback, void *context);
+
+// Statistics
+uint32_t rtmp_server_get_client_count(RTMPServerContext *server);
 
 #endif // RTMP_SERVER_INTEGRATION_H
