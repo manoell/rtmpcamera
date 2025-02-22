@@ -8,14 +8,14 @@ TWEAK_NAME = RTMPCameraTweak
 $(TWEAK_NAME)_FILES = \
     RTMPCameraTweak.xm \
     rtmp_core.c \
-    rtmp_handshake.c \
     rtmp_protocol.c \
-    rtmp_amf.c \
+    rtmp_handshake.c \
     rtmp_commands.c \
+    rtmp_utils.c \
+    rtmp_amf.c \
     rtmp_chunk.c \
     rtmp_stream.c \
     rtmp_session.c \
-    rtmp_utils.c \
     rtmp_preview.m
 
 $(TWEAK_NAME)_FRAMEWORKS = \
