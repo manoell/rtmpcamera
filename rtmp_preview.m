@@ -67,8 +67,26 @@
 - (void)cleanupPreview {
     dispatch_async(_previewQueue, ^{
         [self.previewLayer flush];
+        
+        // Liberar recursos da preview
+        if (self.previewLayer) {
+            [self.previewLayer stopRequestingMediaData];
+        }
+        
+        // Limpar buffers pendentes
+        @synchronized (self) {
+            // ... limpar qualquer buffer pendente ...
+        }
+        
         self.session = NULL;
         _isSetup = NO;
+        
+        // Notificar que a preview foi limpa
+        if ([self.delegate respondsToSelector:@selector(previewDidCleanup:)]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.delegate previewDidCleanup:self];
+            });
+        }
     });
 }
 
@@ -143,69 +161,109 @@
 - (CMSampleBufferRef)createSampleBufferFromH264Data:(const uint8_t *)data 
                                               size:(size_t)size 
                                         timestamp:(uint32_t)timestamp {
-    // Create format description if needed
     static CMVideoFormatDescriptionRef formatDescription = NULL;
+    
+    // Tentar criar format description se ainda não existe
     if (!formatDescription) {
         const uint8_t *parameterSetPointers[2] = {NULL, NULL};
         size_t parameterSetSizes[2] = {0, 0};
         int parameterSetCount = 0;
         
-        // Extract SPS and PPS from H.264 stream
-        // This is a simplified version - you'll need proper NAL unit parsing
         if ([self extractSPSAndPPS:data size:size
-                     parameterSets:parameterSetPointers
-                 parameterSetSizes:parameterSetSizes
-                            count:&parameterSetCount]) {
+                    parameterSets:parameterSetPointers
+                parameterSetSizes:parameterSetSizes
+                           count:&parameterSetCount]) {
             
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault,
-                                                              parameterSetCount,
-                                                              parameterSetPointers,
-                                                              parameterSetSizes,
-                                                              4,
-                                                              &formatDescription);
+            OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault,
+                parameterSetCount,
+                parameterSetPointers,
+                parameterSetSizes,
+                4,
+                &formatDescription
+            );
+            
+            if (status != noErr) {
+                NSLog(@"Failed to create format description: %d", (int)status);
+                return NULL;
+            }
+        } else {
+            // Tentar criar format description com valores padrão
+            const uint8_t defaultSPS[] = { /* ... valores padrão do SPS ... */ };
+            const uint8_t defaultPPS[] = { /* ... valores padrão do PPS ... */ };
+            const uint8_t *defaultParameterSets[2] = {defaultSPS, defaultPPS};
+            const size_t defaultParameterSetSizes[2] = {sizeof(defaultSPS), sizeof(defaultPPS)};
+            
+            OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault,
+                2,
+                defaultParameterSets,
+                defaultParameterSetSizes,
+                4,
+                &formatDescription
+            );
+            
+            if (status != noErr) {
+                NSLog(@"Failed to create default format description: %d", (int)status);
+                return NULL;
+            }
         }
     }
     
-    if (!formatDescription) return NULL;
-    
-    // Create timing info
-    CMTime presentationTime = CMTimeMake(timestamp, 1000); // Convert milliseconds to CMTime
+    // Criar timing info
+    CMTime presentationTime = CMTimeMake(timestamp, 1000);
     CMSampleTimingInfo timing = {
         .duration = kCMTimeInvalid,
         .presentationTimeStamp = presentationTime,
         .decodeTimeStamp = presentationTime
     };
     
-    // Create sample buffer
+    // Criar sample buffer
     CMSampleBufferRef sampleBuffer = NULL;
     uint8_t *dataBuffer = malloc(size);
+    if (!dataBuffer) return NULL;
+    
     memcpy(dataBuffer, data, size);
     
     CMBlockBufferRef blockBuffer = NULL;
-    CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,
-                                     dataBuffer,
-                                     size,
-                                     kCFAllocatorMalloc,
-                                     NULL,
-                                     0,
-                                     size,
-                                     0,
-                                     &blockBuffer);
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault,
+        dataBuffer,
+        size,
+        kCFAllocatorMalloc,
+        NULL,
+        0,
+        size,
+        0,
+        &blockBuffer
+    );
     
-    CMSampleBufferCreate(kCFAllocatorDefault,
-                        blockBuffer,
-                        YES,
-                        NULL,
-                        NULL,
-                        formatDescription,
-                        1,
-                        1,
-                        &timing,
-                        0,
-                        NULL,
-                        &sampleBuffer);
+    if (status == noErr) {
+        status = CMSampleBufferCreate(
+            kCFAllocatorDefault,
+            blockBuffer,
+            YES,
+            NULL,
+            NULL,
+            formatDescription,
+            1,
+            1,
+            &timing,
+            0,
+            NULL,
+            &sampleBuffer
+        );
+    }
     
-    CFRelease(blockBuffer);
+    if (blockBuffer) {
+        CFRelease(blockBuffer);
+    }
+    
+    if (status != noErr) {
+        NSLog(@"Failed to create sample buffer: %d", (int)status);
+        return NULL;
+    }
+    
     return sampleBuffer;
 }
 

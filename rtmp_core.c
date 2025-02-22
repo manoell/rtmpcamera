@@ -309,3 +309,218 @@ void rtmp_server_destroy(RTMPServer* server) {
     
     rtmp_log(RTMP_LOG_INFO, "RTMP Server destroyed");
 }
+
+int rtmp_server_configure(rtmp_server_t *server, const rtmp_server_config_t *config) {
+    if (!server || !config) return -1;
+    
+    // Validar configurações
+    if (config->port <= 0 || config->port > 65535) {
+        return -1;
+    }
+    
+    if (config->chunk_size < 128 || config->chunk_size > 65536) {
+        return -1;
+    }
+    
+    if (config->window_size < 1024 || config->window_size > 5000000) {
+        return -1;
+    }
+    
+    // Aplicar configurações
+    server->port = config->port;
+    server->chunk_size = config->chunk_size;
+    server->window_size = config->window_size;
+    server->peer_bandwidth = config->peer_bandwidth;
+    
+    // Inicializar mutex para gerenciamento de conexões
+    if (pthread_mutex_init(&server->connections_mutex, NULL) != 0) {
+        return -1;
+    }
+    
+    // Inicializar array de conexões
+    server->num_connections = 0;
+    memset(server->connections, 0, sizeof(server->connections));
+    
+    // Configurar callbacks padrão
+    server->on_client_connect = NULL;
+    server->on_client_disconnect = NULL;
+    server->on_publish_stream = NULL;
+    server->on_play_stream = NULL;
+    
+    return 0;
+}
+
+void rtmp_server_set_callbacks(rtmp_server_t *server,
+                             rtmp_client_callback on_connect,
+                             rtmp_client_callback on_disconnect,
+                             rtmp_stream_callback on_publish,
+                             rtmp_stream_callback on_play) {
+    if (!server) return;
+    
+    server->on_client_connect = on_connect;
+    server->on_client_disconnect = on_disconnect;
+    server->on_publish_stream = on_publish;
+    server->on_play_stream = on_play;
+}
+
+int rtmp_server_start(rtmp_server_t *server) {
+    if (!server) return -1;
+    
+    // Criar socket
+    server->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->socket_fd < 0) {
+        return -1;
+    }
+    
+    // Configurar socket para reutilização
+    int reuse = 1;
+    if (setsockopt(server->socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        close(server->socket_fd);
+        return -1;
+    }
+    
+    // Configurar endereço
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(server->port);
+    
+    // Bind
+    if (bind(server->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(server->socket_fd);
+        return -1;
+    }
+    
+    // Listen
+    if (listen(server->socket_fd, 5) < 0) {
+        close(server->socket_fd);
+        return -1;
+    }
+    
+    // Iniciar thread de aceitação
+    server->running = 1;
+    if (pthread_create(&server->accept_thread, NULL, rtmp_server_accept_thread, server) != 0) {
+        close(server->socket_fd);
+        server->running = 0;
+        return -1;
+    }
+    
+    return 0;
+}
+
+static void* rtmp_server_accept_thread(void *arg) {
+    rtmp_server_t *server = (rtmp_server_t *)arg;
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    
+    while (server->running) {
+        // Aceitar nova conexão
+        int client_fd = accept(server->socket_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (client_fd < 0) {
+            if (server->running) {
+                // Log error only if server is still running
+                fprintf(stderr, "Failed to accept client connection\n");
+            }
+            continue;
+        }
+        
+        // Criar nova sessão
+        rtmp_session_t *session = rtmp_session_create(client_fd);
+        if (!session) {
+            close(client_fd);
+            continue;
+        }
+        
+        // Adicionar à lista de conexões
+        if (rtmp_server_add_connection(server, session) < 0) {
+            rtmp_session_destroy(session);
+            continue;
+        }
+        
+        // Notificar callback de conexão
+        if (server->on_client_connect) {
+            server->on_client_connect(server, session);
+        }
+        
+        // Iniciar thread da sessão
+        pthread_t session_thread;
+        if (pthread_create(&session_thread, NULL, rtmp_session_thread, session) != 0) {
+            rtmp_server_remove_connection(server, session);
+            rtmp_session_destroy(session);
+            continue;
+        }
+        
+        pthread_detach(session_thread);
+    }
+    
+    return NULL;
+}
+
+int rtmp_server_stop(rtmp_server_t *server) {
+    if (!server) return -1;
+    
+    // Parar thread de aceitação
+    server->running = 0;
+    shutdown(server->socket_fd, SHUT_RDWR);
+    close(server->socket_fd);
+    
+    // Esperar thread terminar
+    pthread_join(server->accept_thread, NULL);
+    
+    // Desconectar todos os clientes
+    pthread_mutex_lock(&server->connections_mutex);
+    for (int i = 0; i < server->num_connections; i++) {
+        rtmp_session_t *session = server->connections[i];
+        if (session) {
+            // Notificar callback de desconexão
+            if (server->on_client_disconnect) {
+                server->on_client_disconnect(server, session);
+            }
+            rtmp_session_destroy(session);
+        }
+    }
+    server->num_connections = 0;
+    pthread_mutex_unlock(&server->connections_mutex);
+    
+    // Destruir mutex
+    pthread_mutex_destroy(&server->connections_mutex);
+    
+    return 0;
+}
+
+void rtmp_server_destroy(rtmp_server_t *server) {
+    if (!server) return;
+    
+    // Parar servidor se ainda estiver rodando
+    if (server->running) {
+        rtmp_server_stop(server);
+    }
+    
+    // Liberar recursos
+    free(server);
+}
+
+// Função auxiliar para a thread da sessão
+static void* rtmp_session_thread(void *arg) {
+    rtmp_session_t *session = (rtmp_session_t *)arg;
+    
+    // Handshake
+    if (rtmp_handshake_server(session) < 0) {
+        rtmp_session_close(session);
+        return NULL;
+    }
+    
+    // Loop principal de processamento
+    uint8_t buffer[4096];
+    ssize_t bytes_read;
+    
+    while ((bytes_read = recv(session->socket_fd, buffer, sizeof(buffer), 0)) > 0) {
+        if (rtmp_process_input(session, buffer, bytes_read) < 0) {
+            break;
+        }
+    }
+    
+    rtmp_session_close(session);
+    return NULL;
+}

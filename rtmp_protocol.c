@@ -371,3 +371,105 @@ static int rtmp_handle_aggregate(rtmp_session_t *session, const uint8_t *data, s
 
     return 0;
 }
+
+static int rtmp_handle_data(rtmp_session_t *session, const uint8_t *data, size_t size) {
+    if (!session || !data || !size) return -1;
+
+    size_t offset = 0;
+    char *data_type = NULL;
+    
+    // Decode data type string
+    if (rtmp_amf_decode_string(data, size, &offset, &data_type) < 0) {
+        return -1;
+    }
+
+    // Handle different data types
+    if (strcmp(data_type, "@setDataFrame") == 0) {
+        // Process metadata
+        char *metadata_type = NULL;
+        if (rtmp_amf_decode_string(data, size, &offset, &metadata_type) == 0) {
+            if (strcmp(metadata_type, "onMetaData") == 0) {
+                // Store metadata for the stream
+                if (session->metadata_callback) {
+                    session->metadata_callback(session, data + offset, size - offset);
+                }
+            }
+            free(metadata_type);
+        }
+    }
+
+    free(data_type);
+    return 0;
+}
+
+static int rtmp_handle_abort(rtmp_session_t *session, const uint8_t *data, size_t size) {
+    if (!session || !data || size < 4) return -1;
+
+    uint32_t chunk_stream_id;
+    memcpy(&chunk_stream_id, data, 4);
+    chunk_stream_id = RTMP_NTOHL(chunk_stream_id);
+
+    // Clear incomplete chunks for this stream
+    rtmp_chunk_stream_t *chunk_stream = rtmp_get_chunk_stream(session, chunk_stream_id);
+    if (chunk_stream) {
+        chunk_stream->msg_length = 0;
+        chunk_stream->msg_type_id = 0;
+        chunk_stream->msg_stream_id = 0;
+        if (chunk_stream->msg_data) {
+            free(chunk_stream->msg_data);
+            chunk_stream->msg_data = NULL;
+        }
+    }
+
+    return 0;
+}
+
+int rtmp_send_window_acknowledgement_size(rtmp_session_t *session, uint32_t window_size) {
+    if (!session) return -1;
+
+    uint8_t message[4];
+    uint32_t be_window_size = RTMP_HTONL(window_size);
+    memcpy(message, &be_window_size, 4);
+
+    return rtmp_send_message(session, RTMP_MSG_WINDOW_ACK_SIZE, 0, message, sizeof(message));
+}
+
+// Gerenciamento de múltiplas conexões
+int rtmp_server_add_connection(rtmp_server_t *server, rtmp_session_t *session) {
+    if (!server || !session) return -1;
+
+    pthread_mutex_lock(&server->connections_mutex);
+    
+    // Verificar limite de conexões
+    if (server->num_connections >= RTMP_MAX_CONNECTIONS) {
+        pthread_mutex_unlock(&server->connections_mutex);
+        return -1;
+    }
+
+    // Adicionar nova conexão
+    server->connections[server->num_connections++] = session;
+    
+    pthread_mutex_unlock(&server->connections_mutex);
+    return 0;
+}
+
+int rtmp_server_remove_connection(rtmp_server_t *server, rtmp_session_t *session) {
+    if (!server || !session) return -1;
+
+    pthread_mutex_lock(&server->connections_mutex);
+    
+    // Procurar e remover conexão
+    for (int i = 0; i < server->num_connections; i++) {
+        if (server->connections[i] == session) {
+            // Mover últimas conexões uma posição para trás
+            memmove(&server->connections[i], 
+                    &server->connections[i + 1],
+                    (server->num_connections - i - 1) * sizeof(rtmp_session_t*));
+            server->num_connections--;
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&server->connections_mutex);
+    return 0;
+}

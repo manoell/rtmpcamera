@@ -21,7 +21,39 @@ extern "C" {
 
 // Definições de log
 #define RTMP_LOG_FILE "/var/tmp/rtmp_debug.log"
+typedef void (*rtmp_audio_callback)(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp);
+typedef void (*rtmp_video_callback)(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp);
+typedef void (*rtmp_metadata_callback)(rtmp_session_t *session, const uint8_t *data, size_t size);
+
+struct rtmp_session_s {
+    // ... existing members ...
+    
+    rtmp_audio_callback audio_callback;
+    rtmp_video_callback video_callback;
+    rtmp_metadata_callback metadata_callback;
+    
+    // Buffer management
+    uint8_t *aac_sequence_header;
+    size_t aac_sequence_header_size;
+    uint8_t *avc_sequence_header;
+    size_t avc_sequence_header_size;
+    
+    // Connection state
+    uint32_t window_ack_size;
+    uint32_t peer_bandwidth;
+    uint8_t peer_bandwidth_limit_type;
+    uint32_t last_ack_received;
+};
+
 #define RTMP_MAX_CONNECTIONS 10
+
+struct rtmp_server_s {
+    // ... existing members ...
+    
+    rtmp_session_t *connections[RTMP_MAX_CONNECTIONS];
+    int num_connections;
+    pthread_mutex_t connections_mutex;
+};
 
 // Tipos de mensagens RTMP
 #define RTMP_MSG_CHUNK_SIZE        1

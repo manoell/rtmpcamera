@@ -20,6 +20,20 @@
 #define RTMP_MSG_SHARED_OBJ_AMF0   19
 #define RTMP_MSG_COMMAND_AMF0      20
 
+#define RTMP_MSG_USER_CONTROL_STREAM_BEGIN      0x00
+#define RTMP_MSG_USER_CONTROL_STREAM_EOF        0x01
+#define RTMP_MSG_USER_CONTROL_STREAM_DRY        0x02
+#define RTMP_MSG_USER_CONTROL_SET_BUFFER_LENGTH 0x03
+#define RTMP_MSG_USER_CONTROL_STREAM_IS_RECORDED 0x04
+#define RTMP_MSG_USER_CONTROL_PING_REQUEST      0x06
+#define RTMP_MSG_USER_CONTROL_PING_RESPONSE     0x07
+
+// Stream states
+#define RTMP_STREAM_STATE_IDLE     0
+#define RTMP_STREAM_STATE_RESERVED 1
+#define RTMP_STREAM_STATE_ACTIVE   2
+#define RTMP_STREAM_STATE_CLOSED   3
+
 // Estrutura da mensagem RTMP
 typedef struct {
     uint8_t type;              // Tipo da mensagem
