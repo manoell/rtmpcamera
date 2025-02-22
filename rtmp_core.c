@@ -1,310 +1,275 @@
 #include "rtmp_core.h"
 #include "rtmp_protocol.h"
+#include "rtmp_handshake.h"
 #include "rtmp_utils.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <errno.h>
-#include <fcntl.h>
+#include <arpa/inet.h>
 
-static char error_message[1024];
-static void* rtmp_server_accept_thread(void *arg);
-static void* rtmp_session_thread(void *arg);
+#define RTMP_SERVER_PORT 1935
+#define MAX_CLIENTS 10
+#define BUFFER_SIZE 4096
 
-rtmp_server_t* rtmp_server_create(void) {
-    rtmp_server_t *server = (rtmp_server_t*)calloc(1, sizeof(rtmp_server_t));
-    if (!server) {
-        rtmp_set_error("Failed to allocate server structure");
+typedef struct {
+    int running;
+    int server_socket;
+    pthread_t accept_thread;
+    RTMPSession* sessions[MAX_CLIENTS];
+    pthread_mutex_t sessions_mutex;
+    VideoFrameCallback video_callback;
+    AudioFrameCallback audio_callback;
+} RTMPServer;
+
+static RTMPServer* g_server = NULL;
+
+// Buffer pool para otimizar alocação de memória
+typedef struct {
+    uint8_t* buffers[32];
+    int available[32];
+    pthread_mutex_t mutex;
+} BufferPool;
+
+static BufferPool* buffer_pool_create() {
+    BufferPool* pool = (BufferPool*)malloc(sizeof(BufferPool));
+    pthread_mutex_init(&pool->mutex, NULL);
+    
+    for (int i = 0; i < 32; i++) {
+        pool->buffers[i] = (uint8_t*)malloc(BUFFER_SIZE);
+        pool->available[i] = 1;
+    }
+    
+    return pool;
+}
+
+static void buffer_pool_destroy(BufferPool* pool) {
+    if (!pool) return;
+    
+    for (int i = 0; i < 32; i++) {
+        if (pool->buffers[i]) {
+            free(pool->buffers[i]);
+        }
+    }
+    
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+}
+
+static uint8_t* buffer_pool_acquire(BufferPool* pool) {
+    pthread_mutex_lock(&pool->mutex);
+    
+    for (int i = 0; i < 32; i++) {
+        if (pool->available[i]) {
+            pool->available[i] = 0;
+            pthread_mutex_unlock(&pool->mutex);
+            return pool->buffers[i];
+        }
+    }
+    
+    pthread_mutex_unlock(&pool->mutex);
+    return (uint8_t*)malloc(BUFFER_SIZE); // Fallback se pool estiver cheio
+}
+
+static void buffer_pool_release(BufferPool* pool, uint8_t* buffer) {
+    pthread_mutex_lock(&pool->mutex);
+    
+    for (int i = 0; i < 32; i++) {
+        if (pool->buffers[i] == buffer) {
+            pool->available[i] = 1;
+            pthread_mutex_unlock(&pool->mutex);
+            return;
+        }
+    }
+    
+    free(buffer); // Se não for do pool, libera normalmente
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+static void rtmp_session_cleanup(RTMPSession* session) {
+    if (!session) return;
+    
+    if (session->socket >= 0) {
+        close(session->socket);
+    }
+    
+    if (session->handshake_data) {
+        free(session->handshake_data);
+    }
+    
+    if (session->app) {
+        free(session->app);
+    }
+    
+    if (session->streamName) {
+        free(session->streamName);
+    }
+    
+    if (session->tcUrl) {
+        free(session->tcUrl);
+    }
+    
+    if (session->buffer_pool) {
+        buffer_pool_destroy(session->buffer_pool);
+    }
+    
+    free(session);
+}
+
+static void* client_handler(void* arg) {
+    RTMPSession* session = (RTMPSession*)arg;
+    BufferPool* pool = buffer_pool_create();
+    session->buffer_pool = pool;
+    
+    // Handshake
+    if (rtmp_handshake_process(session) < 0) {
+        rtmp_session_cleanup(session);
         return NULL;
     }
     
-    server->socket_fd = -1;
-    server->running = 0;
-    server->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    server->window_size = RTMP_DEFAULT_WINDOW_SIZE;
-    server->peer_bandwidth = RTMP_DEFAULT_WINDOW_SIZE;
+    uint8_t* chunk_buffer = buffer_pool_acquire(pool);
+    RTMPChunk chunk;
     
-    if (pthread_mutex_init(&server->connections_mutex, NULL) != 0) {
-        rtmp_set_error("Failed to initialize connections mutex");
-        free(server);
-        return NULL;
+    while (session->running) {
+        ssize_t bytes = recv(session->socket, chunk_buffer, BUFFER_SIZE, 0);
+        if (bytes <= 0) break;
+        
+        size_t offset = 0;
+        while (offset < bytes) {
+            int ret = rtmp_chunk_parse(chunk_buffer + offset, bytes - offset, &chunk);
+            if (ret < 0) break;
+            
+            offset += ret;
+            
+            // Processa a mensagem
+            rtmp_protocol_handle_message(session, &chunk);
+            
+            // Libera payload se alocado
+            if (chunk.payload) {
+                buffer_pool_release(pool, chunk.payload);
+                chunk.payload = NULL;
+            }
+        }
     }
     
-    return server;
+    buffer_pool_release(pool, chunk_buffer);
+    rtmp_session_cleanup(session);
+    return NULL;
 }
 
-int rtmp_server_configure(rtmp_server_t *server, const rtmp_server_config_t *config) {
-    if (!server || !config) {
-        rtmp_set_error("Invalid server or config");
-        return -1;
-    }
-    
-    // Validate configuration
-    if (config->port <= 0 || config->port > 65535) {
-        rtmp_set_error("Invalid port number");
-        return -1;
-    }
-    
-    if (config->chunk_size < 128 || config->chunk_size > 65536) {
-        rtmp_set_error("Invalid chunk size");
-        return -1;
-    }
-    
-    if (config->window_size < 1024 || config->window_size > 5000000) {
-        rtmp_set_error("Invalid window size");
-        return -1;
-    }
-    
-    // Apply configuration
-    server->port = config->port;
-    server->chunk_size = config->chunk_size;
-    server->window_size = config->window_size;
-    server->peer_bandwidth = config->peer_bandwidth;
-    
-    return 0;
-}
-
-void rtmp_server_set_callbacks(rtmp_server_t *server,
-                             rtmp_client_callback on_connect,
-                             rtmp_client_callback on_disconnect,
-                             rtmp_stream_callback on_publish,
-                             rtmp_stream_callback on_play) {
-    if (!server) return;
-    
-    server->on_client_connect = on_connect;
-    server->on_client_disconnect = on_disconnect;
-    server->on_publish_stream = on_publish;
-    server->on_play_stream = on_play;
-}
-
-int rtmp_server_start(rtmp_server_t *server) {
-    if (!server) {
-        rtmp_set_error("Invalid server");
-        return -1;
-    }
-    
-    if (server->running) {
-        rtmp_set_error("Server already running");
-        return -1;
-    }
-    
-    // Create socket
-    server->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server->socket_fd < 0) {
-        rtmp_set_error("Failed to create socket: %s", strerror(errno));
-        return -1;
-    }
-    
-    // Set socket options
-    int reuse = 1;
-    if (setsockopt(server->socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        rtmp_set_error("Failed to set SO_REUSEADDR: %s", strerror(errno));
-        close(server->socket_fd);
-        return -1;
-    }
-    
-    // Set non-blocking mode
-    int flags = fcntl(server->socket_fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(server->socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        rtmp_set_error("Failed to set non-blocking mode: %s", strerror(errno));
-        close(server->socket_fd);
-        return -1;
-    }
-    
-    // Bind socket
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(server->port);
-    
-    if (bind(server->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        rtmp_set_error("Failed to bind socket: %s", strerror(errno));
-        close(server->socket_fd);
-        return -1;
-    }
-    
-    // Start listening
-    if (listen(server->socket_fd, 5) < 0) {
-        rtmp_set_error("Failed to listen: %s", strerror(errno));
-        close(server->socket_fd);
-        return -1;
-    }
-    
-    // Start accept thread
-    server->running = 1;
-    if (pthread_create(&server->accept_thread, NULL, rtmp_server_accept_thread, server) != 0) {
-        rtmp_set_error("Failed to create accept thread: %s", strerror(errno));
-        close(server->socket_fd);
-        server->running = 0;
-        return -1;
-    }
-    
-    return 0;
-}
-
-static void* rtmp_server_accept_thread(void *arg) {
-    rtmp_server_t *server = (rtmp_server_t *)arg;
+static void* accept_handler(void* arg) {
+    RTMPServer* server = (RTMPServer*)arg;
     struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
+    socklen_t addr_len = sizeof(client_addr);
     
     while (server->running) {
-        // Accept new connection
-        int client_fd = accept(server->socket_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No pending connections, sleep briefly
-                usleep(1000);
-                continue;
+        int client_socket = accept(server->server_socket, 
+                                 (struct sockaddr*)&client_addr, 
+                                 &addr_len);
+        
+        if (client_socket < 0) continue;
+        
+        // Cria nova sessão
+        RTMPSession* session = (RTMPSession*)malloc(sizeof(RTMPSession));
+        memset(session, 0, sizeof(RTMPSession));
+        session->socket = client_socket;
+        session->running = 1;
+        session->video_callback = server->video_callback;
+        session->audio_callback = server->audio_callback;
+        
+        // Adiciona à lista de sessões
+        pthread_mutex_lock(&server->sessions_mutex);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!server->sessions[i]) {
+                server->sessions[i] = session;
+                break;
             }
-            if (server->running) {
-                rtmp_set_error("Failed to accept client: %s", strerror(errno));
-            }
-            continue;
         }
+        pthread_mutex_unlock(&server->sessions_mutex);
         
-        // Set TCP_NODELAY
-        int nodelay = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        
-        // Create new session
-        rtmp_session_t *session = rtmp_session_create(client_fd);
-        if (!session) {
-            close(client_fd);
-            continue;
-        }
-        
-        session->server = server;
-        
-        // Add to connections list
-        pthread_mutex_lock(&server->connections_mutex);
-        if (server->num_connections >= RTMP_MAX_CONNECTIONS) {
-            pthread_mutex_unlock(&server->connections_mutex);
-            rtmp_session_destroy(session);
-            continue;
-        }
-        server->connections[server->num_connections++] = session;
-        pthread_mutex_unlock(&server->connections_mutex);
-        
-        // Notify callback
-        if (server->on_client_connect) {
-            server->on_client_connect(server, session);
-        }
-        
-        // Start session thread
+        // Inicia thread do cliente
         pthread_t thread;
-        if (pthread_create(&thread, NULL, rtmp_session_thread, session) != 0) {
-            rtmp_set_error("Failed to create session thread: %s", strerror(errno));
-            pthread_mutex_lock(&server->connections_mutex);
-            server->num_connections--;
-            pthread_mutex_unlock(&server->connections_mutex);
-            rtmp_session_destroy(session);
-            continue;
-        }
+        pthread_create(&thread, NULL, client_handler, session);
         pthread_detach(thread);
     }
     
     return NULL;
 }
 
-int rtmp_server_stop(rtmp_server_t *server) {
-    if (!server) {
-        rtmp_set_error("Invalid server");
+int rtmp_server_start(int port, VideoFrameCallback video_cb, AudioFrameCallback audio_cb) {
+    if (g_server) return -1;
+    
+    g_server = (RTMPServer*)malloc(sizeof(RTMPServer));
+    memset(g_server, 0, sizeof(RTMPServer));
+    
+    g_server->server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_server->server_socket < 0) {
+        free(g_server);
+        g_server = NULL;
         return -1;
     }
     
-    if (!server->running) {
-        return 0;
+    int reuse = 1;
+    setsockopt(g_server->server_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port ? port : RTMP_SERVER_PORT);
+    
+    if (bind(g_server->server_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(g_server->server_socket);
+        free(g_server);
+        g_server = NULL;
+        return -1;
     }
     
-    // Stop accept thread
-    server->running = 0;
-    shutdown(server->socket_fd, SHUT_RDWR);
-    close(server->socket_fd);
-    server->socket_fd = -1;
-    
-    pthread_join(server->accept_thread, NULL);
-    
-    // Close all connections
-    pthread_mutex_lock(&server->connections_mutex);
-    for (int i = 0; i < server->num_connections; i++) {
-        rtmp_session_t *session = server->connections[i];
-        if (session) {
-            if (server->on_client_disconnect) {
-                server->on_client_disconnect(server, session);
-            }
-            rtmp_session_destroy(session);
-        }
+    if (listen(g_server->server_socket, 5) < 0) {
+        close(g_server->server_socket);
+        free(g_server);
+        g_server = NULL;
+        return -1;
     }
-    server->num_connections = 0;
-    pthread_mutex_unlock(&server->connections_mutex);
+    
+    g_server->running = 1;
+    g_server->video_callback = video_cb;
+    g_server->audio_callback = audio_cb;
+    pthread_mutex_init(&g_server->sessions_mutex, NULL);
+    
+    pthread_create(&g_server->accept_thread, NULL, accept_handler, g_server);
     
     return 0;
 }
 
-void rtmp_server_destroy(rtmp_server_t *server) {
-    if (!server) return;
+void rtmp_server_stop() {
+    if (!g_server) return;
     
-    if (server->running) {
-        rtmp_server_stop(server);
+    g_server->running = 0;
+    
+    // Fecha socket do servidor
+    if (g_server->server_socket >= 0) {
+        close(g_server->server_socket);
     }
     
-    pthread_mutex_destroy(&server->connections_mutex);
-    free(server);
-}
-
-static void* rtmp_session_thread(void *arg) {
-    rtmp_session_t *session = (rtmp_session_t *)arg;
-    rtmp_server_t *server = session->server;
+    // Espera thread de accept terminar
+    pthread_join(g_server->accept_thread, NULL);
     
-    // Perform handshake
-    if (rtmp_handshake_server(session) < 0) {
-        goto cleanup;
-    }
-    
-    // Main processing loop
-    uint8_t buffer[4096];
-    ssize_t bytes_read;
-    
-    while ((bytes_read = recv(session->socket_fd, buffer, sizeof(buffer), 0)) > 0) {
-        if (rtmp_session_process_input(session, buffer, bytes_read) < 0) {
-            break;
+    // Limpa sessões
+    pthread_mutex_lock(&g_server->sessions_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_server->sessions[i]) {
+            g_server->sessions[i]->running = 0;
+            rtmp_session_cleanup(g_server->sessions[i]);
+            g_server->sessions[i] = NULL;
         }
     }
+    pthread_mutex_unlock(&g_server->sessions_mutex);
     
-cleanup:
-    // Remove from connections list
-    pthread_mutex_lock(&server->connections_mutex);
-    for (int i = 0; i < server->num_connections; i++) {
-        if (server->connections[i] == session) {
-            memmove(&server->connections[i], 
-                    &server->connections[i + 1],
-                    (server->num_connections - i - 1) * sizeof(rtmp_session_t*));
-            server->num_connections--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&server->connections_mutex);
+    pthread_mutex_destroy(&g_server->sessions_mutex);
     
-    // Notify callback
-    if (server->on_client_disconnect) {
-        server->on_client_disconnect(server, session);
-    }
-    
-    rtmp_session_destroy(session);
-    return NULL;
-}
-
-void rtmp_set_error(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(error_message, sizeof(error_message), fmt, args);
-    va_end(args);
-}
-
-const char* rtmp_get_error(void) {
-    return error_message;
+    free(g_server);
+    g_server = NULL;
 }

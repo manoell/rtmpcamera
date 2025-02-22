@@ -1,277 +1,227 @@
-#import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import "rtmp_core.h"
-#import "substrate.h"
-
-// RTMP Server Configuration
-#define RTMP_SERVER_PORT 1935
-#define RTMP_PREVIEW_ENABLED 1
-
-// Original method declaration
-static void (*original_captureOutput)(id self, SEL _cmd, AVCaptureOutput *captureOutput, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection);
+#import "rtmp_preview.h"
 
 @interface RTMPCameraManager : NSObject
 
-@property (nonatomic, strong) RTMPPreviewController *previewController;
-@property (nonatomic, assign) rtmp_server_t *rtmpServer;
-@property (nonatomic, assign) BOOL isActive;
-@property (nonatomic, strong) NSString *streamKey;
-@property (nonatomic, strong) dispatch_queue_t serverQueue;
-@property (nonatomic, strong) NSString *currentStreamName;
-@property (nonatomic, assign) BOOL isPublishing;
+@property (nonatomic, strong) dispatch_queue_t sessionQueue;
+@property (nonatomic, strong) AVCaptureSession *captureSession;
+@property (nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
+@property (nonatomic, strong) AVCaptureConnection *videoConnection;
+@property (nonatomic, assign) BOOL isConfigured;
+@property (nonatomic, assign) BOOL isStreaming;
+@property (nonatomic, strong) RTMPPreviewManager *previewManager;
 
-+ (instancetype)sharedManager;
++ (instancetype)sharedInstance;
 - (void)startServer;
 - (void)stopServer;
-- (void)setupPreviewWithView:(UIView *)containerView;
-- (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer;
-- (void)startPublishingWithName:(NSString *)streamName;
-- (void)stopPublishing;
+- (void)setupVideoCapture;
+- (void)startVideoCapture;
+- (void)stopVideoCapture;
+- (void)injectRTMPStream;
 
 @end
 
 @implementation RTMPCameraManager
 
-+ (instancetype)sharedManager {
-    static RTMPCameraManager *sharedManager = nil;
++ (instancetype)sharedInstance {
+    static RTMPCameraManager *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        sharedManager = [[self alloc] init];
+        instance = [[self alloc] init];
     });
-    return sharedManager;
+    return instance;
 }
 
 - (instancetype)init {
-    self = [super init];
-    if (self) {
-        _serverQueue = dispatch_queue_create("com.rtmpcamera.server", DISPATCH_QUEUE_SERIAL);
-        _isActive = NO;
-        _streamKey = @"live";
-        _previewController = [[RTMPPreviewController alloc] init];
-        _isPublishing = NO;
+    if (self = [super init]) {
+        _sessionQueue = dispatch_queue_create("com.rtmpcamera.session", DISPATCH_QUEUE_SERIAL);
+        _previewManager = [RTMPPreviewManager sharedInstance];
+        _isConfigured = NO;
+        _isStreaming = NO;
     }
     return self;
 }
 
 - (void)startServer {
-    if (self.isActive) return;
+    // Iniciar servidor RTMP na porta padrão 1935
+    int result = rtmp_server_start(1935, 
+        ^(uint8_t *data, size_t length, uint32_t timestamp) {
+            // Callback de vídeo
+            [self.previewManager processVideoFrame:data length:length timestamp:timestamp];
+        },
+        ^(uint8_t *data, size_t length, uint32_t timestamp) {
+            // Callback de áudio
+            [self.previewManager processAudioFrame:data length:length timestamp:timestamp];
+        }
+    );
     
-    dispatch_async(self.serverQueue, ^{
-        // Initialize RTMP server
-        self.rtmpServer = rtmp_server_create();
-        if (!self.rtmpServer) {
-            NSLog(@"[RTMPCamera] Failed to create RTMP server");
-            return;
-        }
-        
-        // Configure server
-        rtmp_server_config_t config = {
-            .port = RTMP_SERVER_PORT,
-            .chunk_size = 4096,
-            .window_size = 2500000,
-            .peer_bandwidth = 2500000
-        };
-        
-        if (rtmp_server_configure(self.rtmpServer, &config) < 0) {
-            NSLog(@"[RTMPCamera] Failed to configure RTMP server");
-            rtmp_server_destroy(self.rtmpServer);
-            self.rtmpServer = NULL;
-            return;
-        }
-        
-        // Set server callbacks
-        rtmp_server_set_callbacks(self.rtmpServer,
-                                ^(rtmp_server_t *server, rtmp_session_t *session) {
-            NSLog(@"[RTMPCamera] Client connected");
-        },
-                                ^(rtmp_server_t *server, rtmp_session_t *session) {
-            NSLog(@"[RTMPCamera] Client disconnected");
-        },
-                                ^(rtmp_server_t *server, rtmp_session_t *session, const char *stream_name) {
-            NSLog(@"[RTMPCamera] Stream published: %s", stream_name);
-            self.currentStreamName = [NSString stringWithUTF8String:stream_name];
-            self.isPublishing = YES;
-        },
-                                ^(rtmp_server_t *server, rtmp_session_t *session, const char *stream_name) {
-            NSLog(@"[RTMPCamera] Stream played: %s", stream_name);
-        });
-        
-        // Start server
-        if (rtmp_server_start(self.rtmpServer) < 0) {
-            NSLog(@"[RTMPCamera] Failed to start RTMP server");
-            rtmp_server_destroy(self.rtmpServer);
-            self.rtmpServer = NULL;
-            return;
-        }
-        
-        self.isActive = YES;
-        NSLog(@"[RTMPCamera] RTMP server started on port %d", RTMP_SERVER_PORT);
-    });
+    if (result == 0) {
+        NSLog(@"RTMP Server started successfully");
+        [self setupVideoCapture];
+    } else {
+        NSLog(@"Failed to start RTMP Server");
+    }
 }
 
 - (void)stopServer {
-    if (!self.isActive) return;
+    rtmp_server_stop();
+    [self stopVideoCapture];
+}
+
+- (void)setupVideoCapture {
+    if (self.isConfigured) return;
     
-    dispatch_async(self.serverQueue, ^{
-        if (self.rtmpServer) {
-            rtmp_server_stop(self.rtmpServer);
-            rtmp_server_destroy(self.rtmpServer);
-            self.rtmpServer = NULL;
+    dispatch_async(self.sessionQueue, ^{
+        self.captureSession = [[AVCaptureSession alloc] init];
+        
+        // Configurar qualidade alta
+        if ([self.captureSession canSetSessionPreset:AVCaptureSessionPreset1920x1080]) {
+            self.captureSession.sessionPreset = AVCaptureSessionPreset1920x1080;
         }
-        self.isActive = NO;
-        self.isPublishing = NO;
-        self.currentStreamName = nil;
-        NSLog(@"[RTMPCamera] RTMP server stopped");
+        
+        // Configurar saída de vídeo
+        self.videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+        
+        // Configurar formato de pixel
+        NSDictionary *settings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            (id)kCVPixelBufferWidthKey: @1920,
+            (id)kCVPixelBufferHeightKey: @1080
+        };
+        self.videoOutput.videoSettings = settings;
+        
+        // Configurar queue para processamento
+        dispatch_queue_t videoQueue = dispatch_queue_create("com.rtmpcamera.video", DISPATCH_QUEUE_SERIAL);
+        [self.videoOutput setSampleBufferDelegate:self queue:videoQueue];
+        
+        // Descartar frames atrasados para manter sincronização
+        self.videoOutput.alwaysDiscardsLateVideoFrames = YES;
+        
+        if ([self.captureSession canAddOutput:self.videoOutput]) {
+            [self.captureSession addOutput:self.videoOutput];
+        }
+        
+        self.videoConnection = [self.videoOutput connectionWithMediaType:AVMediaTypeVideo];
+        
+        // Configurar orientação
+        if (self.videoConnection.isVideoOrientationSupported) {
+            self.videoConnection.videoOrientation = AVCaptureVideoOrientationPortrait;
+        }
+        
+        // Configurar estabilização
+        if (self.videoConnection.isVideoStabilizationSupported) {
+            self.videoConnection.preferredVideoStabilizationMode = AVCaptureVideoStabilizationModeStandard;
+        }
+        
+        self.isConfigured = YES;
     });
 }
 
-- (void)setupPreviewWithView:(UIView *)containerView {
-#if RTMP_PREVIEW_ENABLED
-    if (!containerView) return;
+- (void)startVideoCapture {
+    if (!self.isConfigured || self.isStreaming) return;
     
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // Setup preview controller
-        self.previewController.view.frame = containerView.bounds;
-        self.previewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [containerView addSubview:self.previewController.view];
-        [self.previewController startPreview];
+    dispatch_async(self.sessionQueue, ^{
+        [self.captureSession startRunning];
+        self.isStreaming = YES;
+        [self.previewManager startProcessing];
     });
-#endif
 }
 
-- (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer {
-    if (!self.isActive || !sampleBuffer || !self.isPublishing) return;
+- (void)stopVideoCapture {
+    if (!self.isStreaming) return;
     
-    @autoreleasepool {
-        // Get video format
-        CMVideoFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
-        if (!formatDescription) return;
-        
-        // Get dimension
-        CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
-        
-        // Get raw buffer
-        CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (!imageBuffer) return;
-        
-        CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-        
-        @try {
-            // Get data pointers
-            void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
-            size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
-            size_t height = CVPixelBufferGetHeight(imageBuffer);
-            size_t dataSize = bytesPerRow * height;
-            
-            // Create copy of frame data
-            uint8_t *frameData = malloc(dataSize);
-            if (frameData) {
-                memcpy(frameData, baseAddress, dataSize);
-                
-                // Get timestamp
-                CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-                uint32_t timestamp = (uint32_t)(CMTimeGetSeconds(presentationTime) * 1000);
-                
-                // Send frame to RTMP server
-                dispatch_async(self.serverQueue, ^{
-                    if (self.rtmpServer && self.isActive && self.isPublishing) {
-                        rtmp_server_send_video(self.rtmpServer,
-                                             frameData,
-                                             dataSize,
-                                             dimensions.width,
-                                             dimensions.height,
-                                             timestamp);
-                    }
-                    free(frameData);
-                });
-                
-#if RTMP_PREVIEW_ENABLED
-                // Update preview if enabled
-                uint8_t *previewData = malloc(dataSize);
-                if (previewData) {
-                    memcpy(previewData, baseAddress, dataSize);
-                    [self.previewController processVideoData:previewData 
-                                                      size:dataSize 
-                                                timestamp:timestamp];
-                    free(previewData);
-                }
-#endif
-            }
-        }
-        @finally {
-            CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-        }
+    dispatch_async(self.sessionQueue, ^{
+        [self.captureSession stopRunning];
+        self.isStreaming = NO;
+        [self.previewManager stopProcessing];
+    });
+}
+
+- (void)injectRTMPStream {
+    // Substituir feed da câmera do sistema pelo stream RTMP
+    Method originalMethod = class_getInstanceMethod([AVCaptureSession class], 
+                                                  @selector(startRunning));
+    Method customMethod = class_getInstanceMethod([self class], 
+                                                @selector(customStartRunning));
+    method_exchangeImplementations(originalMethod, customMethod);
+}
+
+// Método para substituir o feed da câmera
+- (void)customStartRunning {
+    if (!self.isStreaming) {
+        [self startVideoCapture];
     }
+    
+    // Configurar características da câmera para parecer real
+    CMTime frameDuration = CMTimeMake(1, 30); // 30 fps
+    NSDictionary *deviceCharacteristics = @{
+        @"uniqueID": @"com.rtmpcamera.virtual",
+        @"modelID": @"iPhone Camera",
+        @"localizedName": @"Back Camera",
+        @"frameDuration": [NSValue valueWithCMTime:frameDuration],
+        @"hasFlash": @YES,
+        @"hasTorch": @YES,
+        @"hasAutoFocus": @YES,
+        @"maxISO": @2000,
+        @"minISO": @50
+    };
+    
+    objc_setAssociatedObject(self, "DeviceCharacteristics", 
+                            deviceCharacteristics, 
+                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-- (void)startPublishingWithName:(NSString *)streamName {
-    if (!streamName) streamName = @"live";
-    self.currentStreamName = streamName;
-    self.isPublishing = YES;
-}
+#pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
 
-- (void)stopPublishing {
-    self.isPublishing = NO;
-    self.currentStreamName = nil;
+- (void)captureOutput:(AVCaptureOutput *)output 
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer 
+       fromConnection:(AVCaptureConnection *)connection {
+    if (!self.isStreaming) return;
+    
+    // Processar frame recebido da câmera virtual
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (imageBuffer == NULL) return;
+    
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    uint8_t *baseAddress = (uint8_t *)CVPixelBufferGetBaseAddress(imageBuffer);
+    
+    // Criar buffer para codificação H.264
+    NSMutableData *encodedData = [NSMutableData data];
+    
+    // Codificar frame para H.264
+    VTCompressionSessionRef encodingSession = NULL;
+    VTCompressionSessionCreate(NULL, width, height, kCMVideoCodecType_H264, 
+                             NULL, NULL, NULL, NULL, NULL, &encodingSession);
+    
+    if (encodingSession) {
+        // Configurar parâmetros de codificação
+        VTSessionSetProperty(encodingSession, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+        VTSessionSetProperty(encodingSession, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+        VTSessionSetProperty(encodingSession, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(2000000));
+        VTSessionSetProperty(encodingSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(30));
+        
+        // Codificar frame
+        CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        VTCompressionSessionEncodeFrame(encodingSession, imageBuffer, presentationTime, 
+                                      kCMTimeInvalid, NULL, NULL, NULL);
+        
+        VTCompressionSessionCompleteFrames(encodingSession, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(encodingSession);
+        CFRelease(encodingSession);
+    }
+    
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    // Enviar frame codificado para o preview
+    [self.previewManager processVideoFrame:encodedData.bytes 
+                                  length:encodedData.length 
+                               timestamp:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000];
 }
 
 @end
-
-// Hooks for Camera Integration
-%hook AVCaptureSession
-
-- (void)startRunning {
-    %orig;
-    [[RTMPCameraManager sharedManager] startServer];
-}
-
-- (void)stopRunning {
-    [[RTMPCameraManager sharedManager] stopServer];
-    %orig;
-}
-
-%end
-
-%hook AVCaptureVideoDataOutput
-
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)queue {
-    %orig(sampleBufferDelegate, queue);
-    
-    // Hook the sample buffer delegate to intercept frames
-    if (sampleBufferDelegate && [sampleBufferDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        MSHookMessageEx(object_getClass(sampleBufferDelegate),
-                       @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
-                       (IMP)&replaced_captureOutput,
-                       (IMP*)&original_captureOutput);
-    }
-}
-
-%end
-
-// Replacement method for capturing video frames
-static void replaced_captureOutput(id self, SEL _cmd, AVCaptureOutput *captureOutput, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
-    @autoreleasepool {
-        // Retain buffer antes de passar para o processamento assíncrono
-        CFRetain(sampleBuffer);
-        
-        // Call original method
-        original_captureOutput(self, _cmd, captureOutput, sampleBuffer, connection);
-        
-        // Process frame em uma closure que gerencia a vida útil do buffer
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            @autoreleasepool {
-                [[RTMPCameraManager sharedManager] injectVideoFrame:sampleBuffer];
-                CFRelease(sampleBuffer);
-            }
-        });
-    }
-}
-
-%ctor {
-    @autoreleasepool {
-        // Initialize when tweak loads
-        NSLog(@"[RTMPCamera] Tweak initialized");
-        [RTMPCameraManager sharedManager];
-    }
-}
