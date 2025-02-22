@@ -1,67 +1,90 @@
-// rtmp_stream.h
 #ifndef RTMP_STREAM_H
 #define RTMP_STREAM_H
 
-#include "rtmp_core.h"
-#include "rtmp_session.h"
 #include <stdint.h>
+#include <stdbool.h>
+#include "rtmp_core.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// Configurações otimizadas para rede local
+#define STREAM_BUFFER_SIZE (1024 * 1024)  // 1MB buffer
+#define MAX_FRAME_SIZE (1920 * 1080 * 4)  // 1080p max
+#define MAX_QUEUE_SIZE 60                  // 2 segundos em 30fps
+#define MIN_CACHE_TIME 50                  // 50ms
+#define MAX_CACHE_TIME 500                 // 500ms
 
-// Tipos de pacotes de vídeo
-#define RTMP_VIDEO_KEYFRAME          0x01
-#define RTMP_VIDEO_INTER_FRAME       0x02
-#define RTMP_VIDEO_DISPOSABLE_FRAME  0x03
-#define RTMP_VIDEO_GENERATED_FRAME   0x04
-#define RTMP_VIDEO_INFO_FRAME        0x05
+// Tipo de codec
+typedef enum {
+    VIDEO_CODEC_UNKNOWN = 0,
+    VIDEO_CODEC_H264,
+    VIDEO_CODEC_H265
+} video_codec_t;
 
-// Codecs de vídeo
-#define RTMP_VIDEO_CODEC_JPEG    0x01
-#define RTMP_VIDEO_CODEC_H263    0x02
-#define RTMP_VIDEO_CODEC_SCREEN  0x03
-#define RTMP_VIDEO_CODEC_VP6     0x04
-#define RTMP_VIDEO_CODEC_VP6A    0x05
-#define RTMP_VIDEO_CODEC_SCREEN2 0x06
-#define RTMP_VIDEO_CODEC_H264    0x07
-#define RTMP_VIDEO_CODEC_H265    0x08
-
-// Estrutura do stream
+// Estrutura de frame
 typedef struct {
-    uint8_t type;
-    uint8_t codec;
+    uint8_t *data;
+    size_t length;
     uint32_t timestamp;
-    uint8_t* data;
-    uint32_t length;
     bool is_keyframe;
     bool is_sequence_header;
-} RTMPVideoPacket;
+    video_codec_t codec;
+} video_frame_t;
 
+// Estatísticas do stream
 typedef struct {
-    uint8_t codec;
-    uint32_t timestamp;
-    uint8_t* data;
-    uint32_t length;
-    bool is_sequence_header;
-} RTMPAudioPacket;
+    video_codec_t video_codec;
+    float current_fps;
+    float target_fps;
+    float buffer_usage;
+    float buffer_health;
+    uint32_t cache_time;
+    uint32_t dropped_frames;
+    uint32_t total_frames;
+    uint32_t current_bitrate;
+    uint32_t target_bitrate;
+    float quality_score;
+} stream_stats_t;
 
-// Funções de processamento de vídeo
-int rtmp_stream_process_video(RTMPSession* session, RTMPMessage* message);
-int rtmp_stream_parse_video_packet(uint8_t* data, uint32_t length, RTMPVideoPacket* packet);
-void rtmp_stream_free_video_packet(RTMPVideoPacket* packet);
+// Configuração do stream
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t target_fps;
+    uint32_t initial_bitrate;
+    uint32_t buffer_size;
+    bool hardware_acceleration;
+    bool is_local_network;
+} stream_config_t;
 
-// Funções de processamento de áudio
-int rtmp_stream_process_audio(RTMPSession* session, RTMPMessage* message);
-int rtmp_stream_parse_audio_packet(uint8_t* data, uint32_t length, RTMPAudioPacket* packet);
-void rtmp_stream_free_audio_packet(RTMPAudioPacket* packet);
+// Handle opaco para o stream
+typedef struct rtmp_stream rtmp_stream_t;
 
-// Funções de análise de qualidade
-void rtmp_stream_analyze_quality(RTMPSession* session, RTMPVideoPacket* packet);
-const char* rtmp_stream_get_codec_name(uint8_t codec);
+// Callbacks
+typedef void (*frame_callback_t)(video_frame_t *frame, void *ctx);
+typedef void (*status_callback_t)(stream_stats_t stats, void *ctx);
 
-#ifdef __cplusplus
-}
-#endif
+// Funções principais
+rtmp_stream_t *rtmp_stream_create(const stream_config_t *config);
+int rtmp_stream_connect(rtmp_stream_t *stream, const char *url);
+void rtmp_stream_disconnect(rtmp_stream_t *stream);
+void rtmp_stream_destroy(rtmp_stream_t *stream);
 
-#endif
+// Controle de frames
+video_frame_t *rtmp_stream_get_next_frame(rtmp_stream_t *stream);
+void rtmp_stream_release_frame(video_frame_t *frame);
+int rtmp_stream_queue_frame(rtmp_stream_t *stream, const uint8_t *data, size_t length, uint32_t timestamp);
+
+// Controle de qualidade
+void rtmp_stream_set_bitrate(rtmp_stream_t *stream, uint32_t bitrate);
+void rtmp_stream_set_fps(rtmp_stream_t *stream, uint32_t fps);
+void rtmp_stream_set_buffer_size(rtmp_stream_t *stream, uint32_t size);
+
+// Monitoramento
+stream_stats_t rtmp_stream_get_stats(rtmp_stream_t *stream);
+void rtmp_stream_set_callbacks(rtmp_stream_t *stream, frame_callback_t frame_cb, status_callback_t status_cb, void *ctx);
+
+// Utilidades
+const char *rtmp_stream_get_codec_name(video_codec_t codec);
+bool rtmp_stream_is_connected(rtmp_stream_t *stream);
+float rtmp_stream_get_latency(rtmp_stream_t *stream);
+
+#endif // RTMP_STREAM_H

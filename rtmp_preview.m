@@ -1,355 +1,41 @@
-#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import "rtmp_preview.h"
+#import "rtmp_stream.h"
+#import "rtmp_utils.h"
 
-// Configurações para otimização de performance
-#define MAX_FRAME_BUFFER_SIZE 8   // Buffer de 8 frames
-#define TARGET_FRAME_DURATION 1.0/30.0  // 30 fps
-#define SYNC_THRESHOLD 0.1  // 100ms threshold para sincronização
-#define MEMORY_POOL_SIZE (1024 * 1024 * 10)  // 10MB pool
+// Configurações otimizadas
+static const NSInteger kMaxBufferFrames = 3;
+static const NSTimeInterval kStatsUpdateInterval = 0.5;
+static const float kMinimumFPS = 25.0f;
 
-@interface RTMPPreviewManager () {
-    dispatch_queue_t _processingQueue;
+@interface RTMPPreviewView () {
+    CALayer *_previewLayer;
     dispatch_queue_t _renderQueue;
-    dispatch_semaphore_t _frameSync;
-    CMMemoryPoolRef _memoryPool;
-    
-    struct {
-        CMSampleBufferRef buffers[MAX_FRAME_BUFFER_SIZE];
-        uint32_t head;
-        uint32_t tail;
-        uint32_t count;
-        uint64_t lastTimestamp;
-        pthread_mutex_t mutex;
-    } _frameBuffer;
-    
-    struct {
-        uint32_t droppedFrames;
-        uint32_t processedFrames;
-        double averageLatency;
-        uint32_t bufferUnderruns;
-    } _stats;
+    dispatch_semaphore_t _frameBufferSemaphore;
+    CMFormatDescriptionRef _formatDescription;
+    VTDecompressionSessionRef _decompressionSession;
+    CFMutableArrayRef _frameBuffer;
+    bool _isSetup;
 }
 
-@property (nonatomic, strong) AVSampleBufferDisplayLayer *previewLayer;
-@property (nonatomic, strong) dispatch_source_t frameTimer;
-@property (nonatomic, assign) CMVideoFormatDescriptionRef formatDescription;
-@property (nonatomic, assign) VTDecompressionSessionRef decompressionSession;
-@property (nonatomic, strong) NSMutableArray<AVSampleBufferDisplayLayer *> *displayLayers;
-@property (nonatomic, assign) BOOL isProcessing;
-@property (nonatomic, assign) CMTime lastPresentationTime;
+@property (nonatomic, strong) UIView *statsView;
+@property (nonatomic, strong) UILabel *fpsLabel;
+@property (nonatomic, strong) UILabel *qualityLabel;
+@property (nonatomic, strong) UILabel *latencyLabel;
+@property (nonatomic, assign) NSInteger frameCount;
+@property (nonatomic, assign) NSTimeInterval lastFPSUpdate;
+@property (nonatomic, assign) NSTimeInterval lastFrameTime;
+@property (nonatomic, assign) float currentFPS;
+@property (nonatomic, assign) float averageLatency;
 
 @end
 
-@implementation RTMPPreviewManager
-
-+ (instancetype)sharedInstance {
-    static RTMPPreviewManager *instance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[self alloc] init];
-    });
-    return instance;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        // Inicializar queues
-        _processingQueue = dispatch_queue_create("com.rtmpcamera.preview.processing", 
-                                               DISPATCH_QUEUE_SERIAL);
-        _renderQueue = dispatch_queue_create("com.rtmpcamera.preview.render", 
-                                           DISPATCH_QUEUE_SERIAL);
-        
-        // Inicializar sincronização
-        _frameSync = dispatch_semaphore_create(1);
-        pthread_mutex_init(&_frameBuffer.mutex, NULL);
-        
-        // Criar pool de memória
-        _memoryPool = CMMemoryPoolCreate(NULL);
-        
-        // Configurar camadas de display
-        _displayLayers = [NSMutableArray array];
-        
-        // Configurar decomposição de vídeo
-        [self setupDecompressionSession];
-        
-        // Configurar timer de renderização
-        [self setupFrameTimer];
-    }
-    return self;
-}
-
-- (void)setupDecompressionSession {
-    // Configurar formato de vídeo
-    CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
-                                 kCMVideoCodecType_H264,
-                                 1920, 1080,
-                                 NULL,
-                                 &_formatDescription);
-    
-    // Configurar callback de decomposição
-    VTDecompressionOutputCallbackRecord callback;
-    callback.decompressionOutputCallback = decompressionOutputCallback;
-    callback.decompressionOutputRefCon = (__bridge void *)self;
-    
-    // Criar sessão de decomposição
-    NSDictionary *attributes = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
-        (id)kCVPixelBufferWidthKey: @1920,
-        (id)kCVPixelBufferHeightKey: @1080
-    };
-    
-    VTDecompressionSessionCreate(kCFAllocatorDefault,
-                                _formatDescription,
-                                NULL,
-                                (__bridge CFDictionaryRef)attributes,
-                                &callback,
-                                &_decompressionSession);
-    
-    // Configurar para baixa latência
-    VTSessionSetProperty(_decompressionSession,
-                        kVTDecompressionPropertyKey_RealTime,
-                        kCFBooleanTrue);
-}
-
-- (void)setupFrameTimer {
-    self.frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _renderQueue);
-    
-    dispatch_source_set_timer(self.frameTimer,
-                            dispatch_time(DISPATCH_TIME_NOW, 0),
-                            (int64_t)(TARGET_FRAME_DURATION * NSEC_PER_SEC),
-                            (int64_t)(1 * NSEC_PER_MSEC));
-    
-    __weak typeof(self) weakSelf = self;
-    dispatch_source_set_event_handler(self.frameTimer, ^{
-        [weakSelf renderNextFrame];
-    });
-}
-
-- (void)addPreviewLayer:(AVSampleBufferDisplayLayer *)layer {
-    layer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-    
-    // Otimizações para baixa latência
-    layer.preferredFrameRate = 30;
-    layer.shouldRasterize = NO;
-    
-    [self.displayLayers addObject:layer];
-}
-
-- (void)startProcessing {
-    if (self.isProcessing) return;
-    
-    self.isProcessing = YES;
-    dispatch_resume(self.frameTimer);
-    
-    // Resetar estatísticas
-    memset(&_stats, 0, sizeof(_stats));
-}
-
-- (void)stopProcessing {
-    if (!self.isProcessing) return;
-    
-    self.isProcessing = NO;
-    dispatch_suspend(self.frameTimer);
-    
-    // Limpar buffers
-    [self clearBuffers];
-}
-
-- (void)processVideoFrame:(uint8_t *)data length:(size_t)length timestamp:(uint64_t)timestamp {
-    if (!self.isProcessing) return;
-    
-    dispatch_async(_processingQueue, ^{
-        @autoreleasepool {
-            // Verificar timing
-            if (_frameBuffer.lastTimestamp > 0) {
-                double delta = (timestamp - _frameBuffer.lastTimestamp) / 1000.0;
-                if (delta < TARGET_FRAME_DURATION * 0.5) {
-                    _stats.droppedFrames++;
-                    return;
-                }
-            }
-            
-            // Criar block buffer
-            CMBlockBufferRef blockBuffer = NULL;
-            OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-                kCFAllocatorDefault,
-                data,
-                length,
-                kCFAllocatorDefault,
-                NULL,
-                0,
-                length,
-                0,
-                &blockBuffer
-            );
-            
-            if (status != noErr) return;
-            
-            // Criar sample buffer
-            CMSampleBufferRef sampleBuffer = NULL;
-            const size_t sampleSizes[] = {length};
-            
-            status = CMSampleBufferCreateReady(
-                kCFAllocatorDefault,
-                blockBuffer,
-                self.formatDescription,
-                1,
-                0,
-                NULL,
-                1,
-                sampleSizes,
-                &sampleBuffer
-            );
-            
-            CFRelease(blockBuffer);
-            
-            if (status != noErr) return;
-            
-            // Configurar timing
-            CMTime presentationTime = CMTimeMake(timestamp, 1000);
-            CFDictionaryRef empty = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFArrayRef attachments = CFArrayCreate(kCFAllocatorDefault, (const void **)&empty, 1,
-                &kCFTypeArrayCallBacks);
-            CFRelease(empty);
-            
-            CMSampleBufferSetOutputPresentationTimeStamp(sampleBuffer, presentationTime);
-            CMSampleBufferSetAttachments(sampleBuffer, attachments);
-            CFRelease(attachments);
-            
-            // Decodificar frame
-            VTDecodeFrameFlags flags = kVTDecodeFrame_EnableAsynchronousDecompression;
-            VTDecompressionSessionDecodeFrame(
-                self.decompressionSession,
-                sampleBuffer,
-                flags,
-                NULL,
-                NULL
-            );
-            
-            CFRelease(sampleBuffer);
-            
-            _frameBuffer.lastTimestamp = timestamp;
-            _stats.processedFrames++;
-        }
-    });
-}
-
-static void decompressionOutputCallback(void *decompressionOutputRefCon,
-                                      void *sourceFrameRefCon,
-                                      OSStatus status,
-                                      VTDecodeInfoFlags infoFlags,
-                                      CVImageBufferRef imageBuffer,
-                                      CMTime presentationTimeStamp,
-                                      CMTime presentationDuration) {
-    if (status != noErr || !imageBuffer) return;
-    
-    RTMPPreviewManager *self = (__bridge RTMPPreviewManager *)decompressionOutputRefCon;
-    
-    // Criar sample buffer para o frame decodificado
-    CMSampleTimingInfo timing = {
-        .duration = presentationDuration,
-        .presentationTimeStamp = presentationTimeStamp,
-        .decodeTimeStamp = kCMTimeInvalid
-    };
-    
-    CMSampleBufferRef sampleBuffer;
-    CMSampleBufferCreateForImageBuffer(
-        kCFAllocatorDefault,
-        imageBuffer,
-        true,
-        NULL,
-        NULL,
-        self.formatDescription,
-        &timing,
-        &sampleBuffer
-    );
-    
-    [self enqueueSampleBuffer:sampleBuffer];
-    CFRelease(sampleBuffer);
-}
-
-- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!self.isProcessing) return;
-    
-    pthread_mutex_lock(&_frameBuffer.mutex);
-    
-    if (_frameBuffer.count < MAX_FRAME_BUFFER_SIZE) {
-        CFRetain(sampleBuffer);
-        _frameBuffer.buffers[_frameBuffer.head] = sampleBuffer;
-        _frameBuffer.head = (_frameBuffer.head + 1) % MAX_FRAME_BUFFER_SIZE;
-        _frameBuffer.count++;
-    } else {
-        _stats.droppedFrames++;
-    }
-    
-    pthread_mutex_unlock(&_frameBuffer.mutex);
-}
-
-- (void)renderNextFrame {
-    pthread_mutex_lock(&_frameBuffer.mutex);
-    
-    if (_frameBuffer.count > 0) {
-        CMSampleBufferRef frame = _frameBuffer.buffers[_frameBuffer.tail];
-        _frameBuffer.buffers[_frameBuffer.tail] = NULL;
-        _frameBuffer.tail = (_frameBuffer.tail + 1) % MAX_FRAME_BUFFER_SIZE;
-        _frameBuffer.count--;
-        
-        pthread_mutex_unlock(&_frameBuffer.mutex);
-        
-        if (frame) {
-            // Renderizar frame em todas as layers
-            for (AVSampleBufferDisplayLayer *layer in self.displayLayers) {
-                if (layer.status != AVQueuedSampleBufferRenderingStatusFailed) {
-                    [layer enqueueSampleBuffer:frame];
-                }
-            }
-            
-            CFRelease(frame);
-        }
-    } else {
-        _stats.bufferUnderruns++;
-        pthread_mutex_unlock(&_frameBuffer.mutex);
-    }
-}
-
-- (void)clearBuffers {
-    pthread_mutex_lock(&_frameBuffer.mutex);
-    
-    for (uint32_t i = 0; i < MAX_FRAME_BUFFER_SIZE; i++) {
-        if (_frameBuffer.buffers[i]) {
-            CFRelease(_frameBuffer.buffers[i]);
-            _frameBuffer.buffers[i] = NULL;
-        }
-    }
-    
-    _frameBuffer.head = 0;
-    _frameBuffer.tail = 0;
-    _frameBuffer.count = 0;
-    _frameBuffer.lastTimestamp = 0;
-    
-    pthread_mutex_unlock(&_frameBuffer.mutex);
-}
-
-- (void)getStats:(RTMPPreviewStats *)stats {
-    if (!stats) return;
-    
-    stats->processedFrames = _stats.processedFrames;
-    stats->droppedFrames = _stats.droppedFrames;
-    stats->bufferUnderruns = _stats.bufferUnderruns;
-    stats->averageLatency = _stats.averageLatency;
-}
+@implementation RTMPPreviewView
 
 - (void)dealloc {
-    [self stopProcessing];
-    
-    if (_frameTimer) {
-        dispatch_source_cancel(_frameTimer);
-    }
-    
     if (_decompressionSession) {
         VTDecompressionSessionInvalidate(_decompressionSession);
         CFRelease(_decompressionSession);
@@ -359,12 +45,243 @@ static void decompressionOutputCallback(void *decompressionOutputRefCon,
         CFRelease(_formatDescription);
     }
     
-    if (_memoryPool) {
-        CMMemoryPoolInvalidate(_memoryPool);
-        CFRelease(_memoryPool);
+    if (_frameBuffer) {
+        CFRelease(_frameBuffer);
+    }
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        [self setupPreviewLayer];
+        [self setupRenderQueue];
+        [self setupFrameBuffer];
+        [self setupStatsView];
+        _isSetup = false;
+        _averageLatency = 0;
+    }
+    return self;
+}
+
+- (void)setupPreviewLayer {
+    _previewLayer = [CALayer layer];
+    _previewLayer.frame = self.bounds;
+    _previewLayer.contentsGravity = kCAGravityResizeAspect;
+    _previewLayer.backgroundColor = [UIColor blackColor].CGColor;
+    [self.layer addSublayer:_previewLayer];
+}
+
+- (void)setupRenderQueue {
+    _renderQueue = dispatch_queue_create("com.rtmpcamera.preview.render", 
+        DISPATCH_QUEUE_SERIAL_WITH_AUTORELEASE_POOL);
+    dispatch_set_target_queue(_renderQueue, 
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
+    _frameBufferSemaphore = dispatch_semaphore_create(kMaxBufferFrames);
+}
+
+- (void)setupFrameBuffer {
+    _frameBuffer = CFArrayCreateMutable(kCFAllocatorDefault, kMaxBufferFrames, NULL);
+}
+
+- (void)setupStatsView {
+    self.statsView = [[UIView alloc] initWithFrame:CGRectMake(10, 10, 200, 90)];
+    self.statsView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+    self.statsView.layer.cornerRadius = 5;
+    
+    self.fpsLabel = [[UILabel alloc] initWithFrame:CGRectMake(5, 5, 190, 20)];
+    self.fpsLabel.textColor = [UIColor whiteColor];
+    self.fpsLabel.font = [UIFont systemFontOfSize:12];
+    
+    self.qualityLabel = [[UILabel alloc] initWithFrame:CGRectMake(5, 30, 190, 20)];
+    self.qualityLabel.textColor = [UIColor whiteColor];
+    self.qualityLabel.font = [UIFont systemFontOfSize:12];
+    
+    self.latencyLabel = [[UILabel alloc] initWithFrame:CGRectMake(5, 55, 190, 20)];
+    self.latencyLabel.textColor = [UIColor whiteColor];
+    self.latencyLabel.font = [UIFont systemFontOfSize:12];
+    
+    [self.statsView addSubview:self.fpsLabel];
+    [self.statsView addSubview:self.qualityLabel];
+    [self.statsView addSubview:self.latencyLabel];
+    [self addSubview:self.statsView];
+}
+
+- (void)setupDecompressionSession {
+    if (_isSetup) return;
+    
+    // Configuração otimizada para decodificação por hardware
+    NSDictionary *attributes = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
+    };
+    
+    VTDecompressionOutputCallbackRecord callback;
+    callback.decompressionOutputCallback = decompressionOutputCallback;
+    callback.decompressionOutputRefCon = (__bridge void *)self;
+    
+    // Cria sessão de decodificação com prioridade alta
+    NSDictionary *videoDecoderSpecification = @{
+        (NSString*)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @YES,
+        (NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES
+    };
+    
+    OSStatus status = VTDecompressionSessionCreate(
+        kCFAllocatorDefault,
+        _formatDescription,
+        (__bridge CFDictionaryRef)videoDecoderSpecification,
+        (__bridge CFDictionaryRef)attributes,
+        &callback,
+        &_decompressionSession
+    );
+    
+    if (status != noErr) {
+        NSLog(@"Erro ao criar sessão de decodificação: %d", (int)status);
+        return;
     }
     
-    pthread_mutex_destroy(&_frameBuffer.mutex);
+    // Configura prioridade real-time
+    VTSessionSetProperty(_decompressionSession,
+        kVTDecompressionPropertyKey_RealTime,
+        kCFBooleanTrue);
+    
+    _isSetup = true;
+}
+
+static void decompressionOutputCallback(void *decompressionOutputRefCon,
+                                      void *sourceFrameRefCon,
+                                      OSStatus status,
+                                      VTDecodeInfoFlags infoFlags,
+                                      CVImageBufferRef imageBuffer,
+                                      CMTime presentationTimeStamp,
+                                      CMTime presentationDuration) {
+    RTMPPreviewView *preview = (__bridge RTMPPreviewView *)decompressionOutputRefCon;
+    [preview displayDecodedFrame:imageBuffer withTimestamp:presentationTimeStamp];
+}
+
+- (void)displayDecodedFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
+    if (!imageBuffer) return;
+    
+    // Calcula latência
+    NSTimeInterval currentTime = CACurrentMediaTime();
+    NSTimeInterval frameLatency = currentTime - CMTimeGetSeconds(timestamp);
+    self.averageLatency = (self.averageLatency * 0.7) + (frameLatency * 0.3);
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_previewLayer.contents = (__bridge id)imageBuffer;
+        self.frameCount++;
+        [self updateStats];
+    });
+}
+
+- (void)updateStats {
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastFPSUpdate >= kStatsUpdateInterval) {
+        float fps = self.frameCount / (now - self.lastFPSUpdate);
+        self.currentFPS = fps;
+        
+        self.fpsLabel.text = [NSString stringWithFormat:@"FPS: %.1f", fps];
+        self.latencyLabel.text = [NSString stringWithFormat:@"Latência: %.1f ms", self.averageLatency * 1000];
+        
+        if (self.stream) {
+            stream_stats_t stats = rtmp_stream_get_stats(self.stream);
+            NSString *quality;
+            UIColor *qualityColor;
+            
+            if (stats.buffer_usage > 0.8) {
+                quality = @"Ruim";
+                qualityColor = [UIColor redColor];
+            } else if (stats.buffer_usage > 0.5) {
+                quality = @"Média";
+                qualityColor = [UIColor yellowColor];
+            } else {
+                quality = @"Ótima";
+                qualityColor = [UIColor greenColor];
+            }
+            
+            self.qualityLabel.text = [NSString stringWithFormat:@"Qualidade: %@", quality];
+            self.qualityLabel.textColor = qualityColor;
+        }
+        
+        // Alerta se FPS está baixo
+        if (fps < kMinimumFPS) {
+            NSLog(@"Alerta: FPS baixo (%.1f)", fps);
+        }
+        
+        self.frameCount = 0;
+        self.lastFPSUpdate = now;
+    }
+}
+
+- (void)processVideoFrame:(video_frame_t *)frame {
+    if (!frame || !frame->data) return;
+    
+    if (!_isSetup) {
+        [self setupDecompressionSession];
+    }
+    
+    // Evita buffer overflow
+    dispatch_semaphore_wait(_frameBufferSemaphore, DISPATCH_TIME_FOREVER);
+    
+    dispatch_async(_renderQueue, ^{
+        CMBlockBufferRef blockBuffer = NULL;
+        OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+            kCFAllocatorDefault,
+            frame->data,
+            frame->length,
+            kCFAllocatorNull,
+            NULL,
+            0,
+            frame->length,
+            0,
+            &blockBuffer
+        );
+        
+        if (status != noErr) {
+            dispatch_semaphore_signal(self->_frameBufferSemaphore);
+            return;
+        }
+        
+        CMSampleBufferRef sampleBuffer = NULL;
+        const size_t sampleSizeArray[] = {frame->length};
+        status = CMSampleBufferCreateReady(
+            kCFAllocatorDefault,
+            blockBuffer,
+            self->_formatDescription,
+            1,
+            0,
+            NULL,
+            1,
+            sampleSizeArray,
+            &sampleBuffer
+        );
+        
+        if (status != noErr) {
+            CFRelease(blockBuffer);
+            dispatch_semaphore_signal(self->_frameBufferSemaphore);
+            return;
+        }
+        
+        VTDecodeFrameFlags flags = kVTDecodeFrame_EnableAsynchronousDecompression | 
+                                  kVTDecodeFrame_1xRealTimePlayback;
+        
+        VTDecompressionSessionDecodeFrame(
+            self->_decompressionSession,
+            sampleBuffer,
+            flags,
+            NULL,
+            NULL
+        );
+        
+        CFRelease(sampleBuffer);
+        CFRelease(blockBuffer);
+        dispatch_semaphore_signal(self->_frameBufferSemaphore);
+    });
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _previewLayer.frame = self.bounds;
 }
 
 @end

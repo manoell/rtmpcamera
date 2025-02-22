@@ -1,276 +1,273 @@
-#import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
-#import "rtmp_camera.h"
+#import <objc/runtime.h>
+#import "rtmp_camera_compat.h"
+#import "rtmp_stream.h"
+#import "rtmp_diagnostics.h"
 
-// Constantes para simulação de dispositivo
-#define CAMERA_UNIQUE_ID @"com.rtmpcamera.virtual"
-#define CAMERA_MODEL_ID @"iPhone Pro Camera"
-#define CAMERA_MANUFACTURER @"Apple"
-#define CAMERA_SERIAL @"RTMPCAM001"
+// Configurações da câmera
+static const int kDefaultWidth = 1920;
+static const int kDefaultHeight = 1080;
+static const float kDefaultFrameRate = 30.0f;
 
-@interface RTMPCameraCompatibility : NSObject
+@interface RTMPCameraCompatLayer () {
+    CMFormatDescriptionRef _videoFormatDescription;
+    dispatch_queue_t _cameraQueue;
+    NSTimer *_frameTimer;
+    uint64_t _frameNumber;
+}
 
-@property (nonatomic, strong) NSMutableDictionary *appProfiles;
-@property (nonatomic, strong) NSMutableDictionary *activeCaptureSessions;
-@property (nonatomic, strong) dispatch_queue_t compatQueue;
-@property (nonatomic, assign) BOOL isOverriding;
-
-+ (instancetype)sharedInstance;
-- (void)startCameraOverride;
-- (void)stopCameraOverride;
-- (void)setupForApp:(NSString *)bundleId;
+@property (nonatomic, strong) AVCaptureDevice *originalDevice;
+@property (nonatomic, strong) AVCaptureSession *fakeSession;
+@property (nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
+@property (nonatomic, assign) rtmp_stream_t *stream;
+@property (nonatomic, strong) NSMutableDictionary *deviceProperties;
+@property (nonatomic, assign) BOOL isCapturing;
+@property (nonatomic, assign) CMTime presentationTimeStamp;
 
 @end
 
-@implementation RTMPCameraCompatibility {
-    CMVideoDimensions _defaultDimensions;
-    AVCaptureDeviceFormat *_virtualFormat;
-    NSArray *_supportedFormats;
-    Method _originalDeviceMethod;
-    Method _originalSessionMethod;
-}
-
-+ (instancetype)sharedInstance {
-    static RTMPCameraCompatibility *instance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[self alloc] init];
-    });
-    return instance;
-}
+@implementation RTMPCameraCompatLayer
 
 - (instancetype)init {
-    if (self = [super init]) {
-        _appProfiles = [NSMutableDictionary dictionary];
-        _activeCaptureSessions = [NSMutableDictionary dictionary];
-        _compatQueue = dispatch_queue_create("com.rtmpcamera.compat", DISPATCH_QUEUE_SERIAL);
-        _defaultDimensions = (CMVideoDimensions){1920, 1080};
+    self = [super init];
+    if (self) {
+        _cameraQueue = dispatch_queue_create("com.rtmpcamera.cameraqueue", 
+            DISPATCH_QUEUE_SERIAL_WITH_AUTORELEASE_POOL);
+        dispatch_set_target_queue(_cameraQueue, 
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
         
-        [self setupDefaultProfiles];
-        [self setupVirtualFormats];
+        _deviceProperties = [NSMutableDictionary dictionary];
+        _frameNumber = 0;
+        
+        [self setupFakeSession];
+        [self cloneOriginalCameraProperties];
+        
+        rtmp_diagnostics_log(LOG_INFO, "RTMPCameraCompatLayer inicializada");
     }
     return self;
 }
 
-- (void)setupDefaultProfiles {
-    // Perfis otimizados para apps populares
-    _appProfiles = @{
-        @"com.apple.camera": @{
-            @"name": @"Camera",
-            @"formats": @[@"1920x1080", @"1280x720", @"720x480"],
-            @"features": @{
-                @"flash": @YES,
-                @"torch": @YES,
-                @"focusPoint": @YES,
-                @"exposurePoint": @YES,
-                @"whiteBalance": @YES
-            },
-            @"metadata": @{
-                @"isSystemCamera": @YES,
-                @"position": @"back",
-                @"uniqueID": CAMERA_UNIQUE_ID
-            }
-        },
-        @"com.google.ios.youtube": @{
-            @"name": @"YouTube",
-            @"formats": @[@"1920x1080", @"1280x720"],
-            @"features": @{
-                @"flash": @YES,
-                @"torch": @YES,
-                @"focusPoint": @YES
-            }
-        },
-        @"com.facebook.Facebook": @{
-            @"name": @"Facebook",
-            @"formats": @[@"1280x720", @"854x480"],
-            @"features": @{
-                @"flash": @YES,
-                @"focusPoint": @YES
-            }
-        },
-        // Perfil genérico para outros apps
-        @"default": @{
-            @"name": @"Generic",
-            @"formats": @[@"1920x1080", @"1280x720"],
-            @"features": @{
-                @"flash": @YES,
-                @"torch": @YES,
-                @"focusPoint": @YES
-            }
-        }
-    };
+- (void)setupFakeSession {
+    self.fakeSession = [[AVCaptureSession alloc] init];
+    self.fakeSession.sessionPreset = AVCaptureSessionPresetHigh;
+    
+    // Configuração otimizada do output
+    self.videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    [self.videoOutput setVideoSettings:@{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        (id)kCVPixelBufferWidthKey: @(kDefaultWidth),
+        (id)kCVPixelBufferHeightKey: @(kDefaultHeight)
+    }];
+    
+    self.videoOutput.alwaysDiscardsLateVideoFrames = YES;
+    [self.videoOutput setSampleBufferDelegate:self queue:_cameraQueue];
+    
+    if ([self.fakeSession canAddOutput:self.videoOutput]) {
+        [self.fakeSession addOutput:self.videoOutput];
+    }
 }
 
-- (void)setupVirtualFormats {
+- (void)cloneOriginalCameraProperties {
+    AVCaptureDevice *realCamera = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    self.originalDevice = realCamera;
+    
+    // Clona propriedades da câmera real
+    self.deviceProperties[@"uniqueID"] = realCamera.uniqueID;
+    self.deviceProperties[@"modelID"] = realCamera.modelID;
+    self.deviceProperties[@"localizedName"] = realCamera.localizedName;
+    self.deviceProperties[@"manufacturer"] = @"Apple";
+    
+    // Características da câmera
+    self.deviceProperties[@"exposureDuration"] = @(CMTimeGetSeconds(realCamera.exposureDuration));
+    self.deviceProperties[@"ISO"] = @(realCamera.ISO);
+    self.deviceProperties[@"lensPosition"] = @(realCamera.lensPosition);
+    self.deviceProperties[@"deviceType"] = @(realCamera.deviceType);
+    
+    // Capabilities
+    self.deviceProperties[@"hasFlash"] = @(realCamera.hasFlash);
+    self.deviceProperties[@"hasTorch"] = @(realCamera.hasTorch);
+    self.deviceProperties[@"focusPointOfInterestSupported"] = @(realCamera.focusPointOfInterestSupported);
+    self.deviceProperties[@"exposurePointOfInterestSupported"] = @(realCamera.exposurePointOfInterestSupported);
+    
+    // Formatos suportados
     NSMutableArray *formats = [NSMutableArray array];
-    
-    // Criar formatos suportados
-    NSArray *dimensions = @[
-        @[@1920, @1080],
-        @[@1280, @720],
-        @[@854, @480],
-        @[@640, @480]
-    ];
-    
-    for (NSArray *dim in dimensions) {
-        CMVideoFormatDescriptionRef format;
+    for (AVCaptureDeviceFormat *format in realCamera.formats) {
+        CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        float maxFrameRate = ((AVFrameRateRange *)format.videoSupportedFrameRateRanges.firstObject).maxFrameRate;
         
-        FourCharCode pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-        
-        CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
-                                     kCMVideoCodecType_H264,
-                                     [dim[0] intValue],
-                                     [dim[1] intValue],
-                                     (__bridge CFDictionaryRef)@{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat)
-        },
-                                     &format);
-        
-        AVFrameRateRange *frameRate = [[AVFrameRateRange alloc] init];
-        [frameRate setValue:@(30) forKey:@"_maxFrameRate"];
-        [frameRate setValue:@(30) forKey:@"_minFrameRate"];
-        
-        AVCaptureDeviceFormat *deviceFormat = [[AVCaptureDeviceFormat alloc] init];
-        [deviceFormat setValue:(__bridge id)format forKey:@"_formatDescription"];
-        [deviceFormat setValue:@[frameRate] forKey:@"_frameRateRanges"];
-        
-        [formats addObject:deviceFormat];
-        CFRelease(format);
+        [formats addObject:@{
+            @"width": @(dimensions.width),
+            @"height": @(dimensions.height),
+            @"frameRate": @(maxFrameRate)
+        }];
     }
-    
-    _supportedFormats = formats;
-    _virtualFormat = formats[0];
+    self.deviceProperties[@"supportedFormats"] = formats;
 }
 
-- (void)startCameraOverride {
-    if (_isOverriding) return;
+- (void)startCapturing {
+    if (self.isCapturing) return;
     
-    // Substituir métodos do AVCaptureDevice
-    Class deviceClass = [AVCaptureDevice class];
-    
-    _originalDeviceMethod = class_getClassMethod(deviceClass, @selector(devicesWithMediaType:));
-    Method customMethod = class_getClassMethod([self class], @selector(customDevicesWithMediaType:));
-    method_exchangeImplementations(_originalDeviceMethod, customMethod);
-    
-    // Substituir métodos do AVCaptureSession
-    Class sessionClass = [AVCaptureSession class];
-    
-    _originalSessionMethod = class_getInstanceMethod(sessionClass, @selector(startRunning));
-    Method customSessionMethod = class_getInstanceMethod([self class], @selector(customStartRunning));
-    method_exchangeImplementations(_originalSessionMethod, customSessionMethod);
-    
-    _isOverriding = YES;
-}
-
-- (void)stopCameraOverride {
-    if (!_isOverriding) return;
-    
-    // Restaurar métodos originais
-    method_exchangeImplementations(_originalDeviceMethod, 
-                                 class_getClassMethod([self class], @selector(customDevicesWithMediaType:)));
-    
-    method_exchangeImplementations(_originalSessionMethod,
-                                 class_getInstanceMethod([self class], @selector(customStartRunning)));
-    
-    _isOverriding = NO;
-}
-
-+ (NSArray<AVCaptureDevice *> *)customDevicesWithMediaType:(NSString *)mediaType {
-    // Primeiro obtém dispositivos reais
-    NSArray *originalDevices = ((NSArray<AVCaptureDevice *> *(*)(id, SEL, NSString *))
-                               method_getImplementation([[self class] instanceMethodForSelector:@selector(originalDevicesWithMediaType:)]))
-    ([self class], @selector(originalDevicesWithMediaType:), mediaType);
-    
-    if (![mediaType isEqualToString:AVMediaTypeVideo]) {
-        return originalDevices;
-    }
-    
-    // Criar dispositivo virtual
-    AVCaptureDevice *virtualDevice = [[AVCaptureDevice alloc] init];
-    
-    // Configurar características
-    [virtualDevice setValue:CAMERA_UNIQUE_ID forKey:@"_uniqueID"];
-    [virtualDevice setValue:CAMERA_MODEL_ID forKey:@"_modelID"];
-    [virtualDevice setValue:@"Back Camera" forKey:@"_localizedName"];
-    [virtualDevice setValue:@(AVCaptureDevicePositionBack) forKey:@"_position"];
-    
-    // Configurar capacidades
-    [virtualDevice setValue:@YES forKey:@"_hasFlash"];
-    [virtualDevice setValue:@YES forKey:@"_hasTorch"];
-    [virtualDevice setValue:@YES forKey:@"_hasAutoFocus"];
-    [virtualDevice setValue:@YES forKey:@"_hasAutoExposure"];
-    
-    // Configurar formatos
-    RTMPCameraCompatibility *compat = [RTMPCameraCompatibility sharedInstance];
-    [virtualDevice setValue:compat->_supportedFormats forKey:@"_formats"];
-    [virtualDevice setValue:compat->_virtualFormat forKey:@"_activeFormat"];
-    
-    // Adicionar à lista
-    NSMutableArray *devices = [originalDevices mutableCopy];
-    [devices addObject:virtualDevice];
-    
-    return devices;
-}
-
-- (void)customStartRunning {
-    // Verificar se é nossa sessão virtual
-    AVCaptureSession *session = (AVCaptureSession *)self;
-    
-    if ([self isVirtualSession:session]) {
-        // Iniciar preview RTMP
-        [[RTMPPreviewManager sharedInstance] startProcessing];
-    } else {
-        // Chamar implementação original
-        ((void(*)(id, SEL))
-         method_getImplementation([[self class] instanceMethodForSelector:@selector(originalStartRunning)]))
-        (self, @selector(originalStartRunning));
-    }
-}
-
-- (BOOL)isVirtualSession:(AVCaptureSession *)session {
-    for (AVCaptureInput *input in session.inputs) {
-        if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
-            AVCaptureDeviceInput *deviceInput = (AVCaptureDeviceInput *)input;
-            if ([deviceInput.device.uniqueID isEqualToString:CAMERA_UNIQUE_ID]) {
-                return YES;
-            }
-        }
-    }
-    return NO;
-}
-
-- (void)setupForApp:(NSString *)bundleId {
-    dispatch_async(_compatQueue, ^{
-        // Obter perfil do app
-        NSDictionary *profile = self.appProfiles[bundleId];
-        if (!profile) {
-            profile = self.appProfiles[@"default"];
-        }
+    dispatch_async(_cameraQueue, ^{
+        self.isCapturing = YES;
+        self.presentationTimeStamp = CMTimeMake(0, 1000);
         
-        // Ajustar formatos baseado no perfil
-        NSArray *formats = profile[@"formats"];
-        if (formats.count > 0) {
-            NSString *bestFormat = formats[0];
-            NSArray *dimensions = [bestFormat componentsSeparatedByString:@"x"];
-            if (dimensions.count == 2) {
-                _defaultDimensions.width = [dimensions[0] intValue];
-                _defaultDimensions.height = [dimensions[1] intValue];
-                
-                // Atualizar formato ativo
-                for (AVCaptureDeviceFormat *format in _supportedFormats) {
-                    CMVideoFormatDescriptionRef desc = (__bridge CMVideoFormatDescriptionRef)[format valueForKey:@"_formatDescription"];
-                    if (CMVideoFormatDescriptionGetDimensions(desc).width == _defaultDimensions.width) {
-                        _virtualFormat = format;
-                        break;
-                    }
-                }
-            }
-        }
+        // Inicia timer para simular frames da câmera
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_frameTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/kDefaultFrameRate
+                                                              target:self
+                                                            selector:@selector(generateFrame)
+                                                            userInfo:nil
+                                                             repeats:YES];
+        });
         
-        // Registrar sessão ativa
-        self.activeCaptureSessions[bundleId] = @YES;
+        rtmp_diagnostics_log(LOG_INFO, "Captura iniciada");
     });
+}
+
+- (void)stopCapturing {
+    if (!self.isCapturing) return;
+    
+    dispatch_async(_cameraQueue, ^{
+        self.isCapturing = NO;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self->_frameTimer invalidate];
+            self->_frameTimer = nil;
+        });
+        
+        rtmp_diagnostics_log(LOG_INFO, "Captura finalizada");
+    });
+}
+
+- (void)generateFrame {
+    if (!self.isCapturing) return;
+    
+    dispatch_async(_cameraQueue, ^{
+        @autoreleasepool {
+            CMTime timestamp = CMTimeAdd(self.presentationTimeStamp, 
+                                       CMTimeMake(1000/kDefaultFrameRate, 1000));
+            self.presentationTimeStamp = timestamp;
+            
+            // Obtém frame do stream RTMP
+            video_frame_t *rtmpFrame = rtmp_stream_get_next_frame(self.stream);
+            if (!rtmpFrame) return;
+            
+            // Cria buffer de pixel
+            CVPixelBufferRef pixelBuffer = NULL;
+            CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
+                                                kDefaultWidth,
+                                                kDefaultHeight,
+                                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                                NULL,
+                                                &pixelBuffer);
+            
+            if (status != kCVReturnSuccess) {
+                rtmp_diagnostics_log(LOG_ERROR, "Erro ao criar pixel buffer");
+                return;
+            }
+            
+            // Copia dados do frame RTMP para o buffer
+            CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+            
+            // Aqui você precisa converter os dados do frame RTMP para o formato YUV
+            // Este é um exemplo simplificado
+            uint8_t *baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
+            memcpy(baseAddress, rtmpFrame->data, rtmpFrame->length);
+            
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+            
+            // Cria sample buffer
+            CMSampleBufferRef sampleBuffer = NULL;
+            
+            // Cria format description se necessário
+            if (!_videoFormatDescription) {
+                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault,
+                                                           pixelBuffer,
+                                                           &_videoFormatDescription);
+            }
+            
+            // Timing info
+            CMSampleTimingInfo timing = {
+                .duration = CMTimeMake(1, (int32_t)kDefaultFrameRate),
+                .presentationTimeStamp = timestamp,
+                .decodeTimeStamp = timestamp
+            };
+            
+            // Cria sample buffer
+            status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
+                                                      pixelBuffer,
+                                                      TRUE,
+                                                      NULL,
+                                                      NULL,
+                                                      _videoFormatDescription,
+                                                      &timing,
+                                                      &sampleBuffer);
+            
+            if (status == noErr && sampleBuffer) {
+                // Notifica delegates
+                if ([self.videoOutput.sampleBufferDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                    [self.videoOutput.sampleBufferDelegate captureOutput:self.videoOutput
+                                               didOutputSampleBuffer:sampleBuffer
+                                                      fromConnection:self.videoOutput.connections.firstObject];
+                }
+                
+                CFRelease(sampleBuffer);
+            }
+            
+            CVPixelBufferRelease(pixelBuffer);
+            
+            _frameNumber++;
+            
+            // Log periódico de status
+            if (_frameNumber % 300 == 0) { // A cada 10 segundos em 30fps
+                rtmp_diagnostics_log(LOG_INFO, "Frames processados: %llu", _frameNumber);
+            }
+        }
+    });
+}
+
+#pragma mark - Propriedades da Câmera
+
+- (id)valueForKey:(NSString *)key {
+    id value = self.deviceProperties[key];
+    return value ?: [super valueForKey:key];
+}
+
+- (BOOL)supportsAVCaptureSessionPreset:(NSString *)preset {
+    return [preset isEqualToString:AVCaptureSessionPresetHigh] ||
+           [preset isEqualToString:AVCaptureSessionPreset1920x1080];
+}
+
+- (void)setExposureMode:(AVCaptureExposureMode)exposureMode {
+    // Simula suporte a modos de exposição
+}
+
+- (void)setFocusMode:(AVCaptureFocusMode)focusMode {
+    // Simula suporte a modos de foco
+}
+
+- (void)setWhiteBalanceMode:(AVCaptureWhiteBalanceMode)whiteBalanceMode {
+    // Simula suporte a modos de white balance
+}
+
+#pragma mark - Method Forwarding
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    if ([self.originalDevice respondsToSelector:aSelector]) {
+        return self.originalDevice;
+    }
+    return [super forwardingTargetForSelector:aSelector];
+}
+
+- (void)dealloc {
+    [self stopCapturing];
+    
+    if (_videoFormatDescription) {
+        CFRelease(_videoFormatDescription);
+    }
+    
+    rtmp_diagnostics_log(LOG_INFO, "RTMPCameraCompatLayer finalizada");
 }
 
 @end

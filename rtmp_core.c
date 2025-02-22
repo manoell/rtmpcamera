@@ -1,427 +1,483 @@
-// rtmp_core.c
-#include "rtmp_core.h"
-#include "rtmp_protocol.h"
-#include "rtmp_handshake.h"
-#include "rtmp_utils.h"
-#include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include "rtmp_core.h"
+#include "rtmp_diagnostics.h"
 
-#define RTMP_MAX_CLIENTS 10
-#define RTMP_BUFFER_SIZE (1024 * 1024) // 1MB buffer
-#define RTMP_LOG_FILE "/tmp/rtmpcamera.log"
+// Buffer de leitura/escrita otimizado
+#define IO_BUFFER_SIZE (256 * 1024)  // 256KB
 
+// Estrutura de buffer circular
 typedef struct {
-    int running;
-    int server_socket;
-    pthread_t accept_thread;
-    RTMPSession* sessions[RTMP_MAX_CLIENTS];
-    pthread_mutex_t sessions_mutex;
-    RTMPConfig config;
-    FILE* log_file;
-    ConnectionCallback conn_callback;
-    void* user_data;
-    
-    struct {
-        uint32_t active_connections;
-        uint32_t total_connections;
-        uint32_t failed_connections;
-        uint64_t bytes_received;
-        uint64_t bytes_sent;
-    } stats;
-} RTMPServer;
+    uint8_t *data;
+    size_t size;
+    size_t read_pos;
+    size_t write_pos;
+} circular_buffer_t;
 
-static RTMPServer* g_server = NULL;
+// Contexto de IO
+typedef struct {
+    circular_buffer_t *read_buffer;
+    circular_buffer_t *write_buffer;
+    pthread_mutex_t read_mutex;
+    pthread_mutex_t write_mutex;
+} io_context_t;
 
-// Logging helper
-static void rtmp_log(const char* format, ...) {
-    if (!g_server || !g_server->log_file) return;
+// Funções auxiliares
+static circular_buffer_t *create_circular_buffer(size_t size) {
+    circular_buffer_t *buffer = calloc(1, sizeof(circular_buffer_t));
+    if (!buffer) return NULL;
     
-    va_list args;
-    va_start(args, format);
+    buffer->data = malloc(size);
+    if (!buffer->data) {
+        free(buffer);
+        return NULL;
+    }
     
-    time_t now;
-    time(&now);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    
-    fprintf(g_server->log_file, "[%s] ", timestamp);
-    vfprintf(g_server->log_file, format, args);
-    fprintf(g_server->log_file, "\n");
-    fflush(g_server->log_file);
-    
-    va_end(args);
+    buffer->size = size;
+    return buffer;
 }
 
-// Memory pool for optimized buffer allocation
-static uint8_t* alloc_buffer(void) {
-    return (uint8_t*)aligned_alloc(16, RTMP_BUFFER_SIZE);
+static void destroy_circular_buffer(circular_buffer_t *buffer) {
+    if (buffer) {
+        free(buffer->data);
+        free(buffer);
+    }
 }
 
-static void free_buffer(uint8_t* buffer) {
-    free(buffer);
+static io_context_t *create_io_context(void) {
+    io_context_t *ctx = calloc(1, sizeof(io_context_t));
+    if (!ctx) return NULL;
+    
+    ctx->read_buffer = create_circular_buffer(IO_BUFFER_SIZE);
+    ctx->write_buffer = create_circular_buffer(IO_BUFFER_SIZE);
+    
+    if (!ctx->read_buffer || !ctx->write_buffer) {
+        destroy_circular_buffer(ctx->read_buffer);
+        destroy_circular_buffer(ctx->write_buffer);
+        free(ctx);
+        return NULL;
+    }
+    
+    pthread_mutex_init(&ctx->read_mutex, NULL);
+    pthread_mutex_init(&ctx->write_mutex, NULL);
+    
+    return ctx;
 }
 
-// Session management
-static int add_session(RTMPSession* session) {
-    if (!g_server) return -1;
+static void destroy_io_context(io_context_t *ctx) {
+    if (ctx) {
+        destroy_circular_buffer(ctx->read_buffer);
+        destroy_circular_buffer(ctx->write_buffer);
+        pthread_mutex_destroy(&ctx->read_mutex);
+        pthread_mutex_destroy(&ctx->write_mutex);
+        free(ctx);
+    }
+}
+
+rtmp_session_t *rtmp_session_create(void) {
+    rtmp_session_t *session = calloc(1, sizeof(rtmp_session_t));
+    if (!session) return NULL;
     
-    pthread_mutex_lock(&g_server->sessions_mutex);
+    session->connection = calloc(1, sizeof(rtmp_connection_t));
+    if (!session->connection) {
+        free(session);
+        return NULL;
+    }
     
-    int slot = -1;
-    for (int i = 0; i < RTMP_MAX_CLIENTS; i++) {
-        if (!g_server->sessions[i]) {
-            g_server->sessions[i] = session;
-            g_server->stats.active_connections++;
-            g_server->stats.total_connections++;
-            slot = i;
+    // Configura valores padrão
+    session->connection->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
+    session->connection->window_size = 2500000;
+    session->connection->bandwidth = 2500000;
+    session->buffer_length = RTMP_BUFFER_TIME;
+    
+    rtmp_diagnostics_log(LOG_INFO, "Sessão RTMP criada");
+    return session;
+}
+
+int rtmp_connect(rtmp_session_t *session, const char *url) {
+    if (!session || !url) return -1;
+    
+    // Parse URL
+    char *url_copy = strdup(url);
+    char *host = strstr(url_copy, "://");
+    if (!host) {
+        free(url_copy);
+        return -1;
+    }
+    
+    host += 3;
+    char *port_str = strchr(host, ':');
+    char *path = strchr(host, '/');
+    
+    if (port_str) *port_str++ = '\0';
+    if (path) *path++ = '\0';
+    
+    int port = port_str ? atoi(port_str) : RTMP_DEFAULT_PORT;
+    
+    // Cria socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        free(url_copy);
+        return -1;
+    }
+    
+    // Configura socket para performance
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    
+    // Buffer sizes otimizados
+    int rcvbuf = 256 * 1024;  // 256KB
+    int sndbuf = 256 * 1024;  // 256KB
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    
+    // Conecta
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        free(url_copy);
+        return -1;
+    }
+    
+    session->connection->socket = sock;
+    session->connection->is_connected = true;
+    
+    // Configura contexto de IO
+    session->connection->user_data = create_io_context();
+    
+    // Salva informações da URL
+    session->app_name = path ? strdup(path) : strdup("");
+    session->tcp_url = strdup(url);
+    
+    free(url_copy);
+    
+    rtmp_diagnostics_log(LOG_INFO, "Conectado a %s:%d", host, port);
+    return 0;
+}
+
+int rtmp_read_packet(rtmp_session_t *session, rtmp_packet_t *packet) {
+    if (!session || !packet || !session->connection->is_connected) return -1;
+    
+    io_context_t *io = session->connection->user_data;
+    pthread_mutex_lock(&io->read_mutex);
+    
+    // Lê cabeçalho básico
+    uint8_t header[1];
+    if (read(session->connection->socket, header, 1) != 1) {
+        pthread_mutex_unlock(&io->read_mutex);
+        return -1;
+    }
+    
+    packet->channel_id = header[0] & 0x3f;
+    int header_type = header[0] >> 6;
+    
+    // Lê resto do cabeçalho baseado no tipo
+    switch (header_type) {
+        case 0: // 12 bytes
+            // Implementação do header tipo 0
             break;
+        case 1: // 8 bytes
+            // Implementação do header tipo 1
+            break;
+        case 2: // 4 bytes
+            // Implementação do header tipo 2
+            break;
+        case 3: // 1 byte
+            // Implementação do header tipo 3
+            break;
+    }
+    
+    // Lê dados do pacote
+    if (packet->length > 0) {
+        packet->data = malloc(packet->length);
+        if (!packet->data) {
+            pthread_mutex_unlock(&io->read_mutex);
+            return -1;
+        }
+        
+        size_t bytes_read = 0;
+        while (bytes_read < packet->length) {
+            ssize_t result = read(session->connection->socket,
+                                packet->data + bytes_read,
+                                packet->length - bytes_read);
+            if (result <= 0) {
+                free(packet->data);
+                pthread_mutex_unlock(&io->read_mutex);
+                return -1;
+            }
+            bytes_read += result;
         }
     }
     
-    pthread_mutex_unlock(&g_server->sessions_mutex);
-    return slot;
+    pthread_mutex_unlock(&io->read_mutex);
+    return 0;
 }
 
-static void remove_session(RTMPSession* session) {
-    if (!g_server) return;
+int rtmp_write_packet(rtmp_session_t *session, rtmp_packet_t *packet) {
+    if (!session || !packet || !session->connection->is_connected) return -1;
     
-    pthread_mutex_lock(&g_server->sessions_mutex);
+    io_context_t *io = session->connection->user_data;
+    pthread_mutex_lock(&io->write_mutex);
     
-    for (int i = 0; i < RTMP_MAX_CLIENTS; i++) {
-        if (g_server->sessions[i] == session) {
-            g_server->sessions[i] = NULL;
-            g_server->stats.active_connections--;
-            break;
+    // Escreve cabeçalho
+    uint8_t header[12] = {0};
+    header[0] = (packet->channel_id & 0x3f) | (0 << 6);  // Tipo 0
+    
+    // Timestamp
+    header[1] = (packet->timestamp >> 16) & 0xff;
+    header[2] = (packet->timestamp >> 8) & 0xff;
+    header[3] = packet->timestamp & 0xff;
+    
+    // Length
+    header[4] = (packet->length >> 16) & 0xff;
+    header[5] = (packet->length >> 8) & 0xff;
+    header[6] = packet->length & 0xff;
+    
+    // Type
+    header[7] = packet->type;
+    
+    // Stream ID
+    header[8] = packet->stream_id & 0xff;
+    header[9] = (packet->stream_id >> 8) & 0xff;
+    header[10] = (packet->stream_id >> 16) & 0xff;
+    header[11] = (packet->stream_id >> 24) & 0xff;
+    
+    // Escreve cabeçalho
+    if (write(session->connection->socket, header, 12) != 12) {
+        pthread_mutex_unlock(&io->write_mutex);
+        return -1;
+    }
+    
+    // Escreve dados
+    if (packet->length > 0 && packet->data) {
+        size_t bytes_written = 0;
+        while (bytes_written < packet->length) {
+            ssize_t result = write(session->connection->socket,
+                                 packet->data + bytes_written,
+                                 packet->length - bytes_written);
+            if (result <= 0) {
+                pthread_mutex_unlock(&io->write_mutex);
+                return -1;
+            }
+            bytes_written += result;
         }
     }
     
-    pthread_mutex_unlock(&g_server->sessions_mutex);
+    pthread_mutex_unlock(&io->write_mutex);
+    return 0;
 }
 
-static void cleanup_session(RTMPSession* session) {
+void rtmp_disconnect(rtmp_session_t *session) {
+    if (!session || !session->connection) return;
+    
+    if (session->connection->is_connected) {
+        close(session->connection->socket);
+        session->connection->is_connected = false;
+        
+        io_context_t *io = session->connection->user_data;
+        if (io) {
+            destroy_io_context(io);
+            session->connection->user_data = NULL;
+        }
+        
+        rtmp_diagnostics_log(LOG_INFO, "Desconectado do servidor RTMP");
+    }
+}
+
+void rtmp_session_destroy(rtmp_session_t *session) {
     if (!session) return;
     
-    rtmp_log("Cleaning up session %p", session);
+    rtmp_disconnect(session);
     
-    if (session->socket >= 0) {
-        shutdown(session->socket, SHUT_RDWR);
-        close(session->socket);
-    }
-    
-    remove_session(session);
-    
-    if (session->buffer) {
-        free_buffer(session->buffer);
-    }
-    
-    if (session->handshake_data) {
-        free(session->handshake_data);
-    }
-    
-    pthread_mutex_destroy(&session->mutex);
+    free(session->app_name);
+    free(session->stream_name);
+    free(session->swf_url);
+    free(session->tcp_url);
+    free(session->connection);
     free(session);
+    
+    rtmp_diagnostics_log(LOG_INFO, "Sessão RTMP destruída");
 }
 
-// Client handler thread
-static void* client_handler(void* arg) {
-    RTMPSession* session = (RTMPSession*)arg;
+void rtmp_set_chunk_size(rtmp_session_t *session, uint32_t size) {
+    if (!session || !session->connection) return;
     
-    // Set TCP keepalive
-    int keepalive = 1;
-    int keepidle = 60;
-    int keepintvl = 10;
-    int keepcnt = 3;
+    session->connection->chunk_size = size;
     
-    setsockopt(session->socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    setsockopt(session->socket, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-    setsockopt(session->socket, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-    setsockopt(session->socket, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    // Envia comando de chunk size
+    rtmp_packet_t packet = {0};
+    packet.channel_id = 2;
+    packet.type = RTMP_PACKET_TYPE_CHUNK_SIZE;
+    packet.length = 4;
+    packet.stream_id = 0;
     
-    rtmp_log("New client connected from %s", session->ip_address);
+    uint8_t data[4];
+    data[0] = (size >> 24) & 0xff;
+    data[1] = (size >> 16) & 0xff;
+    data[2] = (size >> 8) & 0xff;
+    data[3] = size & 0xff;
     
-    // Allocate session buffer
-    session->buffer = alloc_buffer();
-    if (!session->buffer) {
-        rtmp_log("Failed to allocate session buffer");
-        goto cleanup;
-    }
-    
-    // Initialize session mutex
-    pthread_mutex_init(&session->mutex, NULL);
-    
-    // Perform handshake
-    if (rtmp_handshake_process(session) < 0) {
-        rtmp_log("Handshake failed for session %p", session);
-        g_server->stats.failed_connections++;
-        goto cleanup;
-    }
-    
-    rtmp_log("Handshake successful for session %p", session);
-    
-    // Main processing loop
-    while (session->running && g_server->running) {
-        // Set receive timeout
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        setsockopt(session->socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        ssize_t bytes = recv(session->socket, 
-                           session->buffer + session->buffer_offset,
-                           RTMP_BUFFER_SIZE - session->buffer_offset,
-                           0);
-        
-        if (bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Timeout - check connection status
-                continue;
-            }
-            rtmp_log("Receive error on session %p: %s", session, strerror(errno));
-            break;
-        }
-        
-        if (bytes == 0) {
-            rtmp_log("Client disconnected for session %p", session);
-            break;
-        }
-        
-        pthread_mutex_lock(&session->mutex);
-        
-        session->buffer_offset += bytes;
-        g_server->stats.bytes_received += bytes;
-        
-        // Process RTMP chunks
-        size_t processed = 0;
-        while (processed < session->buffer_offset) {
-            RTMPChunk chunk;
-            int ret = rtmp_chunk_parse(session->buffer + processed,
-                                     session->buffer_offset - processed,
-                                     &chunk);
-            
-            if (ret < 0) break;
-            
-            processed += ret;
-            
-            // Handle RTMP message
-            if (rtmp_protocol_handle_message(session, &chunk) < 0) {
-                rtmp_log("Error processing message for session %p", session);
-                goto cleanup_locked;
-            }
-        }
-        
-        // Move unprocessed data to start of buffer
-        if (processed < session->buffer_offset) {
-            memmove(session->buffer,
-                    session->buffer + processed,
-                    session->buffer_offset - processed);
-        }
-        session->buffer_offset -= processed;
-        
-        pthread_mutex_unlock(&session->mutex);
-        continue;
-        
-    cleanup_locked:
-        pthread_mutex_unlock(&session->mutex);
-        break;
-    }
-    
-cleanup:
-    cleanup_session(session);
-    return NULL;
+    packet.data = data;
+    rtmp_write_packet(session, &packet);
 }
 
-// Accept handler thread
-static void* accept_handler(void* arg) {
-    RTMPServer* server = (RTMPServer*)arg;
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    
-    while (server->running) {
-        int client_socket = accept(server->server_socket,
-                                 (struct sockaddr*)&client_addr,
-                                 &addr_len);
-        
-        if (client_socket < 0) {
-            if (errno != EINTR) {
-                rtmp_log("Accept error: %s", strerror(errno));
-            }
-            continue;
-        }
-        
-        // Set socket options
-        int flag = 1;
-        setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        
-        // Create new session
-        RTMPSession* session = (RTMPSession*)calloc(1, sizeof(RTMPSession));
-        if (!session) {
-            close(client_socket);
-            continue;
-        }
-        
-        session->socket = client_socket;
-        session->running = 1;
-        
-        // Store client IP
-        inet_ntop(AF_INET, &client_addr.sin_addr,
-                 session->ip_address, sizeof(session->ip_address));
-        
-        // Add to session list
-        if (add_session(session) < 0) {
-            rtmp_log("Max clients reached, rejecting connection from %s",
-                    session->ip_address);
-            cleanup_session(session);
-            continue;
-        }
-        
-        // Notify connection callback
-        if (server->conn_callback) {
-            server->conn_callback(session, 1, server->user_data);
-        }
-        
-        // Start client thread
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, client_handler, session) != 0) {
-            rtmp_log("Failed to create client thread for %s", 
-                    session->ip_address);
-            cleanup_session(session);
-            continue;
-        }
-        pthread_detach(thread);
-    }
-    
-    return NULL;
+void rtmp_set_buffer_length(rtmp_session_t *session, uint32_t length) {
+    if (!session) return;
+    session->buffer_length = length;
 }
 
-// Public API
-int rtmp_server_init(const RTMPConfig* config, ConnectionCallback cb, void* user_data) {
-    if (g_server) return -1;
+void rtmp_set_window_size(rtmp_session_t *session, uint32_t size) {
+    if (!session || !session->connection) return;
     
-    g_server = (RTMPServer*)calloc(1, sizeof(RTMPServer));
-    if (!g_server) return -1;
+    session->connection->window_size = size;
     
-    // Open log file
-    g_server->log_file = fopen(RTMP_LOG_FILE, "a");
-    if (!g_server->log_file) {
-        free(g_server);
-        g_server = NULL;
-        return -1;
-    }
+    // Envia comando de window size
+    rtmp_packet_t packet = {0};
+    packet.channel_id = 2;
+    packet.type = RTMP_PACKET_TYPE_SERVER_BW;
+    packet.length = 4;
+    packet.stream_id = 0;
     
-    // Copy config
-    if (config) {
-        memcpy(&g_server->config, config, sizeof(RTMPConfig));
-    }
+    uint8_t data[4];
+    data[0] = (size >> 24) & 0xff;
+    data[1] = (size >> 16) & 0xff;
+    data[2] = (size >> 8) & 0xff;
+    data[3] = size & 0xff;
     
-    g_server->conn_callback = cb;
-    g_server->user_data = user_data;
-    
-    pthread_mutex_init(&g_server->sessions_mutex, NULL);
-    
-    rtmp_log("RTMP server initialized");
-    return 0;
+    packet.data = data;
+    rtmp_write_packet(session, &packet);
 }
 
-int rtmp_server_start(void) {
-    if (!g_server) return -1;
+void rtmp_set_bandwidth(rtmp_session_t *session, uint32_t bandwidth) {
+    if (!session || !session->connection) return;
     
-    // Create server socket
-    g_server->server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_server->server_socket < 0) {
-        rtmp_log("Failed to create server socket: %s", strerror(errno));
-        return -1;
-    }
+    session->connection->bandwidth = bandwidth;
     
-    // Set socket options
-    int reuse = 1;
-    setsockopt(g_server->server_socket, SOL_SOCKET, SO_REUSEADDR, 
-               &reuse, sizeof(reuse));
+    // Envia comando de bandwidth
+    rtmp_packet_t packet = {0};
+    packet.channel_id = 2;
+    packet.type = RTMP_PACKET_TYPE_CLIENT_BW;
+    packet.length = 5;
+    packet.stream_id = 0;
     
-    // Bind address
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(g_server->config.port ? 
-                         g_server->config.port : 1935);
+    uint8_t data[5];
+    data[0] = (bandwidth >> 24) & 0xff;
+    data[1] = (bandwidth >> 16) & 0xff;
+    data[2] = (bandwidth >> 8) & 0xff;
+    data[3] = bandwidth & 0xff;
+    data[4] = 2; // Dynamic bandwidth
     
-    if (bind(g_server->server_socket, (struct sockaddr*)&addr,
-             sizeof(addr)) < 0) {
-        rtmp_log("Failed to bind server socket: %s", strerror(errno));
-        close(g_server->server_socket);
-        return -1;
-    }
-    
-    // Start listening
-    if (listen(g_server->server_socket, 5) < 0) {
-        rtmp_log("Failed to listen on server socket: %s", strerror(errno));
-        close(g_server->server_socket);
-        return -1;
-    }
-    
-    g_server->running = 1;
-    
-    // Start accept thread
-    if (pthread_create(&g_server->accept_thread, NULL,
-                      accept_handler, g_server) != 0) {
-        rtmp_log("Failed to create accept thread: %s", strerror(errno));
-        close(g_server->server_socket);
-        g_server->running = 0;
-        return -1;
-    }
-    
-    rtmp_log("RTMP server started on port %d",
-             g_server->config.port ? g_server->config.port : 1935);
-    return 0;
+    packet.data = data;
+    rtmp_write_packet(session, &packet);
 }
 
-void rtmp_server_stop(void) {
-    if (!g_server) return;
-    
-    rtmp_log("Stopping RTMP server");
-    
-    g_server->running = 0;
-    
-    // Close server socket
-    if (g_server->server_socket >= 0) {
-        shutdown(g_server->server_socket, SHUT_RDWR);
-        close(g_server->server_socket);
-    }
-    
-    // Wait for accept thread
-    pthread_join(g_server->accept_thread, NULL);
-    
-    // Cleanup all sessions
-    pthread_mutex_lock(&g_server->sessions_mutex);
-    for (int i = 0; i < RTMP_MAX_CLIENTS; i++) {
-        if (g_server->sessions[i]) {
-            cleanup_session(g_server->sessions[i]);
-        }
-    }
-    pthread_mutex_unlock(&g_server->sessions_mutex);
-    
-    pthread_mutex_destroy(&g_server->sessions_mutex);
-    
-    if (g_server->log_file) {
-        fclose(g_server->log_file);
-    }
-    
-    free(g_server);
-    g_server = NULL;
-    
-    rtmp_log("RTMP server stopped");
+bool rtmp_is_connected(rtmp_session_t *session) {
+    return session && session->connection && session->connection->is_connected;
 }
 
-void rtmp_server_get_stats(RTMPServerStats* stats) {
-    if (!g_server || !stats) return;
+uint32_t rtmp_get_time(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
+
+static bool debug_enabled = false;
+
+void rtmp_set_debug(bool enable) {
+    debug_enabled = enable;
+}
+
+void rtmp_dump_packet(rtmp_packet_t *packet) {
+    if (!debug_enabled || !packet) return;
     
-    stats->active_connections = g_server->stats.active_connections;
-    stats->total_connections = g_server->stats.total_connections;
-    stats->failed_connections = g_server->stats.failed_connections;
-    stats->bytes_received = g_server->stats.bytes_received;
-    stats->bytes_sent = g_server->stats.bytes_sent;
+    rtmp_diagnostics_log(LOG_DEBUG, "RTMP Packet:");
+    rtmp_diagnostics_log(LOG_DEBUG, "  Channel ID: %d", packet->channel_id);
+    rtmp_diagnostics_log(LOG_DEBUG, "  Timestamp: %u", packet->timestamp);
+    rtmp_diagnostics_log(LOG_DEBUG, "  Length: %u", packet->length);
+    rtmp_diagnostics_log(LOG_DEBUG, "  Type: %d", packet->type);
+    rtmp_diagnostics_log(LOG_DEBUG, "  Stream ID: %u", packet->stream_id);
+}
+
+const char *rtmp_get_error_string(int error) {
+    switch (error) {
+        case -1: return "Erro genérico";
+        case -2: return "Timeout de conexão";
+        case -3: return "Handshake falhou";
+        case -4: return "Erro de leitura/escrita";
+        case -5: return "Buffer cheio";
+        default: return "Erro desconhecido";
+    }
+}
+
+// Funções utilitárias adicionais
+static int read_fully(int socket, uint8_t *buffer, size_t size) {
+    size_t total_read = 0;
+    
+    while (total_read < size) {
+        ssize_t result = read(socket, buffer + total_read, size - total_read);
+        if (result <= 0) return -1;
+        total_read += result;
+    }
+    
+    return total_read;
+}
+
+static int write_fully(int socket, const uint8_t *buffer, size_t size) {
+    size_t total_written = 0;
+    
+    while (total_written < size) {
+        ssize_t result = write(socket, buffer + total_written, size - total_written);
+        if (result <= 0) return -1;
+        total_written += result;
+    }
+    
+    return total_written;
+}
+
+// Funções de socket não bloqueante
+static int set_nonblocking(int socket) {
+    int flags = fcntl(socket, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(socket, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int wait_for_socket(int socket, bool for_read, int timeout_ms) {
+    fd_set fds;
+    struct timeval tv;
+    
+    FD_ZERO(&fds);
+    FD_SET(socket, &fds);
+    
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    return select(socket + 1, 
+                 for_read ? &fds : NULL,
+                 for_read ? NULL : &fds,
+                 NULL, &tv);
+}
+
+// Manipulação de timestamps
+static uint32_t get_relative_timestamp(rtmp_session_t *session) {
+    uint32_t current = rtmp_get_time();
+    if (!session->connection->timestamp) {
+        session->connection->timestamp = current;
+    }
+    return current - session->connection->timestamp;
+}
+
+// Gerenciamento de sequência
+static uint32_t get_next_sequence(rtmp_session_t *session) {
+    return ++session->connection->sequence_number;
 }

@@ -5,24 +5,56 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = RTMPCamera
 
-$(TWEAK_NAME)_FILES = \
-    RTMPCameraTweak.xm \
-    rtmp_core.c \
-    rtmp_protocol.c \
-    rtmp_handshake.c \
-    rtmp_commands.c \
-    rtmp_utils.c \
-    rtmp_amf.c \
-    rtmp_chunk.c \
-    rtmp_stream.c \
-    rtmp_session.c \
-    rtmp_quality.c \
-    rtmp_failover.c \
-    rtmp_preview.m \
-    rtmp_camera_compat.m
+# Lista completa de arquivos fonte
+RTMPCamera_FILES = \
+	rtmp_amf.c \
+	rtmp_camera_compat.m \
+	rtmp_chunk.c \
+	rtmp_commands.c \
+	rtmp_core.c \
+	rtmp_failover.c \
+	rtmp_handshake.c \
+	rtmp_preview.m \
+	rtmp_protocol.c \
+	rtmp_quality.c \
+	rtmp_server_integration.c \
+	rtmp_stream.c \
+	rtmp_utils.c \
+	RTMPCameraTweak.xm
 
-$(TWEAK_NAME)_CFLAGS = -fobjc-arc
-$(TWEAK_NAME)_FRAMEWORKS = UIKit AVFoundation CoreMedia VideoToolbox
-$(TWEAK_NAME)_PRIVATE_FRAMEWORKS = MediaToolbox
+# Frameworks necessários
+RTMPCamera_FRAMEWORKS = UIKit AVFoundation CoreMedia VideoToolbox
+RTMPCamera_PRIVATE_FRAMEWORKS = MediaToolbox
+
+# Bibliotecas extras
+RTMPCamera_LIBRARIES = ssl crypto
+
+# Flags de compilação otimizadas
+RTMPCamera_CFLAGS = -O2 -fno-strict-aliasing
+RTMPCamera_CCFLAGS = -O2 -fno-strict-aliasing
+RTMPCamera_OBJCFLAGS = -fobjc-arc
+
+# Diretórios de inclusão
+RTMPCamera_INCLUDE_DIRS = include
+
+# Definições
+RTMPCamera_DEFINES = RTMP_CAMERA_VERSION=\"1.0.0\"
+
+# Configuração de instalação
+PACKAGE_VERSION = $(THEOS_PACKAGE_VERSION)
+PACKAGE_BUILDNAME ?= debug
+
+ifeq ($(PACKAGE_BUILDNAME), release)
+	RTMPCamera_CFLAGS += -DNDEBUG
+	RTMPCamera_CCFLAGS += -DNDEBUG
+	RTMPCamera_OBJCFLAGS += -DNDEBUG
+else
+	RTMPCamera_CFLAGS += -DDEBUG
+	RTMPCamera_CCFLAGS += -DDEBUG
+	RTMPCamera_OBJCFLAGS += -DDEBUG
+endif
+
+after-install::
+	install.exec "killall -9 SpringBoard"
 
 include $(THEOS_MAKE_PATH)/tweak.mk

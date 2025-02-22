@@ -1,9 +1,13 @@
-Package: com.yourname.rtmpcamera
+Package: com.yourdomain.rtmpcamera
 Name: RTMPCamera
 Version: 1.0.0
 Architecture: iphoneos-arm
-Description: RTMP Camera feed replacement for iOS
+Description: RTMP Camera Feed Replacement for iOS
+  Este tweak permite substituir o feed da câmera do dispositivo por
+  uma transmissão RTMP recebida via rede local, com suporte a
+  failover, controle de qualidade e baixa latência.
 Maintainer: Your Name
 Author: Your Name
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 7.0)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 7.0), libssl, libcrypto
+Priority: optional

@@ -2,114 +2,91 @@
 #define RTMP_CORE_H
 
 #include <stdint.h>
-#include <stddef.h>
-#include <pthread.h>
+#include <stdbool.h>
+#include <sys/time.h>
 
-// Forward declarations
-typedef struct rtmp_server_s rtmp_server_t;
-typedef struct rtmp_session_s rtmp_session_t;
-typedef struct rtmp_chunk_stream_s rtmp_chunk_stream_t;
-typedef struct rtmp_chunk_s rtmp_chunk_t;
+// Configurações otimizadas
+#define RTMP_DEFAULT_PORT 1935
+#define RTMP_DEFAULT_CHUNK_SIZE 4096
+#define RTMP_MAX_PACKET_SIZE (1024 * 1024)
+#define RTMP_BUFFER_TIME 500
+#define RTMP_DEFAULT_TIMEOUT 5000
 
-// Callback types
-typedef void (*rtmp_audio_callback)(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp);
-typedef void (*rtmp_video_callback)(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp);
-typedef void (*rtmp_metadata_callback)(rtmp_session_t *session, const uint8_t *data, size_t size);
-typedef void (*rtmp_client_callback)(rtmp_server_t *server, rtmp_session_t *session);
-typedef void (*rtmp_stream_callback)(rtmp_server_t *server, rtmp_session_t *session, const char *stream_name);
+// Tipos de pacotes RTMP
+typedef enum {
+    RTMP_PACKET_TYPE_CHUNK_SIZE = 1,
+    RTMP_PACKET_TYPE_BYTES_READ = 3,
+    RTMP_PACKET_TYPE_PING = 4,
+    RTMP_PACKET_TYPE_SERVER_BW = 5,
+    RTMP_PACKET_TYPE_CLIENT_BW = 6,
+    RTMP_PACKET_TYPE_AUDIO = 8,
+    RTMP_PACKET_TYPE_VIDEO = 9,
+    RTMP_PACKET_TYPE_METADATA = 18,
+    RTMP_PACKET_TYPE_INVOKE = 20,
+} rtmp_packet_type_t;
 
-// Configuration structure
+// Estrutura de pacote RTMP
 typedef struct {
-    uint16_t port;
-    uint32_t chunk_size;
-    uint32_t window_size;
-    uint32_t peer_bandwidth;
-} rtmp_server_config_t;
-
-#define RTMP_MAX_CHUNK_STREAMS 128
-#define RTMP_MAX_CONNECTIONS 10
-#define RTMP_DEFAULT_CHUNK_SIZE 128
-#define RTMP_DEFAULT_WINDOW_SIZE 2500000
-
-// Session structure
-struct rtmp_session_s {
-    int socket_fd;
-    rtmp_server_t *server;
+    uint8_t channel_id;
+    uint32_t timestamp;
+    uint32_t length;
+    rtmp_packet_type_t type;
     uint32_t stream_id;
-    
-    // Chunk handling
-    uint32_t in_chunk_size;
-    uint32_t out_chunk_size;
-    rtmp_chunk_stream_t *chunk_streams[RTMP_MAX_CHUNK_STREAMS];
-    
-    // Buffer management
-    uint8_t *aac_sequence_header;
-    size_t aac_sequence_header_size;
-    uint8_t *avc_sequence_header;
-    size_t avc_sequence_header_size;
-    
-    // Connection state
-    uint32_t window_ack_size;
-    uint32_t peer_bandwidth;
-    uint8_t peer_bandwidth_limit_type;
-    uint32_t last_ack_received;
-    uint32_t bytes_received;
-    int state;
-    
-    // Callbacks
-    rtmp_audio_callback audio_callback;
-    rtmp_video_callback video_callback;
-    rtmp_metadata_callback metadata_callback;
-    
-    // Stream info
-    char *stream_name;
-    int is_publishing;
-};
+    uint8_t *data;
+} rtmp_packet_t;
 
-// Server structure
-struct rtmp_server_s {
-    int socket_fd;
-    uint16_t port;
-    int running;
-    pthread_t accept_thread;
-    
-    // Configuration
+// Estado da conexão
+typedef struct {
+    int socket;
+    bool is_connected;
     uint32_t chunk_size;
+    uint32_t stream_id;
+    uint32_t sequence_number;
+    uint32_t timestamp;
     uint32_t window_size;
-    uint32_t peer_bandwidth;
-    
-    // Connection management
-    rtmp_session_t *connections[RTMP_MAX_CONNECTIONS];
-    int num_connections;
-    pthread_mutex_t connections_mutex;
-    
-    // Callbacks
-    rtmp_client_callback on_client_connect;
-    rtmp_client_callback on_client_disconnect;
-    rtmp_stream_callback on_publish_stream;
-    rtmp_stream_callback on_play_stream;
-};
+    uint32_t bandwidth;
+} rtmp_connection_t;
 
-// Server functions
-rtmp_server_t* rtmp_server_create(void);
-int rtmp_server_configure(rtmp_server_t *server, const rtmp_server_config_t *config);
-void rtmp_server_set_callbacks(rtmp_server_t *server,
-                             rtmp_client_callback on_connect,
-                             rtmp_client_callback on_disconnect,
-                             rtmp_stream_callback on_publish,
-                             rtmp_stream_callback on_play);
-int rtmp_server_start(rtmp_server_t *server);
-int rtmp_server_stop(rtmp_server_t *server);
-void rtmp_server_destroy(rtmp_server_t *server);
+// Estrutura de sessão RTMP
+typedef struct {
+    rtmp_connection_t *connection;
+    char *app_name;
+    char *stream_name;
+    char *swf_url;
+    char *tcp_url;
+    uint32_t buffer_length;
+    bool is_playing;
+    void *user_data;
+} rtmp_session_t;
 
-// Session functions
-rtmp_session_t* rtmp_session_create(int socket_fd);
+// Callbacks
+typedef void (*rtmp_callback_t)(rtmp_session_t *session, rtmp_packet_t *packet);
+
+// Funções principais
+rtmp_session_t *rtmp_session_create(void);
 void rtmp_session_destroy(rtmp_session_t *session);
-int rtmp_session_set_chunk_size(rtmp_session_t *session, uint32_t chunk_size);
-int rtmp_session_process_input(rtmp_session_t *session, const uint8_t *data, size_t size);
 
-// Utility functions
-void rtmp_set_error(const char *fmt, ...);
-const char* rtmp_get_error(void);
+int rtmp_connect(rtmp_session_t *session, const char *url);
+void rtmp_disconnect(rtmp_session_t *session);
+
+int rtmp_read_packet(rtmp_session_t *session, rtmp_packet_t *packet);
+int rtmp_write_packet(rtmp_session_t *session, rtmp_packet_t *packet);
+
+void rtmp_set_callback(rtmp_session_t *session, rtmp_callback_t callback);
+
+// Funções de controle
+void rtmp_set_chunk_size(rtmp_session_t *session, uint32_t size);
+void rtmp_set_buffer_length(rtmp_session_t *session, uint32_t length);
+void rtmp_set_window_size(rtmp_session_t *session, uint32_t size);
+void rtmp_set_bandwidth(rtmp_session_t *session, uint32_t bandwidth);
+
+// Funções de status
+bool rtmp_is_connected(rtmp_session_t *session);
+uint32_t rtmp_get_time(void);
+const char *rtmp_get_error_string(int error);
+
+// Funções de debug
+void rtmp_set_debug(bool enable);
+void rtmp_dump_packet(rtmp_packet_t *packet);
 
 #endif // RTMP_CORE_H
