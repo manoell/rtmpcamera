@@ -1,273 +1,184 @@
-#import <AVFoundation/AVFoundation.h>
-#import <objc/runtime.h>
 #import "rtmp_camera_compat.h"
-#import "rtmp_stream.h"
-#import "rtmp_diagnostics.h"
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 
-// Configurações da câmera
-static const int kDefaultWidth = 1920;
-static const int kDefaultHeight = 1080;
-static const float kDefaultFrameRate = 30.0f;
-
-@interface RTMPCameraCompatLayer () {
-    CMFormatDescriptionRef _videoFormatDescription;
-    dispatch_queue_t _cameraQueue;
-    NSTimer *_frameTimer;
-    uint64_t _frameNumber;
+@implementation RTMPCameraCompat {
+    AVCaptureDevice *originalDevice;
+    NSDictionary *originalProperties;
+    CMTime originalFrameDuration;
+    AVCaptureDeviceFormat *originalFormat;
 }
-
-@property (nonatomic, strong) AVCaptureDevice *originalDevice;
-@property (nonatomic, strong) AVCaptureSession *fakeSession;
-@property (nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
-@property (nonatomic, assign) rtmp_stream_t *stream;
-@property (nonatomic, strong) NSMutableDictionary *deviceProperties;
-@property (nonatomic, assign) BOOL isCapturing;
-@property (nonatomic, assign) CMTime presentationTimeStamp;
-
-@end
-
-@implementation RTMPCameraCompatLayer
 
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _cameraQueue = dispatch_queue_create("com.rtmpcamera.cameraqueue", 
-            DISPATCH_QUEUE_SERIAL_WITH_AUTORELEASE_POOL);
-        dispatch_set_target_queue(_cameraQueue, 
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
-        
-        _deviceProperties = [NSMutableDictionary dictionary];
-        _frameNumber = 0;
-        
-        [self setupFakeSession];
-        [self cloneOriginalCameraProperties];
-        
-        rtmp_diagnostics_log(LOG_INFO, "RTMPCameraCompatLayer inicializada");
+        [self setupOriginalCameraProperties];
     }
     return self;
 }
 
-- (void)setupFakeSession {
-    self.fakeSession = [[AVCaptureSession alloc] init];
-    self.fakeSession.sessionPreset = AVCaptureSessionPresetHigh;
+- (void)setupOriginalCameraProperties {
+    // Get the original back camera
+    originalDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    if (!originalDevice) return;
     
-    // Configuração otimizada do output
-    self.videoOutput = [[AVCaptureVideoDataOutput alloc] init];
-    [self.videoOutput setVideoSettings:@{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
-        (id)kCVPixelBufferWidthKey: @(kDefaultWidth),
-        (id)kCVPixelBufferHeightKey: @(kDefaultHeight)
-    }];
+    // Store original properties
+    originalProperties = @{
+        @"exposureMode": @(originalDevice.exposureMode),
+        @"whiteBalanceMode": @(originalDevice.whiteBalanceMode),
+        @"focusMode": @(originalDevice.focusMode),
+        @"iso": @(originalDevice.iso),
+        @"exposureDuration": [NSValue valueWithCMTime:originalDevice.exposureDuration],
+        @"deviceWhiteBalanceGains": [NSValue valueWithCGPoint:CGPointMake(
+            originalDevice.deviceWhiteBalanceGains.redGain,
+            originalDevice.deviceWhiteBalanceGains.greenGain)],
+        @"lensPosition": @(originalDevice.lensPosition)
+    };
     
-    self.videoOutput.alwaysDiscardsLateVideoFrames = YES;
-    [self.videoOutput setSampleBufferDelegate:self queue:_cameraQueue];
+    originalFormat = originalDevice.activeFormat;
+    originalFrameDuration = originalDevice.activeVideoMinFrameDuration;
+}
+
+- (void)configureVirtualCameraWithStream:(RTMPStream *)stream {
+    if (!stream) return;
     
-    if ([self.fakeSession canAddOutput:self.videoOutput]) {
-        [self.fakeSession addOutput:self.videoOutput];
+    // Configure stream to match original camera properties
+    [self applyOriginalPropertiesToStream:stream];
+    
+    // Set up format matching
+    [self setupFormatMatchingWithStream:stream];
+    
+    // Configure frame timing
+    [self configureFrameTimingWithStream:stream];
+}
+
+- (void)applyOriginalPropertiesToStream:(RTMPStream *)stream {
+    // Apply exposure settings
+    stream->camera_properties.exposure_mode = [originalProperties[@"exposureMode"] intValue];
+    stream->camera_properties.exposure_duration = [[originalProperties[@"exposureDuration"] CMTimeValue] timeValue];
+    stream->camera_properties.iso = [originalProperties[@"iso"] floatValue];
+    
+    // Apply white balance
+    stream->camera_properties.white_balance_mode = [originalProperties[@"whiteBalanceMode"] intValue];
+    CGPoint whiteBalanceGains = [[originalProperties[@"deviceWhiteBalanceGains"] CGPointValue];
+    stream->camera_properties.white_balance_gains[0] = whiteBalanceGains.x;
+    stream->camera_properties.white_balance_gains[1] = whiteBalanceGains.y;
+    
+    // Apply focus settings
+    stream->camera_properties.focus_mode = [originalProperties[@"focusMode"] intValue];
+    stream->camera_properties.lens_position = [originalProperties[@"lensPosition"] floatValue];
+}
+
+- (void)setupFormatMatchingWithStream:(RTMPStream *)stream {
+    if (!originalFormat) return;
+    
+    CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(originalFormat.formatDescription);
+    stream->video_width = dimensions.width;
+    stream->video_height = dimensions.height;
+    
+    // Match color space and pixel format
+    stream->video_color_space = originalFormat.supportedColorSpaces.firstObject;
+    stream->video_pixel_format = originalFormat.mediaType;
+    
+    // Match field of view and zoom
+    if ([originalFormat respondsToSelector:@selector(videoFieldOfView)]) {
+        stream->camera_properties.field_of_view = originalFormat.videoFieldOfView;
+    }
+    
+    if ([originalFormat respondsToSelector:@selector(videoZoomFactor)]) {
+        stream->camera_properties.zoom_factor = originalFormat.videoZoomFactor;
     }
 }
 
-- (void)cloneOriginalCameraProperties {
-    AVCaptureDevice *realCamera = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    self.originalDevice = realCamera;
-    
-    // Clona propriedades da câmera real
-    self.deviceProperties[@"uniqueID"] = realCamera.uniqueID;
-    self.deviceProperties[@"modelID"] = realCamera.modelID;
-    self.deviceProperties[@"localizedName"] = realCamera.localizedName;
-    self.deviceProperties[@"manufacturer"] = @"Apple";
-    
-    // Características da câmera
-    self.deviceProperties[@"exposureDuration"] = @(CMTimeGetSeconds(realCamera.exposureDuration));
-    self.deviceProperties[@"ISO"] = @(realCamera.ISO);
-    self.deviceProperties[@"lensPosition"] = @(realCamera.lensPosition);
-    self.deviceProperties[@"deviceType"] = @(realCamera.deviceType);
-    
-    // Capabilities
-    self.deviceProperties[@"hasFlash"] = @(realCamera.hasFlash);
-    self.deviceProperties[@"hasTorch"] = @(realCamera.hasTorch);
-    self.deviceProperties[@"focusPointOfInterestSupported"] = @(realCamera.focusPointOfInterestSupported);
-    self.deviceProperties[@"exposurePointOfInterestSupported"] = @(realCamera.exposurePointOfInterestSupported);
-    
-    // Formatos suportados
-    NSMutableArray *formats = [NSMutableArray array];
-    for (AVCaptureDeviceFormat *format in realCamera.formats) {
-        CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-        float maxFrameRate = ((AVFrameRateRange *)format.videoSupportedFrameRateRanges.firstObject).maxFrameRate;
-        
-        [formats addObject:@{
-            @"width": @(dimensions.width),
-            @"height": @(dimensions.height),
-            @"frameRate": @(maxFrameRate)
-        }];
+- (void)configureFrameTimingWithStream:(RTMPStream *)stream {
+    if (CMTimeCompare(originalFrameDuration, kCMTimeZero) != 0) {
+        double fps = CMTimeGetSeconds(CMTimeMake(1, 1)) / CMTimeGetSeconds(originalFrameDuration);
+        stream->video_fps = (uint32_t)round(fps);
+    } else {
+        // Default to 30fps if we can't determine original
+        stream->video_fps = 30;
     }
-    self.deviceProperties[@"supportedFormats"] = formats;
-}
-
-- (void)startCapturing {
-    if (self.isCapturing) return;
     
-    dispatch_async(_cameraQueue, ^{
-        self.isCapturing = YES;
-        self.presentationTimeStamp = CMTimeMake(0, 1000);
-        
-        // Inicia timer para simular frames da câmera
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self->_frameTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/kDefaultFrameRate
-                                                              target:self
-                                                            selector:@selector(generateFrame)
-                                                            userInfo:nil
-                                                             repeats:YES];
-        });
-        
-        rtmp_diagnostics_log(LOG_INFO, "Captura iniciada");
-    });
+    // Configure frame delivery timing
+    stream->frame_timing.timestamp_base = CMTimeMake(1, stream->video_fps);
+    stream->frame_timing.current_timestamp = kCMTimeZero;
 }
 
-- (void)stopCapturing {
-    if (!self.isCapturing) return;
+- (void)updateStreamMetadata:(RTMPStream *)stream {
+    if (!stream) return;
     
-    dispatch_async(_cameraQueue, ^{
-        self.isCapturing = NO;
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self->_frameTimer invalidate];
-            self->_frameTimer = nil;
-        });
-        
-        rtmp_diagnostics_log(LOG_INFO, "Captura finalizada");
-    });
-}
-
-- (void)generateFrame {
-    if (!self.isCapturing) return;
+    // Update device information
+    stream->device_info.model_name = [self deviceModelName];
+    stream->device_info.os_version = [self deviceOSVersion];
+    stream->device_info.unique_identifier = [self generateDeviceIdentifier];
     
-    dispatch_async(_cameraQueue, ^{
-        @autoreleasepool {
-            CMTime timestamp = CMTimeAdd(self.presentationTimeStamp, 
-                                       CMTimeMake(1000/kDefaultFrameRate, 1000));
-            self.presentationTimeStamp = timestamp;
-            
-            // Obtém frame do stream RTMP
-            video_frame_t *rtmpFrame = rtmp_stream_get_next_frame(self.stream);
-            if (!rtmpFrame) return;
-            
-            // Cria buffer de pixel
-            CVPixelBufferRef pixelBuffer = NULL;
-            CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
-                                                kDefaultWidth,
-                                                kDefaultHeight,
-                                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                                NULL,
-                                                &pixelBuffer);
-            
-            if (status != kCVReturnSuccess) {
-                rtmp_diagnostics_log(LOG_ERROR, "Erro ao criar pixel buffer");
-                return;
-            }
-            
-            // Copia dados do frame RTMP para o buffer
-            CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-            
-            // Aqui você precisa converter os dados do frame RTMP para o formato YUV
-            // Este é um exemplo simplificado
-            uint8_t *baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
-            memcpy(baseAddress, rtmpFrame->data, rtmpFrame->length);
-            
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-            
-            // Cria sample buffer
-            CMSampleBufferRef sampleBuffer = NULL;
-            
-            // Cria format description se necessário
-            if (!_videoFormatDescription) {
-                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault,
-                                                           pixelBuffer,
-                                                           &_videoFormatDescription);
-            }
-            
-            // Timing info
-            CMSampleTimingInfo timing = {
-                .duration = CMTimeMake(1, (int32_t)kDefaultFrameRate),
-                .presentationTimeStamp = timestamp,
-                .decodeTimeStamp = timestamp
-            };
-            
-            // Cria sample buffer
-            status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
-                                                      pixelBuffer,
-                                                      TRUE,
-                                                      NULL,
-                                                      NULL,
-                                                      _videoFormatDescription,
-                                                      &timing,
-                                                      &sampleBuffer);
-            
-            if (status == noErr && sampleBuffer) {
-                // Notifica delegates
-                if ([self.videoOutput.sampleBufferDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-                    [self.videoOutput.sampleBufferDelegate captureOutput:self.videoOutput
-                                               didOutputSampleBuffer:sampleBuffer
-                                                      fromConnection:self.videoOutput.connections.firstObject];
-                }
-                
-                CFRelease(sampleBuffer);
-            }
-            
-            CVPixelBufferRelease(pixelBuffer);
-            
-            _frameNumber++;
-            
-            // Log periódico de status
-            if (_frameNumber % 300 == 0) { // A cada 10 segundos em 30fps
-                rtmp_diagnostics_log(LOG_INFO, "Frames processados: %llu", _frameNumber);
-            }
-        }
-    });
+    // Update camera capabilities
+    [self updateCameraCapabilities:stream];
 }
 
-#pragma mark - Propriedades da Câmera
-
-- (id)valueForKey:(NSString *)key {
-    id value = self.deviceProperties[key];
-    return value ?: [super valueForKey:key];
+- (NSString *)deviceModelName {
+    return [[UIDevice currentDevice] model];
 }
 
-- (BOOL)supportsAVCaptureSessionPreset:(NSString *)preset {
-    return [preset isEqualToString:AVCaptureSessionPresetHigh] ||
-           [preset isEqualToString:AVCaptureSessionPreset1920x1080];
+- (NSString *)deviceOSVersion {
+    return [[UIDevice currentDevice] systemVersion];
 }
 
-- (void)setExposureMode:(AVCaptureExposureMode)exposureMode {
-    // Simula suporte a modos de exposição
+- (NSString *)generateDeviceIdentifier {
+    // Generate a consistent but unique identifier
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *deviceName = [[UIDevice currentDevice] name];
+    return [[NSString stringWithFormat:@"%@-%@", bundleID, deviceName] 
+            stringByReplacingOccurrencesOfString:@" " withString:@"_"];
 }
 
-- (void)setFocusMode:(AVCaptureFocusMode)focusMode {
-    // Simula suporte a modos de foco
-}
-
-- (void)setWhiteBalanceMode:(AVCaptureWhiteBalanceMode)whiteBalanceMode {
-    // Simula suporte a modos de white balance
-}
-
-#pragma mark - Method Forwarding
-
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    if ([self.originalDevice respondsToSelector:aSelector]) {
-        return self.originalDevice;
+- (void)updateCameraCapabilities:(RTMPStream *)stream {
+    stream->camera_capabilities.has_flash = originalDevice.hasFlash;
+    stream->camera_capabilities.has_torch = originalDevice.hasTorch;
+    stream->camera_capabilities.supports_focus_lock = [originalDevice isFocusModeSupported:AVCaptureFocusModeLocked];
+    stream->camera_capabilities.supports_exposure_lock = [originalDevice isExposureModeSupported:AVCaptureExposureModeLocked];
+    
+    // Add supported formats
+    NSArray *formats = originalDevice.formats;
+    stream->camera_capabilities.supported_formats_count = MIN((uint32_t)formats.count, MAX_SUPPORTED_FORMATS);
+    
+    for (uint32_t i = 0; i < stream->camera_capabilities.supported_formats_count; i++) {
+        AVCaptureDeviceFormat *format = formats[i];
+        CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        
+        stream->camera_capabilities.supported_formats[i].width = dims.width;
+        stream->camera_capabilities.supported_formats[i].height = dims.height;
+        stream->camera_capabilities.supported_formats[i].fps = 
+            (uint32_t)format.videoSupportedFrameRateRanges.firstObject.maxFrameRate;
     }
-    return [super forwardingTargetForSelector:aSelector];
+}
+
+- (void)handleCameraControl:(RTMPStream *)stream command:(CameraControlCommand)command value:(float)value {
+    switch (command) {
+        case CAMERA_CONTROL_FOCUS:
+            stream->camera_properties.lens_position = value;
+            break;
+        case CAMERA_CONTROL_EXPOSURE:
+            stream->camera_properties.exposure_duration = CMTimeMakeWithSeconds(value, 1000000);
+            break;
+        case CAMERA_CONTROL_ISO:
+            stream->camera_properties.iso = value;
+            break;
+        case CAMERA_CONTROL_ZOOM:
+            stream->camera_properties.zoom_factor = value;
+            break;
+        case CAMERA_CONTROL_WHITE_BALANCE:
+            stream->camera_properties.white_balance_gains[0] = value;
+            stream->camera_properties.white_balance_gains[1] = value;
+            break;
+        default:
+            break;
+    }
 }
 
 - (void)dealloc {
-    [self stopCapturing];
-    
-    if (_videoFormatDescription) {
-        CFRelease(_videoFormatDescription);
-    }
-    
-    rtmp_diagnostics_log(LOG_INFO, "RTMPCameraCompatLayer finalizada");
+    originalProperties = nil;
+    originalDevice = nil;
 }
 
 @end

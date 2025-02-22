@@ -2,46 +2,41 @@
 #define RTMP_CHUNK_H
 
 #include <stdint.h>
-#include <stddef.h>
-#include "rtmp_core.h"
+#include <stdlib.h>
 
-// Chunk types
-#define RTMP_CHUNK_TYPE_0 0  // Full message header
-#define RTMP_CHUNK_TYPE_1 1  // Message header with no message ID
-#define RTMP_CHUNK_TYPE_2 2  // Message header with timestamp delta
-#define RTMP_CHUNK_TYPE_3 3  // No message header
+// RTMP packet structure
+typedef struct RTMPPacket {
+    uint8_t m_headerType;
+    uint32_t m_nChannel;
+    uint32_t m_nTimeStamp;
+    uint32_t m_nBodySize;
+    uint8_t m_packetType;
+    uint32_t m_nInfoField2;
+    uint8_t *m_body;
+} RTMPPacket;
 
-// Basic chunk header lengths
-#define RTMP_CHUNK_BASIC_HEADER_SIZE_1 1
-#define RTMP_CHUNK_BASIC_HEADER_SIZE_2 2
-#define RTMP_CHUNK_BASIC_HEADER_SIZE_3 3
+// Initialize chunk handling
+void rtmp_chunk_init(void);
 
-// Maximum values
-#define RTMP_CHUNK_MAX_HEADER_SIZE 18
-#define RTMP_CHUNK_MAX_SIZE 65536
+// Set chunk size
+void rtmp_chunk_set_size(uint32_t size);
 
-// Chunk structure
-struct rtmp_chunk_s {
-    uint8_t chunk_type;
-    uint32_t chunk_stream_id;
-    uint32_t timestamp;
-    uint32_t msg_length;
-    uint8_t msg_type_id;
-    uint32_t msg_stream_id;
-    uint8_t *msg_data;
-};
+// Get total size needed for packet serialization
+uint32_t rtmp_chunk_get_size(const RTMPPacket *packet);
 
-// Chunk functions
-size_t rtmp_chunk_read(rtmp_session_t *session, const uint8_t *data, size_t size, rtmp_chunk_t *chunk);
-int rtmp_chunk_write(rtmp_session_t *session, const rtmp_chunk_t *chunk);
+// Serialize packet into chunks
+size_t rtmp_chunk_serialize(const RTMPPacket *packet, uint8_t *buffer, size_t buffer_size);
 
-// Helper functions
-size_t rtmp_chunk_get_header_size(uint8_t chunk_type);
-size_t rtmp_chunk_parse_basic_header(const uint8_t *data, size_t size, uint8_t *chunk_type, uint32_t *chunk_stream_id);
-int rtmp_chunk_create_basic_header(uint8_t chunk_type, uint32_t chunk_stream_id, uint8_t *out);
+// Parse chunks into packet
+RTMPPacket* rtmp_chunk_parse(const uint8_t *buffer, size_t size);
 
-// Extended timestamp handling
-int rtmp_chunk_read_extended_timestamp(const uint8_t *data, size_t size, uint32_t *timestamp);
-int rtmp_chunk_write_extended_timestamp(uint8_t *data, uint32_t timestamp);
+// Free packet memory
+void rtmp_packet_free(RTMPPacket *packet);
+
+// Reset chunk stream state
+void rtmp_chunk_reset_stream(uint32_t chunk_stream_id);
+
+// Reset all chunk streams
+void rtmp_chunk_reset_all(void);
 
 #endif // RTMP_CHUNK_H

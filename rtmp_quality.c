@@ -1,219 +1,142 @@
-#include <string.h>
-#include <stdlib.h>
-#include <sys/time.h>
 #include "rtmp_quality.h"
 #include "rtmp_core.h"
 #include "rtmp_diagnostics.h"
+#include <string.h>
 
-// Configurações otimizadas para rede local
-#define LOCAL_MAX_BITRATE 12000000     // 12 Mbps
-#define LOCAL_MIN_BITRATE 1000000      // 1 Mbps
-#define LOCAL_TARGET_LATENCY 50        // 50ms
-#define QUALITY_CHECK_INTERVAL 100     // 100ms
-#define NETWORK_CHECK_INTERVAL 50      // 50ms
-#define BUFFER_THRESHOLD_HIGH 0.9
-#define BUFFER_THRESHOLD_LOW 0.3
-#define FPS_TARGET 30.0
-#define FPS_MIN_ACCEPTABLE 25.0
+// Constants for quality control
+#define MIN_BITRATE 500000    // 500 Kbps
+#define MAX_BITRATE 8000000   // 8 Mbps
+#define TARGET_BUFFER_MS 500  // Target buffer size in milliseconds
+#define MAX_FRAME_SKIP 2      // Maximum number of frames to skip
 
-struct rtmp_quality_controller {
-    rtmp_stream_t *stream;
-    quality_config_t config;
-    quality_stats_t stats;
-    
-    uint32_t last_quality_check;
-    uint32_t last_network_check;
+// Quality control structure
+typedef struct {
     uint32_t current_bitrate;
     uint32_t target_bitrate;
-    
-    float network_speed;
-    float buffer_health;
-    float average_fps;
+    uint32_t buffer_size;
     uint32_t frame_count;
-    uint32_t drop_count;
-    
-    bool is_local_network;
+    uint32_t skip_count;
+    double avg_frame_size;
+    struct timeval last_adjustment;
     bool is_adjusting;
-    
-    pthread_mutex_t lock;
+} RTMPQualityControl;
+
+static RTMPQualityControl quality_control = {
+    .current_bitrate = 2000000,  // Start at 2 Mbps
+    .target_bitrate = 2000000,
+    .buffer_size = 0,
+    .frame_count = 0,
+    .skip_count = 0,
+    .avg_frame_size = 0,
+    .is_adjusting = false
 };
 
-static uint32_t get_timestamp() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+void rtmp_quality_init(RTMPStream *stream) {
+    if (!stream) return;
+    
+    // Initialize quality settings
+    stream->video_bitrate = quality_control.current_bitrate;
+    stream->video_quality = 90; // Start with high quality
+    
+    gettimeofday(&quality_control.last_adjustment, NULL);
 }
 
-rtmp_quality_controller_t *rtmp_quality_controller_create(rtmp_stream_t *stream) {
-    rtmp_quality_controller_t *controller = calloc(1, sizeof(rtmp_quality_controller_t));
-    if (!controller) return NULL;
-    
-    controller->stream = stream;
-    controller->current_bitrate = LOCAL_MAX_BITRATE;
-    controller->target_bitrate = LOCAL_MAX_BITRATE;
-    controller->is_local_network = true;
-    
-    // Configuração inicial otimizada
-    controller->config.max_bitrate = LOCAL_MAX_BITRATE;
-    controller->config.min_bitrate = LOCAL_MIN_BITRATE;
-    controller->config.target_latency = LOCAL_TARGET_LATENCY;
-    controller->config.quality_priority = 0.7f;
-    
-    pthread_mutex_init(&controller->lock, NULL);
-    
-    rtmp_diagnostics_log(LOG_INFO, "Controlador de qualidade inicializado - Modo: Local");
-    
-    return controller;
-}
+void rtmp_quality_update(RTMPStream *stream, const RTMPPacket *packet) {
+    if (!stream || !packet) return;
 
-static void adjust_for_network_conditions(rtmp_quality_controller_t *controller) {
-    float network_stability = controller->network_speed / (float)controller->config.max_bitrate;
-    float buffer_stability = controller->buffer_health;
-    
-    // Calcula FPS médio
-    float current_fps = (float)controller->frame_count / 
-                       ((float)(get_timestamp() - controller->last_quality_check) / 1000.0f);
-    controller->average_fps = (controller->average_fps * 0.7f) + (current_fps * 0.3f);
-    
-    // Análise de condições
-    bool network_good = network_stability > 0.9f;
-    bool buffer_good = buffer_stability > 0.7f;
-    bool fps_good = controller->average_fps > FPS_MIN_ACCEPTABLE;
-    
-    uint32_t ideal_bitrate = controller->current_bitrate;
-    
-    if (network_good && buffer_good && fps_good) {
-        // Condições ótimas - pode aumentar qualidade
-        if (controller->current_bitrate < controller->config.max_bitrate) {
-            ideal_bitrate = MIN(controller->current_bitrate * 1.2, 
-                              controller->config.max_bitrate);
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // Update statistics
+    quality_control.frame_count++;
+    quality_control.buffer_size += packet->m_nBodySize;
+    quality_control.avg_frame_size = 
+        (quality_control.avg_frame_size * (quality_control.frame_count - 1) + packet->m_nBodySize) 
+        / quality_control.frame_count;
+
+    // Check if we need to adjust quality
+    if (timeval_diff_ms(&now, &quality_control.last_adjustment) > 1000) {
+        rtmp_quality_adjust(stream);
+        quality_control.last_adjustment = now;
+    }
+
+    // Handle frame skipping if needed
+    if (quality_control.buffer_size > (TARGET_BUFFER_MS * quality_control.current_bitrate / 8000)) {
+        if (quality_control.skip_count < MAX_FRAME_SKIP) {
+            quality_control.skip_count++;
+            return;
         }
-    } else if (!network_good || !buffer_good || !fps_good) {
-        // Problemas detectados - reduz qualidade
-        ideal_bitrate = MAX(controller->current_bitrate * 0.8,
-                          controller->config.min_bitrate);
-        
-        rtmp_diagnostics_log(LOG_WARN, 
-            "Ajustando qualidade - Network: %.2f, Buffer: %.2f, FPS: %.2f",
-            network_stability, buffer_stability, controller->average_fps);
+        quality_control.skip_count = 0;
     }
-    
-    // Ajusta gradualmente
-    if (ideal_bitrate != controller->target_bitrate) {
-        controller->target_bitrate = ideal_bitrate;
-        controller->is_adjusting = true;
-        
-        rtmp_diagnostics_log(LOG_INFO, 
-            "Novo target bitrate: %d kbps", controller->target_bitrate / 1000);
+
+    // Reset buffer size periodically
+    if (quality_control.frame_count % 30 == 0) {
+        quality_control.buffer_size = 0;
     }
 }
 
-void rtmp_quality_controller_update(rtmp_quality_controller_t *controller) {
-    if (!controller) return;
-    
-    pthread_mutex_lock(&controller->lock);
-    
-    uint32_t current_time = get_timestamp();
-    
-    // Verifica rede
-    if (current_time - controller->last_network_check >= NETWORK_CHECK_INTERVAL) {
-        controller->network_speed = rtmp_network_get_speed(controller->stream);
-        controller->buffer_health = rtmp_buffer_get_health(controller->stream);
-        controller->last_network_check = current_time;
+void rtmp_quality_adjust(RTMPStream *stream) {
+    if (!stream || quality_control.is_adjusting) return;
+
+    quality_control.is_adjusting = true;
+
+    // Calculate network conditions
+    double buffer_ratio = (double)quality_control.buffer_size / 
+                         (TARGET_BUFFER_MS * quality_control.current_bitrate / 8000);
+
+    // Adjust bitrate based on conditions
+    if (buffer_ratio > 1.2) {
+        // Buffer growing too large, reduce bitrate
+        quality_control.target_bitrate = 
+            (uint32_t)(quality_control.current_bitrate * 0.8);
+    } else if (buffer_ratio < 0.8) {
+        // Buffer too small, increase bitrate
+        quality_control.target_bitrate = 
+            (uint32_t)(quality_control.current_bitrate * 1.2);
     }
-    
-    // Ajusta qualidade
-    if (current_time - controller->last_quality_check >= QUALITY_CHECK_INTERVAL) {
-        adjust_for_network_conditions(controller);
+
+    // Clamp bitrate to acceptable range
+    if (quality_control.target_bitrate < MIN_BITRATE)
+        quality_control.target_bitrate = MIN_BITRATE;
+    if (quality_control.target_bitrate > MAX_BITRATE)
+        quality_control.target_bitrate = MAX_BITRATE;
+
+    // Apply new bitrate if changed
+    if (quality_control.target_bitrate != quality_control.current_bitrate) {
+        quality_control.current_bitrate = quality_control.target_bitrate;
+        stream->video_bitrate = quality_control.current_bitrate;
         
-        // Atualiza estatísticas
-        controller->stats.current_bitrate = controller->current_bitrate;
-        controller->stats.target_bitrate = controller->target_bitrate;
-        controller->stats.network_speed = controller->network_speed;
-        controller->stats.buffer_health = controller->buffer_health;
-        controller->stats.quality_score = (controller->network_speed / controller->config.max_bitrate) * 
-                                        controller->buffer_health;
-        
-        // Reseta contadores
-        controller->frame_count = 0;
-        controller->drop_count = 0;
-        controller->last_quality_check = current_time;
+        // Adjust video quality based on bitrate
+        if (quality_control.current_bitrate > 4000000)
+            stream->video_quality = 90;
+        else if (quality_control.current_bitrate > 2000000)
+            stream->video_quality = 85;
+        else
+            stream->video_quality = 80;
+
+        rtmp_diagnostic_log("Quality adjusted - Bitrate: %u, Quality: %d", 
+                          quality_control.current_bitrate, 
+                          stream->video_quality);
     }
-    
-    // Aplica ajustes gradualmente
-    if (controller->is_adjusting) {
-        float adjustment_factor = 1.0f;
-        
-        if (controller->current_bitrate < controller->target_bitrate) {
-            controller->current_bitrate = MIN(
-                controller->current_bitrate + (uint32_t)(controller->config.max_bitrate * 0.1f * adjustment_factor),
-                controller->target_bitrate
-            );
-        } else if (controller->current_bitrate > controller->target_bitrate) {
-            controller->current_bitrate = MAX(
-                controller->current_bitrate - (uint32_t)(controller->config.max_bitrate * 0.1f * adjustment_factor),
-                controller->target_bitrate
-            );
-        }
-        
-        if (controller->current_bitrate == controller->target_bitrate) {
-            controller->is_adjusting = false;
-        }
-        
-        // Aplica novo bitrate
-        rtmp_stream_set_bitrate(controller->stream, controller->current_bitrate);
-    }
-    
-    pthread_mutex_unlock(&controller->lock);
+
+    quality_control.is_adjusting = false;
 }
 
-void rtmp_quality_controller_configure(rtmp_quality_controller_t *controller,
-                                     const quality_config_t *config) {
-    if (!controller || !config) return;
-    
-    pthread_mutex_lock(&controller->lock);
-    
-    controller->config = *config;
-    
-    // Ajusta limites baseado no tipo de rede
-    if (controller->is_local_network) {
-        controller->config.max_bitrate = MIN(config->max_bitrate, LOCAL_MAX_BITRATE);
-        controller->config.min_bitrate = MAX(config->min_bitrate, LOCAL_MIN_BITRATE);
-        controller->config.target_latency = MIN(config->target_latency, LOCAL_TARGET_LATENCY);
-    } else {
-        controller->config.max_bitrate = MIN(config->max_bitrate, LOCAL_MAX_BITRATE/2);
-        controller->config.min_bitrate = MAX(config->min_bitrate, LOCAL_MIN_BITRATE*2);
-    }
-    
-    // Recalcula target baseado na nova configuração
-    controller->target_bitrate = MIN(controller->current_bitrate, 
-                                   controller->config.max_bitrate);
-    
-    rtmp_diagnostics_log(LOG_INFO, 
-        "Configuração atualizada - Max: %d kbps, Min: %d kbps, Latency: %d ms",
-        controller->config.max_bitrate/1000,
-        controller->config.min_bitrate/1000,
-        controller->config.target_latency);
-    
-    pthread_mutex_unlock(&controller->lock);
-}
+void rtmp_quality_reset(RTMPStream *stream) {
+    if (!stream) return;
 
-quality_stats_t rtmp_quality_controller_get_stats(rtmp_quality_controller_t *controller) {
-    quality_stats_t stats = {0};
-    if (!controller) return stats;
-    
-    pthread_mutex_lock(&controller->lock);
-    stats = controller->stats;
-    pthread_mutex_unlock(&controller->lock);
-    
-    return stats;
-}
+    // Reset quality control structure
+    quality_control.current_bitrate = 2000000;
+    quality_control.target_bitrate = 2000000;
+    quality_control.buffer_size = 0;
+    quality_control.frame_count = 0;
+    quality_control.skip_count = 0;
+    quality_control.avg_frame_size = 0;
+    quality_control.is_adjusting = false;
 
-void rtmp_quality_controller_destroy(rtmp_quality_controller_t *controller) {
-    if (!controller) return;
-    
-    pthread_mutex_destroy(&controller->lock);
-    free(controller);
-    
-    rtmp_diagnostics_log(LOG_INFO, "Controlador de qualidade finalizado");
+    // Reset stream quality settings
+    stream->video_bitrate = quality_control.current_bitrate;
+    stream->video_quality = 90;
+
+    gettimeofday(&quality_control.last_adjustment, NULL);
 }

@@ -2,48 +2,37 @@
 #define RTMP_PROTOCOL_H
 
 #include <stdint.h>
-#include <stddef.h>
-#include "rtmp_core.h"
+#include <stdbool.h>
+#include <stdlib.h>
+#include "rtmp_chunk.h"
 
-// Message types
-#define RTMP_MSG_CHUNK_SIZE     1
-#define RTMP_MSG_ABORT          2
-#define RTMP_MSG_ACKNOWLEDGEMENT 3
-#define RTMP_MSG_USER_CONTROL   4
-#define RTMP_MSG_WINDOW_ACK_SIZE 5
-#define RTMP_MSG_SET_PEER_BW    6
-#define RTMP_MSG_AUDIO          8
-#define RTMP_MSG_VIDEO          9
-#define RTMP_MSG_DATA_AMF3      15
-#define RTMP_MSG_SHARED_OBJ_AMF3 16
-#define RTMP_MSG_COMMAND_AMF3   17
-#define RTMP_MSG_DATA_AMF0      18
-#define RTMP_MSG_SHARED_OBJ_AMF0 19
-#define RTMP_MSG_COMMAND_AMF0   20
-#define RTMP_MSG_AGGREGATE      22
+// RTMP default port
+#define RTMP_DEFAULT_PORT 1935
 
-// User control message types
-#define RTMP_MSG_USER_CONTROL_STREAM_BEGIN      0x00
-#define RTMP_MSG_USER_CONTROL_STREAM_EOF        0x01
-#define RTMP_MSG_USER_CONTROL_STREAM_DRY        0x02
-#define RTMP_MSG_USER_CONTROL_SET_BUFFER_LENGTH 0x03
-#define RTMP_MSG_USER_CONTROL_STREAM_IS_RECORDED 0x04
-#define RTMP_MSG_USER_CONTROL_PING_REQUEST      0x06
-#define RTMP_MSG_USER_CONTROL_PING_RESPONSE     0x07
+// Initialize protocol handling
+void rtmp_protocol_init(void);
 
-// Stream states
-#define RTMP_STREAM_STATE_IDLE     0
-#define RTMP_STREAM_STATE_RESERVED 1
-#define RTMP_STREAM_STATE_ACTIVE   2
-#define RTMP_STREAM_STATE_CLOSED   3
+// Create various RTMP protocol packets
+RTMPPacket* rtmp_protocol_create_connect(const char *app, const char *tcUrl);
+RTMPPacket* rtmp_protocol_create_play(const char *stream_name);
+RTMPPacket* rtmp_protocol_create_publish(const char *stream_name);
+RTMPPacket* rtmp_protocol_create_set_chunk_size(uint32_t chunk_size);
+RTMPPacket* rtmp_protocol_create_window_ack_size(uint32_t window_size);
+RTMPPacket* rtmp_protocol_create_ping(void);
 
-// Protocol functions
-int rtmp_process_input(rtmp_session_t *session, const uint8_t *data, size_t size);
-int rtmp_process_message(rtmp_session_t *session, rtmp_chunk_t *chunk);
-int rtmp_send_message(rtmp_session_t *session, uint8_t msg_type_id, uint32_t msg_stream_id, const uint8_t *data, size_t size);
-int rtmp_send_user_control(rtmp_session_t *session, uint16_t event_type, uint32_t event_data);
-int rtmp_send_window_acknowledgement_size(rtmp_session_t *session, uint32_t window_size);
-int rtmp_send_set_peer_bandwidth(rtmp_session_t *session, uint32_t window_size, uint8_t limit_type);
-int rtmp_send_chunk_size(rtmp_session_t *session, uint32_t chunk_size);
+// Parse RTMP URL into components
+bool rtmp_protocol_parse_url(const char *url, char *hostname, size_t hostname_size,
+                           int *port, char *app_name, size_t app_size,
+                           char *stream_name, size_t stream_size);
+
+// Extract values from received packets
+uint32_t rtmp_protocol_get_chunk_size(const RTMPPacket *packet);
+uint32_t rtmp_protocol_get_window_size(const RTMPPacket *packet);
+
+// Handle received packets
+void rtmp_protocol_handle_packet(const RTMPPacket *packet);
+
+// Stream management
+void rtmp_protocol_set_stream_id(uint32_t stream_id);
 
 #endif // RTMP_PROTOCOL_H

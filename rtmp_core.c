@@ -1,483 +1,381 @@
+#include "rtmp_core.h"
+#include "rtmp_chunk.h"
+#include "rtmp_protocol.h"
+#include "rtmp_quality.h"
+#include "rtmp_diagnostics.h"
 #include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <errno.h>
-#include "rtmp_core.h"
-#include "rtmp_diagnostics.h"
 
-// Buffer de leitura/escrita otimizado
-#define IO_BUFFER_SIZE (256 * 1024)  // 256KB
+#define RTMP_DEFAULT_PORT 1935
+#define RTMP_BUFFER_SIZE 65536
+#define RTMP_MAX_STREAMS 8
+#define RTMP_PING_INTERVAL 5000 // 5 seconds
 
-// Estrutura de buffer circular
-typedef struct {
-    uint8_t *data;
-    size_t size;
-    size_t read_pos;
-    size_t write_pos;
-} circular_buffer_t;
-
-// Contexto de IO
-typedef struct {
-    circular_buffer_t *read_buffer;
-    circular_buffer_t *write_buffer;
-    pthread_mutex_t read_mutex;
-    pthread_mutex_t write_mutex;
-} io_context_t;
-
-// Funções auxiliares
-static circular_buffer_t *create_circular_buffer(size_t size) {
-    circular_buffer_t *buffer = calloc(1, sizeof(circular_buffer_t));
-    if (!buffer) return NULL;
+struct RTMPContext {
+    int socket;
+    bool connected;
+    bool running;
     
-    buffer->data = malloc(size);
-    if (!buffer->data) {
-        free(buffer);
-        return NULL;
+    // Connection info
+    char hostname[256];
+    int port;
+    char app_name[128];
+    char stream_name[128];
+    
+    // Buffers
+    uint8_t *in_buffer;
+    uint8_t *out_buffer;
+    size_t in_buffer_size;
+    size_t out_buffer_size;
+    
+    // Stream management
+    RTMPStream *streams[RTMP_MAX_STREAMS];
+    uint32_t stream_count;
+    uint32_t current_stream_id;
+    
+    // Protocol state
+    uint32_t chunk_size;
+    uint32_t window_size;
+    uint32_t bandwidth;
+    
+    // Threading
+    pthread_t network_thread;
+    pthread_mutex_t mutex;
+    
+    // Callbacks
+    rtmp_core_callback_t callback;
+    void *callback_context;
+    
+    // Stats and monitoring
+    struct {
+        uint64_t bytes_sent;
+        uint64_t bytes_received;
+        uint32_t messages_sent;
+        uint32_t messages_received;
+        struct timeval last_ping;
+    } stats;
+};
+
+static void rtmp_handle_error(RTMPContext *ctx, const char *message) {
+    if (ctx && ctx->callback) {
+        RTMPCoreEvent event = {
+            .type = RTMP_CORE_EVENT_ERROR,
+            .error_message = message
+        };
+        ctx->callback(&event, ctx->callback_context);
     }
-    
-    buffer->size = size;
-    return buffer;
+    rtmp_diagnostic_log("Error: %s", message);
 }
 
-static void destroy_circular_buffer(circular_buffer_t *buffer) {
-    if (buffer) {
-        free(buffer->data);
-        free(buffer);
+static bool rtmp_send_packet(RTMPContext *ctx, RTMPPacket *packet) {
+    if (!ctx || !packet) return false;
+    
+    pthread_mutex_lock(&ctx->mutex);
+    
+    // Prepare chunk
+    size_t chunk_size = rtmp_chunk_get_size(packet);
+    if (chunk_size > ctx->out_buffer_size) {
+        pthread_mutex_unlock(&ctx->mutex);
+        rtmp_handle_error(ctx, "Packet too large for output buffer");
+        return false;
     }
+    
+    // Serialize packet to chunk
+    size_t written = rtmp_chunk_serialize(packet, ctx->out_buffer, ctx->out_buffer_size);
+    if (written == 0) {
+        pthread_mutex_unlock(&ctx->mutex);
+        rtmp_handle_error(ctx, "Failed to serialize packet");
+        return false;
+    }
+    
+    // Send chunk
+    ssize_t sent = send(ctx->socket, ctx->out_buffer, written, 0);
+    if (sent < 0) {
+        pthread_mutex_unlock(&ctx->mutex);
+        rtmp_handle_error(ctx, "Send failed");
+        return false;
+    }
+    
+    // Update stats
+    ctx->stats.bytes_sent += sent;
+    ctx->stats.messages_sent++;
+    
+    pthread_mutex_unlock(&ctx->mutex);
+    return true;
 }
 
-static io_context_t *create_io_context(void) {
-    io_context_t *ctx = calloc(1, sizeof(io_context_t));
+static RTMPPacket* rtmp_receive_packet(RTMPContext *ctx) {
     if (!ctx) return NULL;
     
-    ctx->read_buffer = create_circular_buffer(IO_BUFFER_SIZE);
-    ctx->write_buffer = create_circular_buffer(IO_BUFFER_SIZE);
+    pthread_mutex_lock(&ctx->mutex);
     
-    if (!ctx->read_buffer || !ctx->write_buffer) {
-        destroy_circular_buffer(ctx->read_buffer);
-        destroy_circular_buffer(ctx->write_buffer);
-        free(ctx);
+    // Read chunk header
+    uint8_t header[RTMP_MAX_HEADER_SIZE];
+    ssize_t received = recv(ctx->socket, header, RTMP_MAX_HEADER_SIZE, MSG_PEEK);
+    if (received <= 0) {
+        pthread_mutex_unlock(&ctx->mutex);
         return NULL;
     }
     
-    pthread_mutex_init(&ctx->read_mutex, NULL);
-    pthread_mutex_init(&ctx->write_mutex, NULL);
+    // Parse chunk size
+    size_t chunk_size = rtmp_chunk_get_header_size(header);
+    if (chunk_size > ctx->in_buffer_size) {
+        pthread_mutex_unlock(&ctx->mutex);
+        rtmp_handle_error(ctx, "Incoming chunk too large");
+        return NULL;
+    }
+    
+    // Read full chunk
+    received = recv(ctx->socket, ctx->in_buffer, chunk_size, 0);
+    if (received != chunk_size) {
+        pthread_mutex_unlock(&ctx->mutex);
+        rtmp_handle_error(ctx, "Failed to receive complete chunk");
+        return NULL;
+    }
+    
+    // Update stats
+    ctx->stats.bytes_received += received;
+    ctx->stats.messages_received++;
+    
+    // Parse packet
+    RTMPPacket *packet = rtmp_chunk_parse(ctx->in_buffer, received);
+    
+    pthread_mutex_unlock(&ctx->mutex);
+    return packet;
+}
+
+static void* rtmp_network_thread(void *arg) {
+    RTMPContext *ctx = (RTMPContext*)arg;
+    struct timeval now;
+    
+    while (ctx->running) {
+        RTMPPacket *packet = rtmp_receive_packet(ctx);
+        if (packet) {
+            // Handle packet based on type
+            switch (packet->m_packetType) {
+                case RTMP_PACKET_TYPE_CHUNK_SIZE:
+                    ctx->chunk_size = rtmp_protocol_get_chunk_size(packet);
+                    break;
+                    
+                case RTMP_PACKET_TYPE_BYTES_READ:
+                    ctx->window_size = rtmp_protocol_get_bytes_read(packet);
+                    break;
+                    
+                case RTMP_PACKET_TYPE_BANDWIDTH:
+                    ctx->bandwidth = rtmp_protocol_get_bandwidth(packet);
+                    break;
+                    
+                case RTMP_PACKET_TYPE_VIDEO:
+                case RTMP_PACKET_TYPE_AUDIO:
+                    if (ctx->current_stream_id < ctx->stream_count) {
+                        RTMPStream *stream = ctx->streams[ctx->current_stream_id];
+                        rtmp_quality_update(stream, packet);
+                    }
+                    break;
+                    
+                default:
+                    // Handle other packet types through protocol layer
+                    rtmp_protocol_handle_packet(packet);
+                    break;
+            }
+            
+            // Notify callback
+            if (ctx->callback) {
+                RTMPCoreEvent event = {
+                    .type = RTMP_CORE_EVENT_PACKET,
+                    .packet = packet
+                };
+                ctx->callback(&event, ctx->callback_context);
+            }
+            
+            rtmp_packet_free(packet);
+        }
+        
+        // Handle ping/keepalive
+        gettimeofday(&now, NULL);
+        if ((now.tv_sec - ctx->stats.last_ping.tv_sec) * 1000 + 
+            (now.tv_usec - ctx->stats.last_ping.tv_usec) / 1000 >= RTMP_PING_INTERVAL) {
+            RTMPPacket ping_packet;
+            rtmp_protocol_create_ping(&ping_packet);
+            rtmp_send_packet(ctx, &ping_packet);
+            ctx->stats.last_ping = now;
+        }
+        
+        // Small sleep to prevent CPU hogging
+        usleep(1000);
+    }
+    
+    return NULL;
+}
+
+RTMPContext* rtmp_core_create(void) {
+    RTMPContext *ctx = (RTMPContext*)calloc(1, sizeof(RTMPContext));
+    if (!ctx) return NULL;
+    
+    ctx->in_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
+    ctx->out_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
+    ctx->in_buffer_size = RTMP_BUFFER_SIZE;
+    ctx->out_buffer_size = RTMP_BUFFER_SIZE;
+    
+    pthread_mutex_init(&ctx->mutex, NULL);
+    
+    ctx->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
+    ctx->port = RTMP_DEFAULT_PORT;
+    
+    gettimeofday(&ctx->stats.last_ping, NULL);
     
     return ctx;
 }
 
-static void destroy_io_context(io_context_t *ctx) {
-    if (ctx) {
-        destroy_circular_buffer(ctx->read_buffer);
-        destroy_circular_buffer(ctx->write_buffer);
-        pthread_mutex_destroy(&ctx->read_mutex);
-        pthread_mutex_destroy(&ctx->write_mutex);
-        free(ctx);
-    }
+void rtmp_core_destroy(RTMPContext *ctx) {
+    if (!ctx) return;
+    
+    rtmp_core_disconnect(ctx);
+    
+    pthread_mutex_destroy(&ctx->mutex);
+    
+    free(ctx->in_buffer);
+    free(ctx->out_buffer);
+    free(ctx);
 }
 
-rtmp_session_t *rtmp_session_create(void) {
-    rtmp_session_t *session = calloc(1, sizeof(rtmp_session_t));
-    if (!session) return NULL;
-    
-    session->connection = calloc(1, sizeof(rtmp_connection_t));
-    if (!session->connection) {
-        free(session);
-        return NULL;
-    }
-    
-    // Configura valores padrão
-    session->connection->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    session->connection->window_size = 2500000;
-    session->connection->bandwidth = 2500000;
-    session->buffer_length = RTMP_BUFFER_TIME;
-    
-    rtmp_diagnostics_log(LOG_INFO, "Sessão RTMP criada");
-    return session;
-}
-
-int rtmp_connect(rtmp_session_t *session, const char *url) {
-    if (!session || !url) return -1;
+bool rtmp_core_connect(RTMPContext *ctx, const char *url) {
+    if (!ctx || !url) return false;
     
     // Parse URL
-    char *url_copy = strdup(url);
-    char *host = strstr(url_copy, "://");
-    if (!host) {
-        free(url_copy);
-        return -1;
+    if (!rtmp_protocol_parse_url(url, ctx->hostname, sizeof(ctx->hostname),
+                                &ctx->port, ctx->app_name, sizeof(ctx->app_name),
+                                ctx->stream_name, sizeof(ctx->stream_name))) {
+        rtmp_handle_error(ctx, "Invalid RTMP URL");
+        return false;
     }
     
-    host += 3;
-    char *port_str = strchr(host, ':');
-    char *path = strchr(host, '/');
-    
-    if (port_str) *port_str++ = '\0';
-    if (path) *path++ = '\0';
-    
-    int port = port_str ? atoi(port_str) : RTMP_DEFAULT_PORT;
-    
-    // Cria socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        free(url_copy);
-        return -1;
+    // Create socket
+    ctx->socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (ctx->socket < 0) {
+        rtmp_handle_error(ctx, "Failed to create socket");
+        return false;
     }
     
-    // Configura socket para performance
+    // Set socket options
     int flag = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    setsockopt(ctx->socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     
-    // Buffer sizes otimizados
-    int rcvbuf = 256 * 1024;  // 256KB
-    int sndbuf = 256 * 1024;  // 256KB
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-    
-    // Conecta
-    struct sockaddr_in addr = {0};
+    // Connect
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(host);
-    
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        free(url_copy);
-        return -1;
+    addr.sin_port = htons(ctx->port);
+    if (inet_pton(AF_INET, ctx->hostname, &addr.sin_addr) <= 0) {
+        rtmp_handle_error(ctx, "Invalid address");
+        close(ctx->socket);
+        return false;
     }
     
-    session->connection->socket = sock;
-    session->connection->is_connected = true;
+    if (connect(ctx->socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        rtmp_handle_error(ctx, "Connection failed");
+        close(ctx->socket);
+        return false;
+    }
     
-    // Configura contexto de IO
-    session->connection->user_data = create_io_context();
+    // Set non-blocking
+    int flags = fcntl(ctx->socket, F_GETFL, 0);
+    fcntl(ctx->socket, F_SETFL, flags | O_NONBLOCK);
     
-    // Salva informações da URL
-    session->app_name = path ? strdup(path) : strdup("");
-    session->tcp_url = strdup(url);
+    // Start network thread
+    ctx->running = true;
+    if (pthread_create(&ctx->network_thread, NULL, rtmp_network_thread, ctx) != 0) {
+        rtmp_handle_error(ctx, "Failed to create network thread");
+        close(ctx->socket);
+        ctx->running = false;
+        return false;
+    }
     
-    free(url_copy);
+    ctx->connected = true;
     
-    rtmp_diagnostics_log(LOG_INFO, "Conectado a %s:%d", host, port);
-    return 0;
+    // Notify connection
+    if (ctx->callback) {
+        RTMPCoreEvent event = {
+            .type = RTMP_CORE_EVENT_CONNECTED
+        };
+        ctx->callback(&event, ctx->callback_context);
+    }
+    
+    return true;
 }
 
-int rtmp_read_packet(rtmp_session_t *session, rtmp_packet_t *packet) {
-    if (!session || !packet || !session->connection->is_connected) return -1;
+void rtmp_core_disconnect(RTMPContext *ctx) {
+    if (!ctx || !ctx->connected) return;
     
-    io_context_t *io = session->connection->user_data;
-    pthread_mutex_lock(&io->read_mutex);
+    ctx->running = false;
+    pthread_join(ctx->network_thread, NULL);
     
-    // Lê cabeçalho básico
-    uint8_t header[1];
-    if (read(session->connection->socket, header, 1) != 1) {
-        pthread_mutex_unlock(&io->read_mutex);
-        return -1;
+    close(ctx->socket);
+    ctx->socket = -1;
+    ctx->connected = false;
+    
+    // Notify disconnection
+    if (ctx->callback) {
+        RTMPCoreEvent event = {
+            .type = RTMP_CORE_EVENT_DISCONNECTED
+        };
+        ctx->callback(&event, ctx->callback_context);
     }
+}
+
+bool rtmp_core_add_stream(RTMPContext *ctx, RTMPStream *stream) {
+    if (!ctx || !stream || ctx->stream_count >= RTMP_MAX_STREAMS) return false;
     
-    packet->channel_id = header[0] & 0x3f;
-    int header_type = header[0] >> 6;
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->streams[ctx->stream_count] = stream;
+    ctx->stream_count++;
+    pthread_mutex_unlock(&ctx->mutex);
     
-    // Lê resto do cabeçalho baseado no tipo
-    switch (header_type) {
-        case 0: // 12 bytes
-            // Implementação do header tipo 0
-            break;
-        case 1: // 8 bytes
-            // Implementação do header tipo 1
-            break;
-        case 2: // 4 bytes
-            // Implementação do header tipo 2
-            break;
-        case 3: // 1 byte
-            // Implementação do header tipo 3
-            break;
-    }
+    return true;
+}
+
+void rtmp_core_remove_stream(RTMPContext *ctx, RTMPStream *stream) {
+    if (!ctx || !stream) return;
     
-    // Lê dados do pacote
-    if (packet->length > 0) {
-        packet->data = malloc(packet->length);
-        if (!packet->data) {
-            pthread_mutex_unlock(&io->read_mutex);
-            return -1;
-        }
-        
-        size_t bytes_read = 0;
-        while (bytes_read < packet->length) {
-            ssize_t result = read(session->connection->socket,
-                                packet->data + bytes_read,
-                                packet->length - bytes_read);
-            if (result <= 0) {
-                free(packet->data);
-                pthread_mutex_unlock(&io->read_mutex);
-                return -1;
+    pthread_mutex_lock(&ctx->mutex);
+    for (uint32_t i = 0; i < ctx->stream_count; i++) {
+        if (ctx->streams[i] == stream) {
+            // Shift remaining streams
+            for (uint32_t j = i; j < ctx->stream_count - 1; j++) {
+                ctx->streams[j] = ctx->streams[j + 1];
             }
-            bytes_read += result;
+            ctx->stream_count--;
+            break;
         }
     }
-    
-    pthread_mutex_unlock(&io->read_mutex);
-    return 0;
+    pthread_mutex_unlock(&ctx->mutex);
 }
 
-int rtmp_write_packet(rtmp_session_t *session, rtmp_packet_t *packet) {
-    if (!session || !packet || !session->connection->is_connected) return -1;
+void rtmp_core_set_callback(RTMPContext *ctx, rtmp_core_callback_t callback, void *context) {
+    if (!ctx) return;
     
-    io_context_t *io = session->connection->user_data;
-    pthread_mutex_lock(&io->write_mutex);
-    
-    // Escreve cabeçalho
-    uint8_t header[12] = {0};
-    header[0] = (packet->channel_id & 0x3f) | (0 << 6);  // Tipo 0
-    
-    // Timestamp
-    header[1] = (packet->timestamp >> 16) & 0xff;
-    header[2] = (packet->timestamp >> 8) & 0xff;
-    header[3] = packet->timestamp & 0xff;
-    
-    // Length
-    header[4] = (packet->length >> 16) & 0xff;
-    header[5] = (packet->length >> 8) & 0xff;
-    header[6] = packet->length & 0xff;
-    
-    // Type
-    header[7] = packet->type;
-    
-    // Stream ID
-    header[8] = packet->stream_id & 0xff;
-    header[9] = (packet->stream_id >> 8) & 0xff;
-    header[10] = (packet->stream_id >> 16) & 0xff;
-    header[11] = (packet->stream_id >> 24) & 0xff;
-    
-    // Escreve cabeçalho
-    if (write(session->connection->socket, header, 12) != 12) {
-        pthread_mutex_unlock(&io->write_mutex);
-        return -1;
-    }
-    
-    // Escreve dados
-    if (packet->length > 0 && packet->data) {
-        size_t bytes_written = 0;
-        while (bytes_written < packet->length) {
-            ssize_t result = write(session->connection->socket,
-                                 packet->data + bytes_written,
-                                 packet->length - bytes_written);
-            if (result <= 0) {
-                pthread_mutex_unlock(&io->write_mutex);
-                return -1;
-            }
-            bytes_written += result;
-        }
-    }
-    
-    pthread_mutex_unlock(&io->write_mutex);
-    return 0;
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->callback = callback;
+    ctx->callback_context = context;
+    pthread_mutex_unlock(&ctx->mutex);
 }
 
-void rtmp_disconnect(rtmp_session_t *session) {
-    if (!session || !session->connection) return;
-    
-    if (session->connection->is_connected) {
-        close(session->connection->socket);
-        session->connection->is_connected = false;
-        
-        io_context_t *io = session->connection->user_data;
-        if (io) {
-            destroy_io_context(io);
-            session->connection->user_data = NULL;
-        }
-        
-        rtmp_diagnostics_log(LOG_INFO, "Desconectado do servidor RTMP");
-    }
+bool rtmp_core_is_connected(RTMPContext *ctx) {
+    return ctx ? ctx->connected : false;
 }
 
-void rtmp_session_destroy(rtmp_session_t *session) {
-    if (!session) return;
+void rtmp_core_get_stats(RTMPContext *ctx, RTMPCoreStats *stats) {
+    if (!ctx || !stats) return;
     
-    rtmp_disconnect(session);
-    
-    free(session->app_name);
-    free(session->stream_name);
-    free(session->swf_url);
-    free(session->tcp_url);
-    free(session->connection);
-    free(session);
-    
-    rtmp_diagnostics_log(LOG_INFO, "Sessão RTMP destruída");
-}
-
-void rtmp_set_chunk_size(rtmp_session_t *session, uint32_t size) {
-    if (!session || !session->connection) return;
-    
-    session->connection->chunk_size = size;
-    
-    // Envia comando de chunk size
-    rtmp_packet_t packet = {0};
-    packet.channel_id = 2;
-    packet.type = RTMP_PACKET_TYPE_CHUNK_SIZE;
-    packet.length = 4;
-    packet.stream_id = 0;
-    
-    uint8_t data[4];
-    data[0] = (size >> 24) & 0xff;
-    data[1] = (size >> 16) & 0xff;
-    data[2] = (size >> 8) & 0xff;
-    data[3] = size & 0xff;
-    
-    packet.data = data;
-    rtmp_write_packet(session, &packet);
-}
-
-void rtmp_set_buffer_length(rtmp_session_t *session, uint32_t length) {
-    if (!session) return;
-    session->buffer_length = length;
-}
-
-void rtmp_set_window_size(rtmp_session_t *session, uint32_t size) {
-    if (!session || !session->connection) return;
-    
-    session->connection->window_size = size;
-    
-    // Envia comando de window size
-    rtmp_packet_t packet = {0};
-    packet.channel_id = 2;
-    packet.type = RTMP_PACKET_TYPE_SERVER_BW;
-    packet.length = 4;
-    packet.stream_id = 0;
-    
-    uint8_t data[4];
-    data[0] = (size >> 24) & 0xff;
-    data[1] = (size >> 16) & 0xff;
-    data[2] = (size >> 8) & 0xff;
-    data[3] = size & 0xff;
-    
-    packet.data = data;
-    rtmp_write_packet(session, &packet);
-}
-
-void rtmp_set_bandwidth(rtmp_session_t *session, uint32_t bandwidth) {
-    if (!session || !session->connection) return;
-    
-    session->connection->bandwidth = bandwidth;
-    
-    // Envia comando de bandwidth
-    rtmp_packet_t packet = {0};
-    packet.channel_id = 2;
-    packet.type = RTMP_PACKET_TYPE_CLIENT_BW;
-    packet.length = 5;
-    packet.stream_id = 0;
-    
-    uint8_t data[5];
-    data[0] = (bandwidth >> 24) & 0xff;
-    data[1] = (bandwidth >> 16) & 0xff;
-    data[2] = (bandwidth >> 8) & 0xff;
-    data[3] = bandwidth & 0xff;
-    data[4] = 2; // Dynamic bandwidth
-    
-    packet.data = data;
-    rtmp_write_packet(session, &packet);
-}
-
-bool rtmp_is_connected(rtmp_session_t *session) {
-    return session && session->connection && session->connection->is_connected;
-}
-
-uint32_t rtmp_get_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
-}
-
-static bool debug_enabled = false;
-
-void rtmp_set_debug(bool enable) {
-    debug_enabled = enable;
-}
-
-void rtmp_dump_packet(rtmp_packet_t *packet) {
-    if (!debug_enabled || !packet) return;
-    
-    rtmp_diagnostics_log(LOG_DEBUG, "RTMP Packet:");
-    rtmp_diagnostics_log(LOG_DEBUG, "  Channel ID: %d", packet->channel_id);
-    rtmp_diagnostics_log(LOG_DEBUG, "  Timestamp: %u", packet->timestamp);
-    rtmp_diagnostics_log(LOG_DEBUG, "  Length: %u", packet->length);
-    rtmp_diagnostics_log(LOG_DEBUG, "  Type: %d", packet->type);
-    rtmp_diagnostics_log(LOG_DEBUG, "  Stream ID: %u", packet->stream_id);
-}
-
-const char *rtmp_get_error_string(int error) {
-    switch (error) {
-        case -1: return "Erro genérico";
-        case -2: return "Timeout de conexão";
-        case -3: return "Handshake falhou";
-        case -4: return "Erro de leitura/escrita";
-        case -5: return "Buffer cheio";
-        default: return "Erro desconhecido";
-    }
-}
-
-// Funções utilitárias adicionais
-static int read_fully(int socket, uint8_t *buffer, size_t size) {
-    size_t total_read = 0;
-    
-    while (total_read < size) {
-        ssize_t result = read(socket, buffer + total_read, size - total_read);
-        if (result <= 0) return -1;
-        total_read += result;
-    }
-    
-    return total_read;
-}
-
-static int write_fully(int socket, const uint8_t *buffer, size_t size) {
-    size_t total_written = 0;
-    
-    while (total_written < size) {
-        ssize_t result = write(socket, buffer + total_written, size - total_written);
-        if (result <= 0) return -1;
-        total_written += result;
-    }
-    
-    return total_written;
-}
-
-// Funções de socket não bloqueante
-static int set_nonblocking(int socket) {
-    int flags = fcntl(socket, F_GETFL, 0);
-    if (flags == -1) return -1;
-    return fcntl(socket, F_SETFL, flags | O_NONBLOCK);
-}
-
-static int wait_for_socket(int socket, bool for_read, int timeout_ms) {
-    fd_set fds;
-    struct timeval tv;
-    
-    FD_ZERO(&fds);
-    FD_SET(socket, &fds);
-    
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    
-    return select(socket + 1, 
-                 for_read ? &fds : NULL,
-                 for_read ? NULL : &fds,
-                 NULL, &tv);
-}
-
-// Manipulação de timestamps
-static uint32_t get_relative_timestamp(rtmp_session_t *session) {
-    uint32_t current = rtmp_get_time();
-    if (!session->connection->timestamp) {
-        session->connection->timestamp = current;
-    }
-    return current - session->connection->timestamp;
-}
-
-// Gerenciamento de sequência
-static uint32_t get_next_sequence(rtmp_session_t *session) {
-    return ++session->connection->sequence_number;
+    pthread_mutex_lock(&ctx->mutex);
+    stats->bytes_sent = ctx->stats.bytes_sent;
+    stats->bytes_received = ctx->stats.bytes_received;
+    stats->messages_sent = ctx->stats.messages_sent;
+    stats->messages_received = ctx->stats.messages_received;
+    pthread_mutex_unlock(&ctx->mutex);
 }

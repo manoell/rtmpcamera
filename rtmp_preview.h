@@ -1,12 +1,18 @@
-#import <UIKit/UIKit.h>
-#import "rtmp_stream.h"
+#ifndef RTMP_PREVIEW_H
+#define RTMP_PREVIEW_H
 
-@interface RTMPPreviewView : UIView
+#import <CoreVideo/CoreVideo.h>
 
-// Stream associado ao preview
-@property (nonatomic, assign) rtmp_stream_t *stream;
+// Forward declaration
+typedef struct RTMPStream RTMPStream;
 
-// Processa um frame de vídeo recebido
-- (void)processVideoFrame:(video_frame_t *)frame;
+// Show preview window with stream statistics
+void rtmp_preview_show(RTMPStream *stream);
 
-@end
+// Hide preview window
+void rtmp_preview_hide(void);
+
+// Update preview with new frame
+void rtmp_preview_update_frame(CVImageBufferRef imageBuffer);
+
+#endif // RTMP_PREVIEW_H

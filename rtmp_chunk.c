@@ -1,288 +1,325 @@
 #include "rtmp_chunk.h"
-#include "rtmp_utils.h"
+#include "rtmp_diagnostics.h"
 #include <string.h>
-#include <stdlib.h>
+#include <arpa/inet.h>
 
-size_t rtmp_chunk_read(rtmp_session_t *session, const uint8_t *data, size_t size, rtmp_chunk_t *chunk) {
-    if (!session || !data || !size || !chunk) return 0;
+// RTMP chunk types
+#define RTMP_CHUNK_TYPE_0 0  // Full header
+#define RTMP_CHUNK_TYPE_1 1  // Timestamp delta
+#define RTMP_CHUNK_TYPE_2 2  // Timestamp delta only
+#define RTMP_CHUNK_TYPE_3 3  // No header
+
+// Maximum number of chunk streams
+#define RTMP_MAX_CHUNK_STREAMS 64
+
+// Chunk stream state
+typedef struct {
+    uint32_t timestamp;
+    uint32_t message_length;
+    uint8_t message_type;
+    uint32_t stream_id;
+    uint8_t *message_data;
+    size_t bytes_received;
+} ChunkStreamState;
+
+// Chunk context
+static struct {
+    ChunkStreamState streams[RTMP_MAX_CHUNK_STREAMS];
+    uint32_t chunk_size;
+    bool initialized;
+} chunk_context = {
+    .chunk_size = RTMP_DEFAULT_CHUNK_SIZE,
+    .initialized = false
+};
+
+void rtmp_chunk_init(void) {
+    if (chunk_context.initialized) return;
     
-    size_t offset = 0;
+    memset(&chunk_context, 0, sizeof(chunk_context));
+    chunk_context.chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
+    chunk_context.initialized = true;
+}
+
+void rtmp_chunk_set_size(uint32_t size) {
+    if (size < 1 || size > 65536) return;
+    chunk_context.chunk_size = size;
+}
+
+uint32_t rtmp_chunk_get_size(const RTMPPacket *packet) {
+    if (!packet) return 0;
     
-    // Parse basic header
-    uint8_t chunk_type;
-    uint32_t chunk_stream_id;
-    size_t basic_header_size = rtmp_chunk_parse_basic_header(data, size, &chunk_type, &chunk_stream_id);
-    if (basic_header_size == 0) return 0;
+    // Calculate basic header size
+    size_t header_size = 1;  // Basic header is at least 1 byte
+    if (packet->m_nChannel >= 64) {
+        header_size = 2;
+    } else if (packet->m_nChannel >= 320) {
+        header_size = 3;
+    }
     
-    offset += basic_header_size;
-    if (offset >= size) return 0;
-    
-    // Get chunk stream
-    rtmp_chunk_stream_t *chunk_stream = rtmp_get_chunk_stream(session, chunk_stream_id);
-    if (!chunk_stream) return (size_t)-1;
-    
-    // Parse message header
-    size_t header_size = rtmp_chunk_get_header_size(chunk_type);
-    if (offset + header_size > size) return 0;
-    
-    const uint8_t *header = data + offset;
-    offset += header_size;
-    
-    uint32_t timestamp = 0;
-    switch (chunk_type) {
-        case RTMP_CHUNK_TYPE_0: {
-            timestamp = RTMP_NTOH24(header);
-            chunk_stream->msg_length = RTMP_NTOH24(header + 3);
-            chunk_stream->msg_type_id = header[6];
-            chunk_stream->msg_stream_id = RTMP_NTOHL(*(uint32_t*)(header + 7));
+    // Add message header size based on chunk type
+    switch (packet->m_headerType) {
+        case RTMP_CHUNK_TYPE_0:
+            header_size += 11;
             break;
-        }
-        
-        case RTMP_CHUNK_TYPE_1: {
-            timestamp = RTMP_NTOH24(header);
-            chunk_stream->msg_length = RTMP_NTOH24(header + 3);
-            chunk_stream->msg_type_id = header[6];
+        case RTMP_CHUNK_TYPE_1:
+            header_size += 7;
             break;
-        }
-        
-        case RTMP_CHUNK_TYPE_2: {
-            timestamp = RTMP_NTOH24(header);
+        case RTMP_CHUNK_TYPE_2:
+            header_size += 3;
             break;
-        }
-        
         case RTMP_CHUNK_TYPE_3:
             break;
     }
     
-    // Handle extended timestamp
-    if (timestamp >= 0xFFFFFF) {
-        if (offset + 4 > size) return 0;
+    // Calculate number of chunks needed
+    uint32_t chunks = (packet->m_nBodySize + chunk_context.chunk_size - 1) / chunk_context.chunk_size;
+    
+    // Total size is header plus chunked body
+    return header_size + (chunks * chunk_context.chunk_size);
+}
+
+size_t rtmp_chunk_serialize(const RTMPPacket *packet, uint8_t *buffer, size_t buffer_size) {
+    if (!packet || !buffer || buffer_size == 0) return 0;
+    
+    size_t offset = 0;
+    
+    // Write basic header
+    if (packet->m_nChannel < 64) {
+        buffer[offset++] = (packet->m_headerType << 6) | packet->m_nChannel;
+    } else if (packet->m_nChannel < 320) {
+        buffer[offset++] = (packet->m_headerType << 6) | 0;
+        buffer[offset++] = packet->m_nChannel - 64;
+    } else {
+        buffer[offset++] = (packet->m_headerType << 6) | 1;
+        uint16_t channel = htons(packet->m_nChannel - 64);
+        memcpy(buffer + offset, &channel, 2);
+        offset += 2;
+    }
+    
+    // Write message header based on type
+    if (packet->m_headerType == RTMP_CHUNK_TYPE_0) {
+        // Timestamp
+        uint32_t timestamp = htonl(packet->m_nTimeStamp);
+        memcpy(buffer + offset, &timestamp, 4);
+        offset += 4;
         
-        uint32_t extended_timestamp;
-        if (rtmp_chunk_read_extended_timestamp(data + offset, size - offset, &extended_timestamp) < 0) {
-            return (size_t)-1;
+        // Message length
+        uint32_t length = htonl(packet->m_nBodySize);
+        memcpy(buffer + offset, &length, 3);
+        offset += 3;
+        
+        // Message type
+        buffer[offset++] = packet->m_packetType;
+        
+        // Stream ID
+        uint32_t stream_id = htonl(packet->m_nInfoField2);
+        memcpy(buffer + offset, &stream_id, 4);
+        offset += 4;
+    } else if (packet->m_headerType == RTMP_CHUNK_TYPE_1) {
+        // Timestamp delta
+        uint32_t timestamp = htonl(packet->m_nTimeStamp);
+        memcpy(buffer + offset, &timestamp, 3);
+        offset += 3;
+        
+        // Message length
+        uint32_t length = htonl(packet->m_nBodySize);
+        memcpy(buffer + offset, &length, 3);
+        offset += 3;
+        
+        // Message type
+        buffer[offset++] = packet->m_packetType;
+    } else if (packet->m_headerType == RTMP_CHUNK_TYPE_2) {
+        // Timestamp delta only
+        uint32_t timestamp = htonl(packet->m_nTimeStamp);
+        memcpy(buffer + offset, &timestamp, 3);
+        offset += 3;
+    }
+    
+    // Write packet body in chunks
+    size_t remaining = packet->m_nBodySize;
+    size_t body_offset = 0;
+    
+    while (remaining > 0) {
+        size_t chunk_size = remaining > chunk_context.chunk_size ? 
+                           chunk_context.chunk_size : remaining;
+        
+        if (offset + chunk_size > buffer_size) {
+            rtmp_diagnostic_log("Buffer overflow while serializing chunk");
+            return 0;
         }
         
-        timestamp = extended_timestamp;
-        offset += 4;
-    }
-    
-    // Update timestamp
-    if (chunk_type != RTMP_CHUNK_TYPE_0) {
-        timestamp += chunk_stream->timestamp;
-    }
-    chunk_stream->timestamp = timestamp;
-    
-    // Calculate chunk data size
-    size_t chunk_data_size = chunk_stream->msg_length - chunk_stream->msg_data_pos;
-    if (chunk_data_size > session->in_chunk_size) {
-        chunk_data_size = session->in_chunk_size;
-    }
-    
-    if (offset + chunk_data_size > size) return 0;
-    
-    // Allocate message data if needed
-    if (!chunk_stream->msg_data) {
-        chunk_stream->msg_data = (uint8_t*)malloc(chunk_stream->msg_length);
-        if (!chunk_stream->msg_data) return (size_t)-1;
-        chunk_stream->msg_data_pos = 0;
-    }
-    
-    // Copy chunk data
-    memcpy(chunk_stream->msg_data + chunk_stream->msg_data_pos,
-           data + offset,
-           chunk_data_size);
-    
-    chunk_stream->msg_data_pos += chunk_data_size;
-    offset += chunk_data_size;
-    
-    // Check if message is complete
-    if (chunk_stream->msg_data_pos >= chunk_stream->msg_length) {
-        // Fill chunk structure
-        chunk->chunk_type = chunk_type;
-        chunk->chunk_stream_id = chunk_stream_id;
-        chunk->timestamp = chunk_stream->timestamp;
-        chunk->msg_length = chunk_stream->msg_length;
-        chunk->msg_type_id = chunk_stream->msg_type_id;
-        chunk->msg_stream_id = chunk_stream->msg_stream_id;
-        chunk->msg_data = chunk_stream->msg_data;
-        
-        // Reset chunk stream
-        chunk_stream->msg_data = NULL;
-        chunk_stream->msg_data_pos = 0;
-    } else {
-        // Message not complete yet
-        chunk->msg_data = NULL;
+        memcpy(buffer + offset, packet->m_body + body_offset, chunk_size);
+        offset += chunk_size;
+        body_offset += chunk_size;
+        remaining -= chunk_size;
     }
     
     return offset;
 }
 
-int rtmp_chunk_write(rtmp_session_t *session, const rtmp_chunk_t *chunk) {
-    if (!session || !chunk) return -1;
+RTMPPacket* rtmp_chunk_parse(const uint8_t *buffer, size_t size) {
+    if (!buffer || size < 1) return NULL;
     
-    uint8_t header[RTMP_CHUNK_MAX_HEADER_SIZE];
-    size_t header_size = 0;
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    // Write basic header
-    size_t basic_header_size = rtmp_chunk_create_basic_header(chunk->chunk_type,
-                                                            chunk->chunk_stream_id,
-                                                            header);
-    header_size += basic_header_size;
+    size_t offset = 0;
     
-    // Write message header
-    switch (chunk->chunk_type) {
-        case RTMP_CHUNK_TYPE_0: {
-            uint32_t timestamp = chunk->timestamp >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp;
-            uint32_t be_timestamp = RTMP_HTON24(timestamp);
-            uint32_t be_length = RTMP_HTON24(chunk->msg_length);
-            uint32_t be_stream_id = RTMP_HTONL(chunk->msg_stream_id);
-            
-            memcpy(header + header_size, &be_timestamp, 3);
-            memcpy(header + header_size + 3, &be_length, 3);
-            header[header_size + 6] = chunk->msg_type_id;
-            memcpy(header + header_size + 7, &be_stream_id, 4);
-            header_size += 11;
-            break;
+    // Parse basic header
+    uint8_t basic_header = buffer[offset++];
+    packet->m_headerType = (basic_header >> 6) & 0x03;
+    uint32_t chunk_stream_id = basic_header & 0x3F;
+    
+    if (chunk_stream_id == 0) {
+        if (size < offset + 1) {
+            free(packet);
+            return NULL;
+        }
+        chunk_stream_id = buffer[offset++] + 64;
+    } else if (chunk_stream_id == 1) {
+        if (size < offset + 2) {
+            free(packet);
+            return NULL;
+        }
+        chunk_stream_id = (buffer[offset] + 64) + (buffer[offset+1] << 8);
+        offset += 2;
+    }
+    
+    packet->m_nChannel = chunk_stream_id;
+    ChunkStreamState *state = &chunk_context.streams[chunk_stream_id % RTMP_MAX_CHUNK_STREAMS];
+    
+    // Parse message header
+    if (packet->m_headerType == RTMP_CHUNK_TYPE_0) {
+        if (size < offset + 11) {
+            free(packet);
+            return NULL;
         }
         
-        case RTMP_CHUNK_TYPE_1: {
-            uint32_t timestamp = chunk->timestamp >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp;
-            uint32_t be_timestamp = RTMP_HTON24(timestamp);
-            uint32_t be_length = RTMP_HTON24(chunk->msg_length);
-            
-            memcpy(header + header_size, &be_timestamp, 3);
-            memcpy(header + header_size + 3, &be_length, 3);
-            header[header_size + 6] = chunk->msg_type_id;
-            header_size += 7;
-            break;
+        // Full header
+        memcpy(&packet->m_nTimeStamp, buffer + offset, 4);
+        packet->m_nTimeStamp = ntohl(packet->m_nTimeStamp);
+        offset += 4;
+        
+        uint32_t message_length;
+        memcpy(&message_length, buffer + offset, 3);
+        message_length = ntohl(message_length >> 8);
+        packet->m_nBodySize = message_length;
+        offset += 3;
+        
+        packet->m_packetType = buffer[offset++];
+        
+        memcpy(&packet->m_nInfoField2, buffer + offset, 4);
+        packet->m_nInfoField2 = ntohl(packet->m_nInfoField2);
+        offset += 4;
+        
+        // Update state
+        state->timestamp = packet->m_nTimeStamp;
+        state->message_length = packet->m_nBodySize;
+        state->message_type = packet->m_packetType;
+        state->stream_id = packet->m_nInfoField2;
+        
+    } else if (packet->m_headerType == RTMP_CHUNK_TYPE_1) {
+        if (size < offset + 7) {
+            free(packet);
+            return NULL;
         }
         
-        case RTMP_CHUNK_TYPE_2: {
-            uint32_t timestamp = chunk->timestamp >= 0xFFFFFF ? 0xFFFFFF : chunk->timestamp;
-            uint32_t be_timestamp = RTMP_HTON24(timestamp);
-            memcpy(header + header_size, &be_timestamp, 3);
-            header_size += 3;
-            break;
+        // Delta + message type + stream ID
+        uint32_t timestamp_delta;
+        memcpy(&timestamp_delta, buffer + offset, 3);
+        timestamp_delta = ntohl(timestamp_delta >> 8);
+        packet->m_nTimeStamp = state->timestamp + timestamp_delta;
+        offset += 3;
+        
+        uint32_t message_length;
+        memcpy(&message_length, buffer + offset, 3);
+        message_length = ntohl(message_length >> 8);
+        packet->m_nBodySize = message_length;
+        offset += 3;
+        
+        packet->m_packetType = buffer[offset++];
+        packet->m_nInfoField2 = state->stream_id;
+        
+        // Update state
+        state->timestamp = packet->m_nTimeStamp;
+        state->message_length = packet->m_nBodySize;
+        state->message_type = packet->m_packetType;
+        
+    } else if (packet->m_headerType == RTMP_CHUNK_TYPE_2) {
+        if (size < offset + 3) {
+            free(packet);
+            return NULL;
         }
-    }
-    
-    // Write extended timestamp if needed
-    if (chunk->timestamp >= 0xFFFFFF) {
-        uint32_t be_timestamp = RTMP_HTONL(chunk->timestamp);
-        memcpy(header + header_size, &be_timestamp, 4);
-        header_size += 4;
-    }
-    
-    // Send header
-    if (rtmp_session_send_data(session, header, header_size) < 0) {
-        return -1;
-    }
-    
-    // Send chunk data
-    if (chunk->msg_data && chunk->msg_length > 0) {
-        size_t offset = 0;
-        while (offset < chunk->msg_length) {
-            size_t remaining = chunk->msg_length - offset;
-            size_t chunk_size = remaining > session->out_chunk_size ? 
-                              session->out_chunk_size : remaining;
-            
-            if (rtmp_session_send_data(session, chunk->msg_data + offset, chunk_size) < 0) {
-                return -1;
-            }
-            
-            offset += chunk_size;
-            
-            // If more data remains, send continuation chunks
-            if (offset < chunk->msg_length) {
-                uint8_t continuation_header;
-                rtmp_chunk_create_basic_header(RTMP_CHUNK_TYPE_3,
-                                           chunk->chunk_stream_id,
-                                           &continuation_header);
-                
-                if (rtmp_session_send_data(session, &continuation_header, 1) < 0) {
-                    return -1;
-                }
-            }
-        }
-    }
-    
-    return 0;
-}
-
-size_t rtmp_chunk_get_header_size(uint8_t chunk_type) {
-    switch (chunk_type) {
-        case RTMP_CHUNK_TYPE_0:
-            return 11;
-        case RTMP_CHUNK_TYPE_1:
-            return 7;
-        case RTMP_CHUNK_TYPE_2:
-            return 3;
-        case RTMP_CHUNK_TYPE_3:
-            return 0;
-        default:
-            return 0;
-    }
-}
-
-size_t rtmp_chunk_parse_basic_header(const uint8_t *data, size_t size,
-                                   uint8_t *chunk_type, uint32_t *chunk_stream_id) {
-    if (!data || !size || !chunk_type || !chunk_stream_id) return 0;
-    
-    uint8_t fmt = (data[0] >> 6) & 0x03;
-    uint32_t csid = data[0] & 0x3F;
-    
-    size_t header_size = 1;
-    
-    if (csid == 0) {
-        if (size < 2) return 0;
-        csid = data[1] + 64;
-        header_size = 2;
-    } else if (csid == 1) {
-        if (size < 3) return 0;
-        csid = (data[2] << 8) + data[1] + 64;
-        header_size = 3;
-    }
-    
-    *chunk_type = fmt;
-    *chunk_stream_id = csid;
-    
-    return header_size;
-}
-
-int rtmp_chunk_create_basic_header(uint8_t chunk_type, uint32_t chunk_stream_id, uint8_t *out) {
-    if (!out) return -1;
-    
-    if (chunk_stream_id >= 64 + 255) {
-        out[0] = (chunk_type << 6) | 1;
-        chunk_stream_id -= 64;
-        out[1] = chunk_stream_id & 0xFF;
-        out[2] = (chunk_stream_id >> 8) & 0xFF;
-        return 3;
-    } else if (chunk_stream_id >= 64) {
-        out[0] = (chunk_type << 6) | 0;
-        out[1] = chunk_stream_id - 64;
-        return 2;
+        
+        // Delta only
+        uint32_t timestamp_delta;
+        memcpy(&timestamp_delta, buffer + offset, 3);
+        timestamp_delta = ntohl(timestamp_delta >> 8);
+        packet->m_nTimeStamp = state->timestamp + timestamp_delta;
+        offset += 3;
+        
+        packet->m_nBodySize = state->message_length;
+        packet->m_packetType = state->message_type;
+        packet->m_nInfoField2 = state->stream_id;
+        
+        // Update state
+        state->timestamp = packet->m_nTimeStamp;
+        
     } else {
-        out[0] = (chunk_type << 6) | chunk_stream_id;
-        return 1;
+        // No header, use saved state
+        packet->m_nTimeStamp = state->timestamp;
+        packet->m_nBodySize = state->message_length;
+        packet->m_packetType = state->message_type;
+        packet->m_nInfoField2 = state->stream_id;
     }
+    
+    // Read packet body
+    if (packet->m_nBodySize > 0) {
+        packet->m_body = (uint8_t*)malloc(packet->m_nBodySize);
+        if (!packet->m_body) {
+            free(packet);
+            return NULL;
+        }
+        
+        size_t remaining = packet->m_nBodySize;
+        size_t body_offset = 0;
+        
+        while (remaining > 0 && offset < size) {
+            size_t chunk_size = remaining > chunk_context.chunk_size ? 
+                               chunk_context.chunk_size : remaining;
+            
+            if (offset + chunk_size > size) {
+                chunk_size = size - offset;
+            }
+            
+            memcpy(packet->m_body + body_offset, buffer + offset, chunk_size);
+            offset += chunk_size;
+            body_offset += chunk_size;
+            remaining -= chunk_size;
+        }
+        
+        if (remaining > 0) {
+            free(packet->m_body);
+            free(packet);
+            return NULL;
+        }
+    }
+    
+    return packet;
 }
 
-int rtmp_chunk_read_extended_timestamp(const uint8_t *data, size_t size, uint32_t *timestamp) {
-    if (!data || size < 4 || !timestamp) return -1;
-    
-    memcpy(timestamp, data, 4);
-    *timestamp = RTMP_NTOHL(*timestamp);
-    
-    return 0;
+void rtmp_packet_free(RTMPPacket *packet) {
+    if (!packet) return;
+    free(packet->m_body);
+    free(packet);
 }
 
-int rtmp_chunk_write_extended_timestamp(uint8_t *data, uint32_t timestamp) {
-    if (!data) return -1;
-    
-    uint32_t be_timestamp = RTMP_HTONL(timestamp);
-    memcpy(data, &be_timestamp, 4);
-    
-    return 0;
+void rtmp_chunk_reset_stream(uint32_t chunk_stream_id) {
+    if (chunk_stream_id >= RTMP_MAX_CHUNK_STREAMS) return;
+    memset(&chunk_context.streams[chunk_stream_id], 0, sizeof(ChunkStreamState));
+}
+
+void rtmp_chunk_reset_all(void) {
+    memset(chunk_context.streams, 0, sizeof(chunk_context.streams));
+    chunk_context.chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
 }

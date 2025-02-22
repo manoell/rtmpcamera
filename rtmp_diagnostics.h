@@ -1,56 +1,39 @@
 #ifndef RTMP_DIAGNOSTICS_H
 #define RTMP_DIAGNOSTICS_H
 
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-// Níveis de log
-typedef enum {
-    LOG_DEBUG = 0,
-    LOG_INFO,
-    LOG_WARN,
-    LOG_ERROR
-} log_level_t;
-
-// Eventos de diagnóstico
-typedef enum {
-    EVENT_STREAM_START,
-    EVENT_STREAM_STOP,
-    EVENT_QUALITY_CHANGE,
-    EVENT_FAILOVER,
-    EVENT_ERROR
-} diagnostic_event_t;
-
-// Configuração de diagnóstico
+// Log message structure
 typedef struct {
-    log_level_t min_log_level;
-    bool qos_enabled;
-    bool failover_enabled;
-    uint32_t buffer_size;
-} diagnostic_config_t;
+    const char *timestamp;
+    const char *message;
+    int level;
+} RTMPLogMessage;
 
-// Estatísticas de diagnóstico
-typedef struct {
-    uint32_t total_logs;
-    uint32_t error_count;
-    uint64_t bytes_transmitted;
-    uint32_t peak_bandwidth;
-} diagnostic_stats_t;
+// Log callback function type
+typedef void (*rtmp_log_callback_t)(const RTMPLogMessage *message, void *context);
 
-// Estatísticas de rede
-typedef struct {
-    float bandwidth_mbps;
-    uint32_t latency_ms;
-    float packet_loss;
-} network_stats_t;
+// Initialize diagnostic system
+void rtmp_diagnostic_init(void);
 
-// Funções principais
-bool rtmp_diagnostics_init(const char *log_path, diagnostic_config_t config);
-void rtmp_diagnostics_log(log_level_t level, const char *format, ...);
-void rtmp_diagnostics_update_stream_stats(const stream_stats_t *stats);
-void rtmp_diagnostics_update_network_stats(const network_stats_t *stats);
-void rtmp_diagnostics_record_event(diagnostic_event_t event, const char *details);
-diagnostic_stats_t rtmp_diagnostics_get_stats(void);
-void rtmp_diagnostics_shutdown(void);
+// Set log callback
+void rtmp_diagnostic_set_callback(rtmp_log_callback_t callback, void *context);
+
+// Set log file
+bool rtmp_diagnostic_set_log_file(const char *filename);
+
+// Set log level
+void rtmp_diagnostic_set_level(int level);
+
+// Log functions
+void rtmp_diagnostic_log(const char *format, ...);
+void rtmp_diagnostic_debug(const char *format, ...);
+void rtmp_diagnostic_info(const char *format, ...);
+void rtmp_diagnostic_warning(const char *format, ...);
+void rtmp_diagnostic_error(const char *format, ...);
+
+// Cleanup diagnostic system
+void rtmp_diagnostic_cleanup(void);
 
 #endif // RTMP_DIAGNOSTICS_H

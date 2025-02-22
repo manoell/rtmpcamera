@@ -1,60 +1,52 @@
-TARGET := iphone:clang:latest:7.0
+TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = SpringBoard
+
+ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = RTMPCamera
 
-# Lista completa de arquivos fonte
-RTMPCamera_FILES = \
-	rtmp_amf.c \
-	rtmp_camera_compat.m \
-	rtmp_chunk.c \
-	rtmp_commands.c \
-	rtmp_core.c \
-	rtmp_failover.c \
-	rtmp_handshake.c \
-	rtmp_preview.m \
-	rtmp_protocol.c \
-	rtmp_quality.c \
-	rtmp_server_integration.c \
-	rtmp_stream.c \
-	rtmp_utils.c \
-	RTMPCameraTweak.xm
+$(TWEAK_NAME)_FILES = ./control \
+    Filter.plist \
+    rtmp_amf.c \
+    rtmp_amf.h \
+    rtmp_camera_compat.h \
+    rtmp_camera_compat.m \
+    rtmp_chunk.c \
+    rtmp_chunk.h \
+    rtmp_commands.c \
+    rtmp_commands.h \
+    rtmp_compatibility.m \
+    rtmp_core.c \
+    rtmp_core.h \
+    rtmp_diagnostics.c \
+    rtmp_diagnostics.h \
+    rtmp_failover.c \
+    rtmp_failover.h \
+    rtmp_handshake.c \
+    rtmp_handshake.h \
+    rtmp_preview.h \
+    rtmp_preview.m \
+    rtmp_protocol.c \
+    rtmp_protocol.h \
+    rtmp_quality.c \
+    rtmp_quality.h \
+    rtmp_server_integration.c \
+    rtmp_server_integration.h \
+    rtmp_session.c \
+    rtmp_session.h \
+    rtmp_stability.c \
+    rtmp_stability.h \
+    rtmp_stream.c \
+    rtmp_stream.h \
+    rtmp_utils.c \
+    rtmp_utils.h \
+    RTMPCameraTweak.xm
 
-# Frameworks necessários
-RTMPCamera_FRAMEWORKS = UIKit AVFoundation CoreMedia VideoToolbox
-RTMPCamera_PRIVATE_FRAMEWORKS = MediaToolbox
-
-# Bibliotecas extras
-RTMPCamera_LIBRARIES = ssl crypto
-
-# Flags de compilação otimizadas
-RTMPCamera_CFLAGS = -O2 -fno-strict-aliasing
-RTMPCamera_CCFLAGS = -O2 -fno-strict-aliasing
-RTMPCamera_OBJCFLAGS = -fobjc-arc
-
-# Diretórios de inclusão
-RTMPCamera_INCLUDE_DIRS = include
-
-# Definições
-RTMPCamera_DEFINES = RTMP_CAMERA_VERSION=\"1.0.0\"
-
-# Configuração de instalação
-PACKAGE_VERSION = $(THEOS_PACKAGE_VERSION)
-PACKAGE_BUILDNAME ?= debug
-
-ifeq ($(PACKAGE_BUILDNAME), release)
-	RTMPCamera_CFLAGS += -DNDEBUG
-	RTMPCamera_CCFLAGS += -DNDEBUG
-	RTMPCamera_OBJCFLAGS += -DNDEBUG
-else
-	RTMPCamera_CFLAGS += -DDEBUG
-	RTMPCamera_CCFLAGS += -DDEBUG
-	RTMPCamera_OBJCFLAGS += -DDEBUG
-endif
-
-after-install::
-	install.exec "killall -9 SpringBoard"
+$(TWEAK_NAME)_CFLAGS = -fobjc-arc
+$(TWEAK_NAME)_CCFLAGS = -std=c11
+$(TWEAK_NAME)_FRAMEWORKS = Foundation AVFoundation UIKit CoreMedia CoreVideo
+$(TWEAK_NAME)_PRIVATE_FRAMEWORKS = MediaToolbox
 
 include $(THEOS_MAKE_PATH)/tweak.mk

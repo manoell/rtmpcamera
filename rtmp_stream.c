@@ -1,297 +1,270 @@
-#include <string.h>
-#include <stdlib.h>
-#include <pthread.h>
 #include "rtmp_stream.h"
+#include "rtmp_core.h"
+#include "rtmp_quality.h"
+#include "rtmp_chunk.h"
 #include "rtmp_diagnostics.h"
+#include <string.h>
+#include <pthread.h>
+#include <sys/time.h>
 
-// Buffer circular para frames
-struct frame_buffer {
-    video_frame_t *frames;
+#define STREAM_BUFFER_SIZE (1024 * 1024)  // 1MB buffer
+#define MAX_QUEUE_SIZE 60  // Maximum frames to queue
+#define MIN_BUFFER_TIME 100  // Minimum buffer in milliseconds
+#define MAX_BUFFER_TIME 2000 // Maximum buffer in milliseconds
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    int64_t timestamp;
+    bool is_keyframe;
+} StreamFrame;
+
+typedef struct {
+    StreamFrame *frames;
     int head;
     int tail;
-    int size;
-    pthread_mutex_t lock;
+    int count;
+    pthread_mutex_t mutex;
     pthread_cond_t cond;
-};
+} FrameQueue;
 
-// Estrutura principal do stream
-struct rtmp_stream {
-    // Configuração
-    stream_config_t config;
+struct RTMPStream {
+    // Connection properties
+    char url[256];
+    bool connected;
+    bool running;
     
-    // Estado
-    bool is_connected;
-    bool is_running;
-    uint32_t current_bitrate;
-    uint32_t current_fps;
+    // Video properties
+    uint32_t video_width;
+    uint32_t video_height;
+    uint32_t video_fps;
+    uint32_t video_bitrate;
+    uint32_t video_quality;
     
-    // Buffer de frames
-    struct frame_buffer *buffer;
+    // Buffer management
+    uint8_t *stream_buffer;
+    size_t buffer_size;
+    size_t buffer_position;
     
-    // Estatísticas
-    stream_stats_t stats;
-    uint32_t last_stats_update;
+    // Frame queue
+    FrameQueue frame_queue;
+    
+    // Threading
+    pthread_t stream_thread;
+    pthread_mutex_t stream_mutex;
+    
+    // Statistics
+    struct {
+        uint32_t current_fps;
+        uint32_t current_bitrate;
+        uint32_t buffer_ms;
+        uint32_t quality_percent;
+        uint32_t dropped_frames;
+        struct timeval last_stats_update;
+    } stats;
     
     // Callbacks
-    frame_callback_t frame_callback;
-    status_callback_t status_callback;
-    void *callback_ctx;
-    
-    // Threads e sincronização
-    pthread_t process_thread;
-    pthread_mutex_t lock;
+    rtmp_stream_callback_t event_callback;
+    void *callback_context;
 };
 
-// Inicialização do buffer
-static struct frame_buffer *frame_buffer_create(int size) {
-    struct frame_buffer *buffer = calloc(1, sizeof(struct frame_buffer));
-    if (!buffer) return NULL;
-    
-    buffer->frames = calloc(size, sizeof(video_frame_t));
-    if (!buffer->frames) {
-        free(buffer);
-        return NULL;
-    }
-    
-    buffer->size = size;
-    pthread_mutex_init(&buffer->lock, NULL);
-    pthread_cond_init(&buffer->cond, NULL);
-    
-    return buffer;
+static void init_frame_queue(FrameQueue *queue) {
+    queue->frames = (StreamFrame*)calloc(MAX_QUEUE_SIZE, sizeof(StreamFrame));
+    queue->head = queue->tail = queue->count = 0;
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
 }
 
-// Liberação do buffer
-static void frame_buffer_destroy(struct frame_buffer *buffer) {
-    if (!buffer) return;
-    
-    pthread_mutex_lock(&buffer->lock);
-    
-    for (int i = 0; i < buffer->size; i++) {
-        if (buffer->frames[i].data) {
-            free(buffer->frames[i].data);
-        }
+static void destroy_frame_queue(FrameQueue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+        free(queue->frames[i].data);
     }
-    
-    free(buffer->frames);
-    
-    pthread_mutex_unlock(&buffer->lock);
-    pthread_mutex_destroy(&buffer->lock);
-    pthread_cond_destroy(&buffer->cond);
-    
-    free(buffer);
+    free(queue->frames);
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
 }
 
-// Thread de processamento
-static void *process_thread(void *arg) {
-    rtmp_stream_t *stream = (rtmp_stream_t *)arg;
-    uint32_t frame_interval = 1000 / stream->config.target_fps;
-    uint32_t last_frame_time = 0;
+static bool enqueue_frame(FrameQueue *queue, const uint8_t *data, size_t size, int64_t timestamp, bool is_keyframe) {
+    pthread_mutex_lock(&queue->mutex);
     
-    while (stream->is_running) {
-        uint32_t current_time = get_timestamp();
-        
-        // Controle de FPS
-        if (current_time - last_frame_time < frame_interval) {
-            usleep(1000); // 1ms
-            continue;
-        }
-        
-        pthread_mutex_lock(&stream->buffer->lock);
-        
-        // Verifica se há frames disponíveis
-        if (stream->buffer->head != stream->buffer->tail) {
-            video_frame_t *frame = &stream->buffer->frames[stream->buffer->tail];
+    if (queue->count >= MAX_QUEUE_SIZE) {
+        pthread_mutex_unlock(&queue->mutex);
+        return false;
+    }
+    
+    StreamFrame *frame = &queue->frames[queue->tail];
+    frame->data = (uint8_t*)malloc(size);
+    memcpy(frame->data, data, size);
+    frame->size = size;
+    frame->timestamp = timestamp;
+    frame->is_keyframe = is_keyframe;
+    
+    queue->tail = (queue->tail + 1) % MAX_QUEUE_SIZE;
+    queue->count++;
+    
+    pthread_cond_signal(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+    return true;
+}
+
+static bool dequeue_frame(FrameQueue *queue, StreamFrame *frame) {
+    pthread_mutex_lock(&queue->mutex);
+    
+    while (queue->count == 0) {
+        pthread_cond_wait(&queue->cond, &queue->mutex);
+    }
+    
+    StreamFrame *src_frame = &queue->frames[queue->head];
+    frame->data = src_frame->data;
+    frame->size = src_frame->size;
+    frame->timestamp = src_frame->timestamp;
+    frame->is_keyframe = src_frame->is_keyframe;
+    
+    src_frame->data = NULL;  // Ownership transferred
+    
+    queue->head = (queue->head + 1) % MAX_QUEUE_SIZE;
+    queue->count--;
+    
+    pthread_mutex_unlock(&queue->mutex);
+    return true;
+}
+
+static void *stream_thread_func(void *arg) {
+    RTMPStream *stream = (RTMPStream*)arg;
+    StreamFrame frame;
+    
+    while (stream->running) {
+        if (dequeue_frame(&stream->frame_queue, &frame)) {
+            pthread_mutex_lock(&stream->stream_mutex);
             
-            // Processa frame
-            if (stream->frame_callback) {
-                stream->frame_callback(frame, stream->callback_ctx);
-            }
-            
-            // Atualiza estatísticas
-            stream->stats.total_frames++;
-            stream->stats.current_fps = stream->current_fps;
-            stream->stats.buffer_usage = (float)(stream->buffer->head - stream->buffer->tail) / 
-                                       stream->buffer->size;
-            
-            // Atualiza ponteiros
-            stream->buffer->tail = (stream->buffer->tail + 1) % stream->buffer->size;
-            last_frame_time = current_time;
-            
-            // Notifica status se necessário 
-            if (current_time - stream->last_stats_update >= 1000) {
-                if (stream->status_callback) {
-                    stream->status_callback(stream->stats, stream->callback_ctx);
+            // Process frame
+            if (stream->buffer_position + frame.size <= STREAM_BUFFER_SIZE) {
+                memcpy(stream->stream_buffer + stream->buffer_position, frame.data, frame.size);
+                stream->buffer_position += frame.size;
+                
+                // Update statistics
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                int64_t time_diff = (now.tv_sec - stream->stats.last_stats_update.tv_sec) * 1000 +
+                                  (now.tv_usec - stream->stats.last_stats_update.tv_usec) / 1000;
+                
+                if (time_diff >= 1000) {  // Update stats every second
+                    stream->stats.current_bitrate = (uint32_t)((stream->buffer_position * 8 * 1000) / time_diff);
+                    stream->stats.buffer_ms = (uint32_t)((stream->buffer_position * 1000) / stream->video_bitrate);
+                    stream->stats.last_stats_update = now;
+                    stream->buffer_position = 0;
                 }
-                stream->last_stats_update = current_time;
             }
+            
+            // Notify event
+            if (stream->event_callback) {
+                RTMPStreamEvent event = {
+                    .type = RTMP_EVENT_FRAME_PROCESSED,
+                    .timestamp = frame.timestamp,
+                    .data = frame.data,
+                    .data_size = frame.size
+                };
+                stream->event_callback(&event, stream->callback_context);
+            }
+            
+            pthread_mutex_unlock(&stream->stream_mutex);
+            free(frame.data);
         }
-        
-        pthread_mutex_unlock(&stream->buffer->lock);
     }
     
     return NULL;
 }
 
-rtmp_stream_t *rtmp_stream_create(const stream_config_t *config) {
-    rtmp_stream_t *stream = calloc(1, sizeof(rtmp_stream_t));
+RTMPStream* rtmp_stream_create(const char *url) {
+    RTMPStream *stream = (RTMPStream*)calloc(1, sizeof(RTMPStream));
     if (!stream) return NULL;
     
-    // Configura com valores padrão ou fornecidos
-    if (config) {
-        stream->config = *config;
-    } else {
-        stream->config.width = 1920;
-        stream->config.height = 1080;
-        stream->config.target_fps = 30;
-        stream->config.initial_bitrate = 4000000; // 4 Mbps
-        stream->config.buffer_size = STREAM_BUFFER_SIZE;
-        stream->config.hardware_acceleration = true;
-        stream->config.is_local_network = true;
-    }
+    strncpy(stream->url, url, sizeof(stream->url) - 1);
+    stream->stream_buffer = (uint8_t*)malloc(STREAM_BUFFER_SIZE);
     
-    // Inicializa buffer
-    stream->buffer = frame_buffer_create(MAX_QUEUE_SIZE);
-    if (!stream->buffer) {
-        free(stream);
-        return NULL;
-    }
+    init_frame_queue(&stream->frame_queue);
+    pthread_mutex_init(&stream->stream_mutex, NULL);
     
-    // Inicializa mutex
-    pthread_mutex_init(&stream->lock, NULL);
-    
-    // Configura estado inicial
-    stream->current_bitrate = stream->config.initial_bitrate;
-    stream->current_fps = stream->config.target_fps;
-    
-    rtmp_diagnostics_log(LOG_INFO, "Stream criado com sucesso - %dx%d @%dfps",
-                        stream->config.width, stream->config.height, stream->config.target_fps);
+    gettimeofday(&stream->stats.last_stats_update, NULL);
     
     return stream;
 }
 
-int rtmp_stream_connect(rtmp_stream_t *stream, const char *url) {
-    if (!stream || !url) return -1;
-    
-    pthread_mutex_lock(&stream->lock);
-    
-    if (stream->is_connected) {
-        pthread_mutex_unlock(&stream->lock);
-        return 0;
-    }
-    
-    // Inicia thread de processamento
-    stream->is_running = true;
-    if (pthread_create(&stream->process_thread, NULL, process_thread, stream) != 0) {
-        rtmp_diagnostics_log(LOG_ERROR, "Falha ao criar thread de processamento");
-        pthread_mutex_unlock(&stream->lock);
-        return -1;
-    }
-    
-    stream->is_connected = true;
-    rtmp_diagnostics_log(LOG_INFO, "Conectado ao servidor RTMP: %s", url);
-    
-    pthread_mutex_unlock(&stream->lock);
-    return 0;
-}
-
-void rtmp_stream_disconnect(rtmp_stream_t *stream) {
+void rtmp_stream_destroy(RTMPStream *stream) {
     if (!stream) return;
     
-    pthread_mutex_lock(&stream->lock);
+    stream->running = false;
+    pthread_join(stream->stream_thread, NULL);
     
-    if (stream->is_connected) {
-        stream->is_running = false;
-        pthread_join(stream->process_thread, NULL);
-        stream->is_connected = false;
-        
-        rtmp_diagnostics_log(LOG_INFO, "Desconectado do servidor RTMP");
-    }
+    destroy_frame_queue(&stream->frame_queue);
+    pthread_mutex_destroy(&stream->stream_mutex);
     
-    pthread_mutex_unlock(&stream->lock);
-}
-
-video_frame_t *rtmp_stream_get_next_frame(rtmp_stream_t *stream) {
-    if (!stream || !stream->is_connected) return NULL;
-    
-    pthread_mutex_lock(&stream->buffer->lock);
-    
-    // Aguarda frame disponível
-    while (stream->buffer->head == stream->buffer->tail && stream->is_running) {
-        pthread_cond_wait(&stream->buffer->cond, &stream->buffer->lock);
-    }
-    
-    if (!stream->is_running) {
-        pthread_mutex_unlock(&stream->buffer->lock);
-        return NULL;
-    }
-    
-    video_frame_t *frame = &stream->buffer->frames[stream->buffer->tail];
-    stream->buffer->tail = (stream->buffer->tail + 1) % stream->buffer->size;
-    
-    pthread_mutex_unlock(&stream->buffer->lock);
-    return frame;
-}
-
-int rtmp_stream_queue_frame(rtmp_stream_t *stream, const uint8_t *data, size_t length, uint32_t timestamp) {
-    if (!stream || !data || !length) return -1;
-    
-    pthread_mutex_lock(&stream->buffer->lock);
-    
-    // Verifica overflow
-    if (((stream->buffer->head + 1) % stream->buffer->size) == stream->buffer->tail) {
-        stream->stats.dropped_frames++;
-        pthread_mutex_unlock(&stream->buffer->lock);
-        return -1;
-    }
-    
-    // Copia frame
-    video_frame_t *frame = &stream->buffer->frames[stream->buffer->head];
-    frame->data = malloc(length);
-    if (!frame->data) {
-        pthread_mutex_unlock(&stream->buffer->lock);
-        return -1;
-    }
-    
-    memcpy(frame->data, data, length);
-    frame->length = length;
-    frame->timestamp = timestamp;
-    frame->is_keyframe = (data[0] & 0xf0) == 0x10;
-    
-    stream->buffer->head = (stream->buffer->head + 1) % stream->buffer->size;
-    pthread_cond_signal(&stream->buffer->cond);
-    
-    pthread_mutex_unlock(&stream->buffer->lock);
-    return 0;
-}
-
-void rtmp_stream_set_bitrate(rtmp_stream_t *stream, uint32_t bitrate) {
-    if (!stream) return;
-    
-    pthread_mutex_lock(&stream->lock);
-    stream->current_bitrate = bitrate;
-    stream->stats.target_bitrate = bitrate;
-    pthread_mutex_unlock(&stream->lock);
-}
-
-stream_stats_t rtmp_stream_get_stats(rtmp_stream_t *stream) {
-    stream_stats_t stats = {0};
-    if (!stream) return stats;
-    
-    pthread_mutex_lock(&stream->lock);
-    stats = stream->stats;
-    pthread_mutex_unlock(&stream->lock);
-    
-    return stats;
-}
-
-void rtmp_stream_destroy(rtmp_stream_t *stream) {
-    if (!stream) return;
-    
-    rtmp_stream_disconnect(stream);
-    frame_buffer_destroy(stream->buffer);
-    pthread_mutex_destroy(&stream->lock);
-    
+    free(stream->stream_buffer);
     free(stream);
+}
+
+bool rtmp_stream_start(RTMPStream *stream) {
+    if (!stream || stream->running) return false;
     
-    rtmp_diagnostics_log(LOG_INFO, "Stream destruído");
+    stream->running = true;
+    int result = pthread_create(&stream->stream_thread, NULL, stream_thread_func, stream);
+    
+    if (result != 0) {
+        stream->running = false;
+        return false;
+    }
+    
+    return true;
+}
+
+void rtmp_stream_stop(RTMPStream *stream) {
+    if (!stream || !stream->running) return;
+    stream->running = false;
+}
+
+bool rtmp_stream_push_frame(RTMPStream *stream, const uint8_t *data, size_t size, int64_t timestamp, bool is_keyframe) {
+    if (!stream || !data || size == 0) return false;
+    
+    return enqueue_frame(&stream->frame_queue, data, size, timestamp, is_keyframe);
+}
+
+void rtmp_stream_set_callback(RTMPStream *stream, rtmp_stream_callback_t callback, void *context) {
+    if (!stream) return;
+    
+    pthread_mutex_lock(&stream->stream_mutex);
+    stream->event_callback = callback;
+    stream->callback_context = context;
+    pthread_mutex_unlock(&stream->stream_mutex);
+}
+
+void rtmp_stream_get_stats(RTMPStream *stream, RTMPStreamStats *stats) {
+    if (!stream || !stats) return;
+    
+    pthread_mutex_lock(&stream->stream_mutex);
+    memcpy(stats, &stream->stats, sizeof(RTMPStreamStats));
+    pthread_mutex_unlock(&stream->stream_mutex);
+}
+
+bool rtmp_stream_set_video_params(RTMPStream *stream, uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate) {
+    if (!stream) return false;
+    
+    pthread_mutex_lock(&stream->stream_mutex);
+    stream->video_width = width;
+    stream->video_height = height;
+    stream->video_fps = fps;
+    stream->video_bitrate = bitrate;
+    pthread_mutex_unlock(&stream->stream_mutex);
+    
+    return true;
+}
+
+bool rtmp_stream_is_connected(RTMPStream *stream) {
+    return stream ? stream->connected : false;
+}
+
+void rtmp_stream_set_connected(RTMPStream *stream, bool connected) {
+    if (!stream) return;
+    stream->connected = connected;
 }

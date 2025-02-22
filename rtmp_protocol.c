@@ -1,509 +1,311 @@
 #include "rtmp_protocol.h"
 #include "rtmp_chunk.h"
-#include "rtmp_amf.h"
+#include "rtmp_diagnostics.h"
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <time.h>
+#include <stdio.h>
 
-#define RTMP_VERSION 3
-#define RTMP_CHUNK_SIZE 128
-#define RTMP_WINDOW_ACK_SIZE (2.5 * 1024 * 1024) // 2.5MB
-#define RTMP_DEFAULT_TIMEOUT 5000 // 5 segundos
-#define RTMP_MAX_RETRY 3
+// RTMP message types
+#define RTMP_MSG_SetChunkSize     1
+#define RTMP_MSG_Abort            2
+#define RTMP_MSG_Ack              3
+#define RTMP_MSG_UserControl      4
+#define RTMP_MSG_WindowAckSize    5
+#define RTMP_MSG_SetPeerBandwidth 6
+#define RTMP_MSG_AudioMessage     8
+#define RTMP_MSG_VideoMessage     9
+#define RTMP_MSG_Command         20
+#define RTMP_MSG_DataMessage     18
+#define RTMP_MSG_SharedObject    19
 
-typedef struct {
-    uint32_t timestamp;
-    uint32_t messageLength;
-    uint8_t messageTypeId;
-    uint32_t messageStreamId;
-    uint8_t *payload;
-} RTMPMessage;
+// RTMP user control message types
+#define RTMP_USER_STREAM_BEGIN     0
+#define RTMP_USER_STREAM_EOF       1
+#define RTMP_USER_STREAM_DRY       2
+#define RTMP_USER_SET_BUFFER_LEN   3
+#define RTMP_USER_STREAM_IS_REC    4
+#define RTMP_USER_PING_REQUEST     6
+#define RTMP_USER_PING_RESPONSE    7
 
-typedef struct {
-    uint32_t chunkSize;
-    uint32_t windowAckSize;
-    uint32_t bytesReceived;
-    uint32_t lastAckBytes;
-    uint64_t lastAckTime;
-    uint8_t audioCodec;
-    uint8_t videoCodec;
-    uint32_t streamId;
-    char *appName;
-    char *streamName;
-    RTMPSessionState state;
-    uint32_t retryCount;
-} RTMPProtocolContext;
+// Protocol context
+static struct {
+    uint32_t chunk_size;
+    uint32_t window_size;
+    uint32_t bandwidth;
+    uint32_t stream_id;
+    bool initialized;
+} protocol_context = {
+    .chunk_size = RTMP_DEFAULT_CHUNK_SIZE,
+    .window_size = 2500000,
+    .bandwidth = 2500000,
+    .stream_id = 1,
+    .initialized = false
+};
 
-static void rtmp_message_free(RTMPMessage *msg) {
-    if (msg) {
-        free(msg->payload);
-        free(msg);
-    }
+void rtmp_protocol_init(void) {
+    if (protocol_context.initialized) return;
+    protocol_context.initialized = true;
 }
 
-static int send_error(RTMPSession *session, const char *code, const char *level, const char *desc) {
-    uint8_t response[1024];
-    size_t offset = 0;
+RTMPPacket* rtmp_protocol_create_connect(const char *app, const char *tcUrl) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    // Codificar mensagem de erro em AMF
-    offset += amf_encode_string(response + offset, "onStatus");
-    offset += amf_encode_number(response + offset, 0);
-    offset += amf_encode_null(response + offset);
+    // Create connect command
+    char connect_cmd[1024];
+    snprintf(connect_cmd, sizeof(connect_cmd),
+             "{\"app\":\"%s\",\"flashVer\":\"FMLE/3.0\",\"tcUrl\":\"%s\","
+             "\"type\":\"nonprivate\",\"capabilities\":255}", 
+             app, tcUrl);
     
-    offset += amf_encode_object_start(response + offset);
-    offset += amf_encode_named_string(response + offset, "level", level);
-    offset += amf_encode_named_string(response + offset, "code", code);
-    offset += amf_encode_named_string(response + offset, "description", desc);
-    offset += amf_encode_object_end(response + offset);
+    size_t cmd_len = strlen(connect_cmd);
+    packet->m_body = (uint8_t*)malloc(cmd_len + 1);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
+    }
     
-    return rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, response, offset);
+    memcpy(packet->m_body, connect_cmd, cmd_len + 1);
+    
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_Command;
+    packet->m_nChannel = 3;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = cmd_len;
+    packet->m_nInfoField2 = 0;
+    
+    return packet;
 }
 
-static int handle_connect(RTMPSession *session, RTMPChunk *chunk) {
-    RTMPProtocolContext *ctx = session->protocol;
-    AMFObject *obj = amf_decode(chunk->payload, chunk->header.messageLength);
-    if (!obj) return -1;
+RTMPPacket* rtmp_protocol_create_play(const char *stream_name) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    const char *app = amf_object_get_string(obj, "app");
-    const char *tcUrl = amf_object_get_string(obj, "tcUrl");
+    // Create play command
+    char play_cmd[512];
+    snprintf(play_cmd, sizeof(play_cmd),
+             "{\"command\":\"play\",\"streamName\":\"%s\"}", 
+             stream_name);
     
-    if (!app || !tcUrl) {
-        amf_object_free(obj);
-        return send_error(session, "NetConnection.Connect.Failed", 
-                         "error", "Invalid connect parameters");
+    size_t cmd_len = strlen(play_cmd);
+    packet->m_body = (uint8_t*)malloc(cmd_len + 1);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
     }
     
-    // Armazenar informações da conexão
-    ctx->appName = strdup(app);
+    memcpy(packet->m_body, play_cmd, cmd_len + 1);
     
-    // Preparar resposta
-    uint8_t response[1024];
-    size_t offset = 0;
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_Command;
+    packet->m_nChannel = 8;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = cmd_len;
+    packet->m_nInfoField2 = protocol_context.stream_id;
     
-    // Window Acknowledgement Size
-    uint8_t ackSize[4];
-    uint32_t windowSize = RTMP_WINDOW_ACK_SIZE;
-    ackSize[0] = (windowSize >> 24) & 0xFF;
-    ackSize[1] = (windowSize >> 16) & 0xFF;
-    ackSize[2] = (windowSize >> 8) & 0xFF;
-    ackSize[3] = windowSize & 0xFF;
-    rtmp_send_message(session, RTMP_MSG_WINDOW_ACK_SIZE, 0, ackSize, 4);
-    
-    // Set Peer Bandwidth
-    uint8_t peerBw[5];
-    peerBw[0] = (windowSize >> 24) & 0xFF;
-    peerBw[1] = (windowSize >> 16) & 0xFF;
-    peerBw[2] = (windowSize >> 8) & 0xFF;
-    peerBw[3] = windowSize & 0xFF;
-    peerBw[4] = 2; // Dynamic
-    rtmp_send_message(session, RTMP_MSG_SET_PEER_BW, 0, peerBw, 5);
-    
-    // Set Chunk Size
-    uint8_t chunkSizeMsg[4];
-    uint32_t newChunkSize = RTMP_CHUNK_SIZE;
-    chunkSizeMsg[0] = (newChunkSize >> 24) & 0xFF;
-    chunkSizeMsg[1] = (newChunkSize >> 16) & 0xFF;
-    chunkSizeMsg[2] = (newChunkSize >> 8) & 0xFF;
-    chunkSizeMsg[3] = newChunkSize & 0xFF;
-    rtmp_send_message(session, RTMP_MSG_SET_CHUNK_SIZE, 0, chunkSizeMsg, 4);
-    
-    ctx->chunkSize = newChunkSize;
-    
-    // _result
-    offset += amf_encode_string(response + offset, "_result");
-    offset += amf_encode_number(response + offset, 1); // transaction ID
-    
-    // Properties
-    offset += amf_encode_object_start(response + offset);
-    offset += amf_encode_named_string(response + offset, "fmsVer", "FMS/3,0,1,123");
-    offset += amf_encode_named_number(response + offset, "capabilities", 31);
-    offset += amf_encode_object_end(response + offset);
-    
-    // Information
-    offset += amf_encode_object_start(response + offset);
-    offset += amf_encode_named_string(response + offset, "level", "status");
-    offset += amf_encode_named_string(response + offset, "code", "NetConnection.Connect.Success");
-    offset += amf_encode_named_string(response + offset, "description", "Connection succeeded.");
-    offset += amf_encode_named_string(response + offset, "objectEncoding", "0");
-    offset += amf_encode_object_end(response + offset);
-    
-    int result = rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, response, offset);
-    
-    amf_object_free(obj);
-    
-    if (result == 0) {
-        ctx->state = RTMP_SESSION_CONNECTED;
-    }
-    
-    return result;
+    return packet;
 }
 
-static int handle_create_stream(RTMPSession *session, RTMPChunk *chunk) {
-    RTMPProtocolContext *ctx = session->protocol;
-    AMFObject *obj = amf_decode(chunk->payload, chunk->header.messageLength);
-    if (!obj) return -1;
+RTMPPacket* rtmp_protocol_create_publish(const char *stream_name) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    double transactionId = amf_object_get_number(obj, "transactionId");
+    // Create publish command
+    char publish_cmd[512];
+    snprintf(publish_cmd, sizeof(publish_cmd),
+             "{\"command\":\"publish\",\"streamName\":\"%s\",\"type\":\"live\"}", 
+             stream_name);
     
-    // Gerar novo stream ID
-    ctx->streamId = session->nextStreamId++;
+    size_t cmd_len = strlen(publish_cmd);
+    packet->m_body = (uint8_t*)malloc(cmd_len + 1);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
+    }
     
-    // Resposta
-    uint8_t response[128];
-    size_t offset = 0;
+    memcpy(packet->m_body, publish_cmd, cmd_len + 1);
     
-    offset += amf_encode_string(response + offset, "_result");
-    offset += amf_encode_number(response + offset, transactionId);
-    offset += amf_encode_null(response + offset);
-    offset += amf_encode_number(response + offset, ctx->streamId);
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_Command;
+    packet->m_nChannel = 8;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = cmd_len;
+    packet->m_nInfoField2 = protocol_context.stream_id;
     
-    int result = rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, response, offset);
-    
-    amf_object_free(obj);
-    return result;
+    return packet;
 }
 
-static int handle_publish(RTMPSession *session, RTMPChunk *chunk) {
-    RTMPProtocolContext *ctx = session->protocol;
-    AMFObject *obj = amf_decode(chunk->payload, chunk->header.messageLength);
-    if (!obj) return -1;
+RTMPPacket* rtmp_protocol_create_set_chunk_size(uint32_t chunk_size) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    const char *streamName = amf_object_get_string(obj, "name");
-    const char *type = amf_object_get_string(obj, "type");
-    
-    if (!streamName || !type) {
-        amf_object_free(obj);
-        return send_error(session, "NetStream.Publish.BadName",
-                         "error", "Invalid stream name or type");
+    packet->m_body = (uint8_t*)malloc(4);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
     }
     
-    ctx->streamName = strdup(streamName);
+    // Network byte order
+    packet->m_body[0] = (chunk_size >> 24) & 0xFF;
+    packet->m_body[1] = (chunk_size >> 16) & 0xFF;
+    packet->m_body[2] = (chunk_size >> 8) & 0xFF;
+    packet->m_body[3] = chunk_size & 0xFF;
     
-    // Notificar sucesso
-    int result = send_error(session, "NetStream.Publish.Start",
-                          "status", "Stream is now published.");
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_SetChunkSize;
+    packet->m_nChannel = 2;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = 4;
+    packet->m_nInfoField2 = 0;
     
-    amf_object_free(obj);
-    
-    if (result == 0) {
-        ctx->state = RTMP_SESSION_PUBLISHING;
-    }
-    
-    return result;
+    return packet;
 }
 
-static int handle_play(RTMPSession *session, RTMPChunk *chunk) {
-    RTMPProtocolContext *ctx = session->protocol;
-    AMFObject *obj = amf_decode(chunk->payload, chunk->header.messageLength);
-    if (!obj) return -1;
+RTMPPacket* rtmp_protocol_create_window_ack_size(uint32_t window_size) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
     
-    const char *streamName = amf_object_get_string(obj, "name");
-    if (!streamName) {
-        amf_object_free(obj);
-        return send_error(session, "NetStream.Play.Failed",
-                         "error", "Invalid stream name");
+    packet->m_body = (uint8_t*)malloc(4);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
     }
     
-    ctx->streamName = strdup(streamName);
+    packet->m_body[0] = (window_size >> 24) & 0xFF;
+    packet->m_body[1] = (window_size >> 16) & 0xFF;
+    packet->m_body[2] = (window_size >> 8) & 0xFF;
+    packet->m_body[3] = window_size & 0xFF;
     
-    // Stream Begin
-    uint8_t begin[6] = {0, 0, 0, 0, 0, 0};
-    rtmp_send_message(session, RTMP_MSG_USER_CONTROL, 0, begin, 6);
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_WindowAckSize;
+    packet->m_nChannel = 2;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = 4;
+    packet->m_nInfoField2 = 0;
     
-    // Notificar sucesso
-    int result = send_error(session, "NetStream.Play.Start",
-                          "status", "Stream is now playing.");
-    
-    amf_object_free(obj);
-    
-    if (result == 0) {
-        ctx->state = RTMP_SESSION_PLAYING;
-    }
-    
-    return result;
+    return packet;
 }
 
-static int handle_video(RTMPSession *session, RTMPChunk *chunk) {
-    if (session->videoCallback) {
-        session->videoCallback(session, chunk->payload, 
-                             chunk->header.messageLength,
-                             chunk->header.timestamp);
+RTMPPacket* rtmp_protocol_create_ping(void) {
+    RTMPPacket *packet = (RTMPPacket*)calloc(1, sizeof(RTMPPacket));
+    if (!packet) return NULL;
+    
+    packet->m_body = (uint8_t*)malloc(6);
+    if (!packet->m_body) {
+        free(packet);
+        return NULL;
     }
-    return 0;
+    
+    // Ping type (request)
+    packet->m_body[0] = 0;
+    packet->m_body[1] = RTMP_USER_PING_REQUEST;
+    
+    // Timestamp
+    uint32_t timestamp = (uint32_t)time(NULL);
+    packet->m_body[2] = (timestamp >> 24) & 0xFF;
+    packet->m_body[3] = (timestamp >> 16) & 0xFF;
+    packet->m_body[4] = (timestamp >> 8) & 0xFF;
+    packet->m_body[5] = timestamp & 0xFF;
+    
+    packet->m_headerType = 0;
+    packet->m_packetType = RTMP_MSG_UserControl;
+    packet->m_nChannel = 2;
+    packet->m_nTimeStamp = 0;
+    packet->m_nBodySize = 6;
+    packet->m_nInfoField2 = 0;
+    
+    return packet;
 }
 
-static int handle_audio(RTMPSession *session, RTMPChunk *chunk) {
-    if (session->audioCallback) {
-        session->audioCallback(session, chunk->payload,
-                             chunk->header.messageLength,
-                             chunk->header.timestamp);
+bool rtmp_protocol_parse_url(const char *url, char *hostname, size_t hostname_size,
+                           int *port, char *app_name, size_t app_size,
+                           char *stream_name, size_t stream_size) {
+    if (!url || !hostname || !port || !app_name || !stream_name) return false;
+    
+    // Check for rtmp:// prefix
+    if (strncmp(url, "rtmp://", 7) != 0) return false;
+    
+    const char *p = url + 7;
+    const char *host_end = strchr(p, '/');
+    if (!host_end) return false;
+    
+    // Extract hostname and port
+    size_t host_len = host_end - p;
+    const char *port_start = strchr(p, ':');
+    
+    if (port_start && port_start < host_end) {
+        host_len = port_start - p;
+        *port = atoi(port_start + 1);
+    } else {
+        *port = RTMP_DEFAULT_PORT;
     }
-    return 0;
-}
-
-static int check_window_ack(RTMPSession *session) {
-    RTMPProtocolContext *ctx = session->protocol;
     
-    ctx->bytesReceived += ctx->chunkSize;
+    if (host_len >= hostname_size) return false;
+    strncpy(hostname, p, host_len);
+    hostname[host_len] = '\0';
     
-    if (ctx->bytesReceived - ctx->lastAckBytes >= ctx->windowAckSize) {
-        uint8_t ack[4];
-        uint32_t bytesReceived = ctx->bytesReceived;
-        ack[0] = (bytesReceived >> 24) & 0xFF;
-        ack[1] = (bytesReceived >> 16) & 0xFF;
-        ack[2] = (bytesReceived >> 8) & 0xFF;
-        ack[3] = bytesReceived & 0xFF;
+    // Extract app name and stream name
+    p = host_end + 1;
+    const char *app_end = strchr(p, '/');
+    if (!app_end) {
+        if (strlen(p) >= app_size) return false;
+        strcpy(app_name, p);
+        stream_name[0] = '\0';
+    } else {
+        size_t app_len = app_end - p;
+        if (app_len >= app_size) return false;
+        strncpy(app_name, p, app_len);
+        app_name[app_len] = '\0';
         
-        int result = rtmp_send_message(session, RTMP_MSG_ACKNOWLEDGEMENT, 
-                                     0, ack, 4);
-        
-        if (result == 0) {
-            ctx->lastAckBytes = ctx->bytesReceived;
-            ctx->lastAckTime = time(NULL);
-        }
-        
-        return result;
+        p = app_end + 1;
+        if (strlen(p) >= stream_size) return false;
+        strcpy(stream_name, p);
     }
     
-    return 0;
+    return true;
 }
 
-int rtmp_protocol_init(RTMPSession *session) {
-    RTMPProtocolContext *ctx = calloc(1, sizeof(RTMPProtocolContext));
-    if (!ctx) return -1;
+uint32_t rtmp_protocol_get_chunk_size(const RTMPPacket *packet) {
+    if (!packet || packet->m_nBodySize < 4) return RTMP_DEFAULT_CHUNK_SIZE;
     
-    ctx->chunkSize = RTMP_CHUNK_SIZE;
-    ctx->windowAckSize = RTMP_WINDOW_ACK_SIZE;
-    ctx->state = RTMP_SESSION_INITIALIZED;
-    
-    session->protocol = ctx;
-    return 0;
+    return (packet->m_body[0] << 24) | (packet->m_body[1] << 16) |
+           (packet->m_body[2] << 8) | packet->m_body[3];
 }
 
-void rtmp_protocol_destroy(RTMPSession *session) {
-    if (!session || !session->protocol) return;
+uint32_t rtmp_protocol_get_window_size(const RTMPPacket *packet) {
+    if (!packet || packet->m_nBodySize < 4) return 0;
     
-    RTMPProtocolContext *ctx = session->protocol;
-    
-    free(ctx->appName);
-    free(ctx->streamName);
-    free(ctx);
-    
-    session->protocol = NULL;
+    return (packet->m_body[0] << 24) | (packet->m_body[1] << 16) |
+           (packet->m_body[2] << 8) | packet->m_body[3];
 }
 
-int rtmp_protocol_handle_message(RTMPSession *session, RTMPChunk *chunk) {
-    RTMPProtocolContext *ctx = session->protocol;
-    int result = 0;
+void rtmp_protocol_handle_packet(const RTMPPacket *packet) {
+    if (!packet) return;
     
-    // Verificar timeout
-    if (ctx->lastAckTime > 0 && 
-        time(NULL) - ctx->lastAckTime > RTMP_DEFAULT_TIMEOUT) {
-        
-        if (ctx->retryCount < RTMP_MAX_RETRY) {
-            ctx->retryCount++;
-            // Tentar reconexão
-            return rtmp_protocol_reconnect(session);
-        }
-        return -1;
-    }
-    
-    // Processar mensagem
-    switch (chunk->header.messageTypeId) {
-        case RTMP_MSG_SET_CHUNK_SIZE:
-            if (chunk->header.messageLength >= 4) {
-                ctx->chunkSize = (chunk->payload[0] << 24) |
-                                (chunk->payload[1] << 16) |
-                                (chunk->payload[2] << 8) |
-                                chunk->payload[3];
+    switch (packet->m_packetType) {
+        case RTMP_MSG_SetChunkSize:
+            protocol_context.chunk_size = rtmp_protocol_get_chunk_size(packet);
+            rtmp_chunk_set_size(protocol_context.chunk_size);
+            break;
+            
+        case RTMP_MSG_WindowAckSize:
+            protocol_context.window_size = rtmp_protocol_get_window_size(packet);
+            break;
+            
+        case RTMP_MSG_SetPeerBandwidth:
+            if (packet->m_nBodySize >= 4) {
+                protocol_context.bandwidth = (packet->m_body[0] << 24) |
+                                          (packet->m_body[1] << 16) |
+                                          (packet->m_body[2] << 8) |
+                                           packet->m_body[3];
             }
             break;
             
-        case RTMP_MSG_ACKNOWLEDGEMENT:
-            // Processar acknowledgement
-            break;
-            
-        case RTMP_MSG_WINDOW_ACK_SIZE:
-            if (chunk->header.messageLength >= 4) {
-                ctx->windowAckSize = (chunk->payload[0] << 24) |
-                                   (chunk->payload[1] << 16) |
-                                   (chunk->payload[2] << 8) |
-                                   chunk->payload[3];
-            }
-            break;
-            
-        case RTMP_MSG_AMF0_COMMAND:
-            // Decodificar nome do comando
-            char cmdName[128];
-            size_t cmdLen;
-            if (amf_decode_string(chunk->payload, &cmdLen, cmdName, sizeof(cmdName)) < 0) {
-                return -1;
-            }
-            
-            if (strcmp(cmdName, "connect") == 0) {
-                result = handle_connect(session, chunk);
-            } else if (strcmp(cmdName, "createStream") == 0) {
-                result = handle_create_stream(session, chunk);
-            } else if (strcmp(cmdName, "publish") == 0) {
-                result = handle_publish(session, chunk);
-            } else if (strcmp(cmdName, "play") == 0) {
-                result = handle_play(session, chunk);
-            }
-            break;
-            
-        case RTMP_MSG_VIDEO:
-            result = handle_video(session, chunk);
-            break;
-            
-        case RTMP_MSG_AUDIO:
-            result = handle_audio(session, chunk);
-            break;
-            
-        case RTMP_MSG_USER_CONTROL:
-            // Processar mensagens de controle do usuário
-            if (chunk->header.messageLength >= 2) {
-                uint16_t eventType = (chunk->payload[0] << 8) | chunk->payload[1];
-                switch (eventType) {
-                    case RTMP_USER_PING_REQUEST:
-                        // Responder ping
-                        if (chunk->header.messageLength >= 6) {
-                            uint8_t response[6];
-                            memcpy(response, chunk->payload, 6);
-                            response[1] = RTMP_USER_PING_RESPONSE;
-                            rtmp_send_message(session, RTMP_MSG_USER_CONTROL, 0, response, 6);
-                        }
-                        break;
-                        
-                    case RTMP_USER_STREAM_BEGIN:
-                    case RTMP_USER_STREAM_EOF:
-                    case RTMP_USER_STREAM_DRY:
-                    case RTMP_USER_SET_BUFFER:
-                        // Processar outros eventos de controle
-                        break;
-                }
-            }
+        default:
             break;
     }
-    
-    // Verificar acknowledgment window
-    if (result == 0) {
-        result = check_window_ack(session);
-    }
-    
-    return result;
 }
 
-int rtmp_protocol_reconnect(RTMPSession *session) {
-    RTMPProtocolContext *ctx = session->protocol;
-    
-    // Salvar estado importante
-    char *appName = ctx->appName;
-    char *streamName = ctx->streamName;
-    uint32_t streamId = ctx->streamId;
-    
-    ctx->appName = NULL;
-    ctx->streamName = NULL;
-    
-    // Resetar contexto
-    memset(ctx, 0, sizeof(RTMPProtocolContext));
-    
-    // Restaurar estado
-    ctx->appName = appName;
-    ctx->streamName = streamName;
-    ctx->streamId = streamId;
-    ctx->state = RTMP_SESSION_INITIALIZED;
-    
-    // Realizar handshake novamente
-    if (rtmp_handshake_process(session) < 0) {
-        return -1;
-    }
-    
-    // Reconectar
-    uint8_t connect[1024];
-    size_t offset = 0;
-    
-    offset += amf_encode_string(connect + offset, "connect");
-    offset += amf_encode_number(connect + offset, 1);
-    
-    offset += amf_encode_object_start(connect + offset);
-    offset += amf_encode_named_string(connect + offset, "app", ctx->appName);
-    offset += amf_encode_named_string(connect + offset, "flashVer", "FMLE/3.0");
-    offset += amf_encode_named_string(connect + offset, "swfUrl", "");
-    offset += amf_encode_named_string(connect + offset, "tcUrl", "");
-    offset += amf_encode_named_boolean(connect + offset, "fpad", false);
-    offset += amf_encode_named_number(connect + offset, "capabilities", 15);
-    offset += amf_encode_named_number(connect + offset, "audioCodecs", 0x0FFF);
-    offset += amf_encode_named_number(connect + offset, "videoCodecs", 0x0FFF);
-    offset += amf_encode_named_number(connect + offset, "videoFunction", 1);
-    offset += amf_encode_object_end(connect + offset);
-    
-    if (rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, connect, offset) < 0) {
-        return -1;
-    }
-    
-    // Recriar stream se necessário
-    if (ctx->streamId > 0) {
-        uint8_t createStream[128];
-        offset = 0;
-        
-        offset += amf_encode_string(createStream + offset, "createStream");
-        offset += amf_encode_number(createStream + offset, 2);
-        offset += amf_encode_null(createStream + offset);
-        
-        if (rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, 0, createStream, offset) < 0) {
-            return -1;
-        }
-        
-        // Republicar/reproduzir stream
-        if (ctx->streamName) {
-            uint8_t publish[256];
-            offset = 0;
-            
-            if (ctx->state == RTMP_SESSION_PUBLISHING) {
-                offset += amf_encode_string(publish + offset, "publish");
-                offset += amf_encode_number(publish + offset, 3);
-                offset += amf_encode_null(publish + offset);
-                offset += amf_encode_string(publish + offset, ctx->streamName);
-                offset += amf_encode_string(publish + offset, "live");
-                
-                if (rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, ctx->streamId, publish, offset) < 0) {
-                    return -1;
-                }
-            } else if (ctx->state == RTMP_SESSION_PLAYING) {
-                offset += amf_encode_string(publish + offset, "play");
-                offset += amf_encode_number(publish + offset, 3);
-                offset += amf_encode_null(publish + offset);
-                offset += amf_encode_string(publish + offset, ctx->streamName);
-                
-                if (rtmp_send_message(session, RTMP_MSG_AMF0_COMMAND, ctx->streamId, publish, offset) < 0) {
-                    return -1;
-                }
-            }
-        }
-    }
-    
-    return 0;
-}
-
-RTMPSessionState rtmp_protocol_get_state(RTMPSession *session) {
-    if (!session || !session->protocol) return RTMP_SESSION_DISCONNECTED;
-    return ((RTMPProtocolContext*)session->protocol)->state;
-}
-
-int rtmp_protocol_get_stream_id(RTMPSession *session) {
-    if (!session || !session->protocol) return -1;
-    return ((RTMPProtocolContext*)session->protocol)->streamId;
-}
-
-void rtmp_protocol_get_stats(RTMPSession *session, RTMPProtocolStats *stats) {
-    if (!session || !session->protocol || !stats) return;
-    
-    RTMPProtocolContext *ctx = session->protocol;
-    
-    stats->chunkSize = ctx->chunkSize;
-    stats->windowAckSize = ctx->windowAckSize;
-    stats->bytesReceived = ctx->bytesReceived;
-    stats->retryCount = ctx->retryCount;
+void rtmp_protocol_set_stream_id(uint32_t stream_id) {
+    protocol_context.stream_id = stream_id;
 }

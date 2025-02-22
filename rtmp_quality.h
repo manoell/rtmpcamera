@@ -3,35 +3,28 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include "rtmp_stream.h"
+#include <sys/time.h>
 
-// Configuração do controlador de qualidade
-typedef struct {
-    uint32_t max_bitrate;
-    uint32_t min_bitrate;
-    uint32_t target_latency;
-    float quality_priority;  // 0.0 - 1.0, prioridade entre qualidade e latência
-} quality_config_t;
+// Forward declarations
+typedef struct RTMPStream RTMPStream;
+typedef struct RTMPPacket RTMPPacket;
 
-// Estatísticas de qualidade
-typedef struct {
-    uint32_t current_bitrate;
-    uint32_t target_bitrate;
-    float network_speed;
-    float buffer_health;
-    float quality_score;
-} quality_stats_t;
+// Initialize quality control for a stream
+void rtmp_quality_init(RTMPStream *stream);
 
-// Handle opaco para o controlador
-typedef struct rtmp_quality_controller rtmp_quality_controller_t;
+// Update quality metrics based on received packet
+void rtmp_quality_update(RTMPStream *stream, const RTMPPacket *packet);
 
-// Funções principais
-rtmp_quality_controller_t *rtmp_quality_controller_create(rtmp_stream_t *stream);
-void rtmp_quality_controller_update(rtmp_quality_controller_t *controller);
-void rtmp_quality_controller_configure(rtmp_quality_controller_t *controller,
-                                     const quality_config_t *config);
-quality_stats_t rtmp_quality_controller_get_stats(rtmp_quality_controller_t *controller);
-void rtmp_quality_controller_destroy(rtmp_quality_controller_t *controller);
+// Adjust stream quality based on current metrics
+void rtmp_quality_adjust(RTMPStream *stream);
+
+// Reset quality control to default values
+void rtmp_quality_reset(RTMPStream *stream);
+
+// Utility function to get time difference in milliseconds
+static inline int64_t timeval_diff_ms(struct timeval *t1, struct timeval *t2) {
+    return ((int64_t)(t1->tv_sec - t2->tv_sec) * 1000 +
+            (int64_t)(t1->tv_usec - t2->tv_usec) / 1000);
+}
 
 #endif // RTMP_QUALITY_H
