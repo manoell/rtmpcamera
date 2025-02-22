@@ -8,6 +8,9 @@
 #define RTMP_SERVER_PORT 1935
 #define RTMP_PREVIEW_ENABLED 1
 
+// Original method declaration
+static void (*original_captureOutput)(id self, SEL _cmd, AVCaptureOutput *captureOutput, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection);
+
 @interface RTMPCameraManager : NSObject
 
 @property (nonatomic, strong) RTMPPreviewController *previewController;
@@ -15,12 +18,16 @@
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, strong) NSString *streamKey;
 @property (nonatomic, strong) dispatch_queue_t serverQueue;
+@property (nonatomic, strong) NSString *currentStreamName;
+@property (nonatomic, assign) BOOL isPublishing;
 
 + (instancetype)sharedManager;
 - (void)startServer;
 - (void)stopServer;
 - (void)setupPreviewWithView:(UIView *)containerView;
 - (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer;
+- (void)startPublishingWithName:(NSString *)streamName;
+- (void)stopPublishing;
 
 @end
 
@@ -42,6 +49,7 @@
         _isActive = NO;
         _streamKey = @"live";
         _previewController = [[RTMPPreviewController alloc] init];
+        _isPublishing = NO;
     }
     return self;
 }
@@ -72,6 +80,23 @@
             return;
         }
         
+        // Set server callbacks
+        rtmp_server_set_callbacks(self.rtmpServer,
+                                ^(rtmp_server_t *server, rtmp_session_t *session) {
+            NSLog(@"[RTMPCamera] Client connected");
+        },
+                                ^(rtmp_server_t *server, rtmp_session_t *session) {
+            NSLog(@"[RTMPCamera] Client disconnected");
+        },
+                                ^(rtmp_server_t *server, rtmp_session_t *session, const char *stream_name) {
+            NSLog(@"[RTMPCamera] Stream published: %s", stream_name);
+            self.currentStreamName = [NSString stringWithUTF8String:stream_name];
+            self.isPublishing = YES;
+        },
+                                ^(rtmp_server_t *server, rtmp_session_t *session, const char *stream_name) {
+            NSLog(@"[RTMPCamera] Stream played: %s", stream_name);
+        });
+        
         // Start server
         if (rtmp_server_start(self.rtmpServer) < 0) {
             NSLog(@"[RTMPCamera] Failed to start RTMP server");
@@ -95,6 +120,8 @@
             self.rtmpServer = NULL;
         }
         self.isActive = NO;
+        self.isPublishing = NO;
+        self.currentStreamName = nil;
         NSLog(@"[RTMPCamera] RTMP server stopped");
     });
 }
@@ -103,16 +130,18 @@
 #if RTMP_PREVIEW_ENABLED
     if (!containerView) return;
     
-    // Setup preview controller
-    self.previewController.view.frame = containerView.bounds;
-    self.previewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [containerView addSubview:self.previewController.view];
-    [self.previewController startPreview];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Setup preview controller
+        self.previewController.view.frame = containerView.bounds;
+        self.previewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [containerView addSubview:self.previewController.view];
+        [self.previewController startPreview];
+    });
 #endif
 }
 
 - (void)injectVideoFrame:(CMSampleBufferRef)sampleBuffer {
-    if (!self.isActive || !sampleBuffer) return;
+    if (!self.isActive || !sampleBuffer || !self.isPublishing) return;
     
     @autoreleasepool {
         // Get video format
@@ -146,7 +175,7 @@
                 
                 // Send frame to RTMP server
                 dispatch_async(self.serverQueue, ^{
-                    if (self.rtmpServer && self.isActive) {
+                    if (self.rtmpServer && self.isActive && self.isPublishing) {
                         rtmp_server_send_video(self.rtmpServer,
                                              frameData,
                                              dataSize,
@@ -158,16 +187,14 @@
                 });
                 
 #if RTMP_PREVIEW_ENABLED
-                // Update preview if enabled - cópia separada para o preview
+                // Update preview if enabled
                 uint8_t *previewData = malloc(dataSize);
                 if (previewData) {
                     memcpy(previewData, baseAddress, dataSize);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self.previewController processVideoData:previewData 
-                                                          size:dataSize 
-                                                    timestamp:timestamp];
-                        free(previewData);
-                    });
+                    [self.previewController processVideoData:previewData 
+                                                      size:dataSize 
+                                                timestamp:timestamp];
+                    free(previewData);
                 }
 #endif
             }
@@ -176,6 +203,17 @@
             CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
         }
     }
+}
+
+- (void)startPublishingWithName:(NSString *)streamName {
+    if (!streamName) streamName = @"live";
+    self.currentStreamName = streamName;
+    self.isPublishing = YES;
+}
+
+- (void)stopPublishing {
+    self.isPublishing = NO;
+    self.currentStreamName = nil;
 }
 
 @end

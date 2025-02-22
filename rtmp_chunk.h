@@ -1,31 +1,47 @@
 #ifndef RTMP_CHUNK_H
 #define RTMP_CHUNK_H
 
-#include "rtmp_core.h"
-#include "rtmp_protocol.h"
 #include <stdint.h>
+#include <stddef.h>
+#include "rtmp_core.h"
 
-// Tamanhos de chunk
-#define RTMP_CHUNK_SIZE_MAX 65536
-#define RTMP_CHUNK_SIZE_MIN 128
+// Chunk types
+#define RTMP_CHUNK_TYPE_0 0  // Full message header
+#define RTMP_CHUNK_TYPE_1 1  // Message header with no message ID
+#define RTMP_CHUNK_TYPE_2 2  // Message header with timestamp delta
+#define RTMP_CHUNK_TYPE_3 3  // No message header
 
-// Formatos de chunk
-#define RTMP_CHUNK_TYPE_0 0  // Chunk com cabeçalho completo
-#define RTMP_CHUNK_TYPE_1 1  // Chunk com timestamp delta
-#define RTMP_CHUNK_TYPE_2 2  // Chunk com timestamp delta reduzido
-#define RTMP_CHUNK_TYPE_3 3  // Chunk sem cabeçalho
+// Basic chunk header lengths
+#define RTMP_CHUNK_BASIC_HEADER_SIZE_1 1
+#define RTMP_CHUNK_BASIC_HEADER_SIZE_2 2
+#define RTMP_CHUNK_BASIC_HEADER_SIZE_3 3
 
-// Estrutura do header do chunk
-typedef struct {
-    uint8_t fmt;           // Formato do chunk (0-3)
-    uint32_t csid;         // Chunk Stream ID
-    uint32_t timestamp;    // Timestamp absoluto ou delta
-    uint32_t length;       // Tamanho da mensagem
-    uint8_t type_id;       // Tipo da mensagem
-    uint32_t stream_id;    // ID do stream
-} RTMPChunkHeader;
+// Maximum values
+#define RTMP_CHUNK_MAX_HEADER_SIZE 18
+#define RTMP_CHUNK_MAX_SIZE 65536
 
-// Funções
-int rtmp_read_chunk_header(RTMPClient *client, RTMPChunkHeader *header);
+// Chunk structure
+struct rtmp_chunk_s {
+    uint8_t chunk_type;
+    uint32_t chunk_stream_id;
+    uint32_t timestamp;
+    uint32_t msg_length;
+    uint8_t msg_type_id;
+    uint32_t msg_stream_id;
+    uint8_t *msg_data;
+};
 
-#endif
+// Chunk functions
+size_t rtmp_chunk_read(rtmp_session_t *session, const uint8_t *data, size_t size, rtmp_chunk_t *chunk);
+int rtmp_chunk_write(rtmp_session_t *session, const rtmp_chunk_t *chunk);
+
+// Helper functions
+size_t rtmp_chunk_get_header_size(uint8_t chunk_type);
+size_t rtmp_chunk_parse_basic_header(const uint8_t *data, size_t size, uint8_t *chunk_type, uint32_t *chunk_stream_id);
+int rtmp_chunk_create_basic_header(uint8_t chunk_type, uint32_t chunk_stream_id, uint8_t *out);
+
+// Extended timestamp handling
+int rtmp_chunk_read_extended_timestamp(const uint8_t *data, size_t size, uint32_t *timestamp);
+int rtmp_chunk_write_extended_timestamp(uint8_t *data, uint32_t timestamp);
+
+#endif // RTMP_CHUNK_H

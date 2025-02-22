@@ -1,116 +1,165 @@
-#include "rtmp_core.h"
 #include "rtmp_handshake.h"
-#include <time.h>
+#include "rtmp_utils.h"
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 
-#define RTMP_HANDSHAKE_SIZE 1536
-#define RTMP_VERSION 3
+// Local types
+typedef struct {
+    uint32_t time;
+    uint32_t version;
+    uint8_t random[RTMP_HANDSHAKE_SIZE - 8];
+} rtmp_handshake_packet_t;
 
-// Função helper para enviar dados
-static int send_bytes(RTMPClient* client, const uint8_t* data, size_t size) {
-    ssize_t sent = 0;
-    while (sent < size) {
-        ssize_t ret = send(client->socket_fd, data + sent, size - sent, 0);
-        if (ret <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);  // 1ms de espera
-                continue;
-            }
-            rtmp_log(RTMP_LOG_ERROR, "Send failed: %s", strerror(errno));
-            return RTMP_ERROR_SOCKET;
-        }
-        sent += ret;
+int rtmp_handshake_server(rtmp_session_t *session) {
+    if (!session) return -1;
+    
+    // Read C0 (version byte)
+    if (rtmp_handshake_read_version(session) < 0) {
+        return -1;
     }
-    return RTMP_OK;
+    
+    // Generate and send S0+S1
+    if (rtmp_handshake_write_s0s1(session) < 0) {
+        return -1;
+    }
+    
+    // Read C1
+    uint8_t c1[RTMP_HANDSHAKE_SIZE];
+    if (rtmp_handshake_read_c1(session) < 0) {
+        return -1;
+    }
+    
+    // Generate and send S2
+    if (rtmp_handshake_write_s2(session) < 0) {
+        return -1;
+    }
+    
+    // Read C2
+    if (rtmp_handshake_read_c2(session) < 0) {
+        return -1;
+    }
+    
+    return 0;
 }
 
-// Função helper para receber dados
-static int receive_bytes(RTMPClient* client, uint8_t* data, size_t size) {
-    ssize_t received = 0;
-    while (received < size) {
-        ssize_t ret = recv(client->socket_fd, data + received, size - received, 0);
-        if (ret <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);  // 1ms de espera
-                continue;
-            }
-            if (ret == 0) {
-                rtmp_log(RTMP_LOG_ERROR, "Connection closed during handshake");
-            } else {
-                rtmp_log(RTMP_LOG_ERROR, "Receive failed: %s", strerror(errno));
-            }
-            return RTMP_ERROR_SOCKET;
-        }
-        received += ret;
+int rtmp_handshake_read_version(rtmp_session_t *session) {
+    uint8_t version;
+    ssize_t bytes_read = recv(session->socket_fd, &version, 1, 0);
+    
+    if (bytes_read != 1) {
+        return -1;
     }
-    return RTMP_OK;
+    
+    if (version != RTMP_HANDSHAKE_VERSION) {
+        return -1;
+    }
+    
+    return 0;
 }
 
-// Gera bytes aleatórios para o handshake
-static void generate_random_bytes(uint8_t* buffer, size_t size) {
-    static bool seeded = false;
-    if (!seeded) {
-        srand(time(NULL));
-        seeded = true;
+int rtmp_handshake_write_s0s1(rtmp_session_t *session) {
+    uint8_t packet[RTMP_HANDSHAKE_PACKET_SIZE];
+    rtmp_handshake_packet_t *s1 = (rtmp_handshake_packet_t *)(packet + 1);
+    
+    // Write S0 (version)
+    packet[0] = RTMP_HANDSHAKE_VERSION;
+    
+    // Generate S1
+    s1->time = rtmp_handshake_get_time();
+    s1->version = 0;
+    if (rtmp_handshake_generate_random(s1->random, sizeof(s1->random)) < 0) {
+        return -1;
     }
+    
+    // Send S0+S1
+    if (rtmp_session_send_data(session, packet, RTMP_HANDSHAKE_PACKET_SIZE) < 0) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+int rtmp_handshake_read_c1(rtmp_session_t *session) {
+    uint8_t packet[RTMP_HANDSHAKE_SIZE];
+    
+    // Read full C1 packet
+    size_t total_read = 0;
+    while (total_read < RTMP_HANDSHAKE_SIZE) {
+        ssize_t bytes_read = recv(session->socket_fd, 
+                                packet + total_read, 
+                                RTMP_HANDSHAKE_SIZE - total_read, 
+                                0);
+        
+        if (bytes_read <= 0) {
+            return -1;
+        }
+        
+        total_read += bytes_read;
+    }
+    
+    return 0;
+}
+
+int rtmp_handshake_write_s2(rtmp_session_t *session) {
+    uint8_t packet[RTMP_HANDSHAKE_SIZE];
+    rtmp_handshake_packet_t *s2 = (rtmp_handshake_packet_t *)packet;
+    
+    // Generate S2
+    s2->time = rtmp_handshake_get_time();
+    s2->version = 0;
+    if (rtmp_handshake_generate_random(s2->random, sizeof(s2->random)) < 0) {
+        return -1;
+    }
+    
+    // Send S2
+    if (rtmp_session_send_data(session, packet, RTMP_HANDSHAKE_SIZE) < 0) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+int rtmp_handshake_read_c2(rtmp_session_t *session) {
+    uint8_t packet[RTMP_HANDSHAKE_SIZE];
+    
+    // Read full C2 packet
+    size_t total_read = 0;
+    while (total_read < RTMP_HANDSHAKE_SIZE) {
+        ssize_t bytes_read = recv(session->socket_fd, 
+                                packet + total_read, 
+                                RTMP_HANDSHAKE_SIZE - total_read, 
+                                0);
+        
+        if (bytes_read <= 0) {
+            return -1;
+        }
+        
+        total_read += bytes_read;
+    }
+    
+    return 0;
+}
+
+int rtmp_handshake_generate_random(uint8_t *buffer, size_t size) {
+    if (!buffer || !size) return -1;
     
     for (size_t i = 0; i < size; i++) {
-        buffer[i] = rand() % 256;
+        buffer[i] = rand() & 0xFF;
     }
+    
+    return 0;
 }
 
-int rtmp_handshake_perform(RTMPClient* client) {
-    rtmp_log(RTMP_LOG_DEBUG, "Starting handshake...");
-    
-    // Receber C0 (1 byte versão) + C1 (1536 bytes)
-    uint8_t c0c1[RTMP_HANDSHAKE_SIZE + 1];
-    if (receive_bytes(client, c0c1, sizeof(c0c1)) != RTMP_OK) {
-        return RTMP_ERROR_HANDSHAKE;
-    }
-    rtmp_log(RTMP_LOG_DEBUG, "Received C0C1: %d bytes", sizeof(c0c1));
+uint32_t rtmp_handshake_get_time(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
 
-    // Verificar versão RTMP
-    if (c0c1[0] != RTMP_VERSION) {
-        rtmp_log(RTMP_LOG_ERROR, "Unsupported RTMP version: %d", c0c1[0]);
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    // Preparar S0 + S1 + S2
-    uint8_t s0s1s2[1 + RTMP_HANDSHAKE_SIZE * 2];
-    
-    // S0 - versão
-    s0s1s2[0] = RTMP_VERSION;
-    
-    // S1 - timestamp (4 bytes) + zeros (4 bytes) + random (1528 bytes)
-    uint32_t timestamp = (uint32_t)time(NULL);
-    memcpy(s0s1s2 + 1, &timestamp, 4);
-    memset(s0s1s2 + 5, 0, 4);
-    generate_random_bytes(s0s1s2 + 9, RTMP_HANDSHAKE_SIZE - 8);
-    
-    // S2 - eco do C1
-    memcpy(s0s1s2 + RTMP_HANDSHAKE_SIZE + 1, c0c1 + 1, RTMP_HANDSHAKE_SIZE);
-
-    // Enviar S0 + S1 + S2
-    if (send_bytes(client, s0s1s2, sizeof(s0s1s2)) != RTMP_OK) {
-        return RTMP_ERROR_HANDSHAKE;
-    }
-    rtmp_log(RTMP_LOG_DEBUG, "S0S1S2 sent successfully: %d bytes", sizeof(s0s1s2));
-
-    // Receber C2
-    uint8_t c2[RTMP_HANDSHAKE_SIZE];
-    if (receive_bytes(client, c2, sizeof(c2)) != RTMP_OK) {
-        return RTMP_ERROR_HANDSHAKE;
-    }
-    rtmp_log(RTMP_LOG_DEBUG, "C2 received: %d bytes", sizeof(c2));
-
-    // Verificar C2 (deve ser eco do nosso S1)
-    if (memcmp(c2, s0s1s2 + 1, RTMP_HANDSHAKE_SIZE) != 0) {
-        rtmp_log(RTMP_LOG_WARNING, "C2 does not match S1 echo");
-        // Algumas implementações não seguem o protocolo exatamente,
-        // então vamos continuar mesmo assim
-    }
-
-    client->state = RTMP_STATE_HANDSHAKE_DONE;
-    rtmp_log(RTMP_LOG_INFO, "Handshake completed successfully");
-    return RTMP_OK;
+int rtmp_handshake_verify_digest(const uint8_t *buffer, size_t size) {
+    // Simplified digest verification
+    // In a production environment, you would want to implement proper digest verification
+    return 0;
 }

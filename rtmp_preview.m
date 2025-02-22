@@ -2,12 +2,21 @@
 #import <AVFoundation/AVFoundation.h>
 #import "rtmp_core.h"
 
+@protocol RTMPPreviewDelegate <NSObject>
+@optional
+- (void)previewDidStart:(id)preview;
+- (void)previewDidStop:(id)preview;
+- (void)previewDidCleanup:(id)preview;
+- (void)preview:(id)preview didFailWithError:(NSError *)error;
+@end
+
 @interface RTMPPreviewView : UIView
 
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *previewLayer;
 @property (nonatomic, assign) rtmp_session_t *session;
 @property (nonatomic, strong) dispatch_queue_t previewQueue;
 @property (nonatomic, assign) BOOL isSetup;
+@property (nonatomic, weak) id<RTMPPreviewDelegate> delegate;
 
 - (void)setupPreviewLayer;
 - (void)displayVideoFrame:(CMSampleBufferRef)sampleBuffer;
@@ -45,6 +54,10 @@
     }
     
     _isSetup = YES;
+    
+    if ([self.delegate respondsToSelector:@selector(previewDidStart:)]) {
+        [self.delegate previewDidStart:self];
+    }
 }
 
 - (void)displayVideoFrame:(CMSampleBufferRef)sampleBuffer {
@@ -54,6 +67,13 @@
     dispatch_async(_previewQueue, ^{
         if (self.previewLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
             [self.previewLayer flush];
+            
+            if ([self.delegate respondsToSelector:@selector(preview:didFailWithError:)]) {
+                NSError *error = [NSError errorWithDomain:@"com.rtmpcamera"
+                                                   code:-1
+                                               userInfo:@{NSLocalizedDescriptionKey: @"Preview rendering failed"}];
+                [self.delegate preview:self didFailWithError:error];
+            }
         }
         
         if (self.previewLayer.readyForMoreMediaData) {
@@ -81,7 +101,6 @@
         self.session = NULL;
         _isSetup = NO;
         
-        // Notificar que a preview foi limpa
         if ([self.delegate respondsToSelector:@selector(previewDidCleanup:)]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.delegate previewDidCleanup:self];
@@ -96,13 +115,13 @@
 
 @end
 
-// RTMP Preview Controller
-@interface RTMPPreviewController : UIViewController
+@interface RTMPPreviewController : UIViewController <RTMPPreviewDelegate>
 
 @property (nonatomic, strong) RTMPPreviewView *previewView;
 @property (nonatomic, assign) rtmp_session_t *session;
 @property (nonatomic, strong) dispatch_queue_t processingQueue;
 @property (nonatomic, assign) BOOL isProcessing;
+@property (nonatomic, strong) CMVideoFormatDescriptionRef formatDescription;
 
 - (void)startPreview;
 - (void)stopPreview;
@@ -122,6 +141,7 @@
     // Setup preview view
     self.previewView = [[RTMPPreviewView alloc] initWithFrame:self.view.bounds];
     self.previewView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.previewView.delegate = self;
     [self.view addSubview:self.previewView];
 }
 
@@ -134,14 +154,20 @@
 - (void)stopPreview {
     self.isProcessing = NO;
     [self.previewView cleanupPreview];
+    
+    if (self.formatDescription) {
+        CFRelease(self.formatDescription);
+        self.formatDescription = NULL;
+    }
 }
 
 - (void)processVideoData:(const uint8_t *)data size:(size_t)size timestamp:(uint32_t)timestamp {
     if (!self.isProcessing) return;
     
     dispatch_async(self.processingQueue, ^{
-        // Decode H.264 video data and create CMSampleBuffer
-        CMSampleBufferRef sampleBuffer = [self createSampleBufferFromH264Data:data size:size timestamp:timestamp];
+        CMSampleBufferRef sampleBuffer = [self createSampleBufferFromH264Data:data 
+                                                                        size:size 
+                                                                  timestamp:timestamp];
         if (sampleBuffer) {
             [self.previewView displayVideoFrame:sampleBuffer];
             CFRelease(sampleBuffer);
@@ -150,121 +176,7 @@
 }
 
 - (void)processAudioData:(const uint8_t *)data size:(size_t)size timestamp:(uint32_t)timestamp {
-    if (!self.isProcessing) return;
-    
-    dispatch_async(self.processingQueue, ^{
-        // Process AAC audio data if needed
-        // Currently focusing on video preview
-    });
-}
-
-- (CMSampleBufferRef)createSampleBufferFromH264Data:(const uint8_t *)data 
-                                              size:(size_t)size 
-                                        timestamp:(uint32_t)timestamp {
-    static CMVideoFormatDescriptionRef formatDescription = NULL;
-    
-    // Tentar criar format description se ainda não existe
-    if (!formatDescription) {
-        const uint8_t *parameterSetPointers[2] = {NULL, NULL};
-        size_t parameterSetSizes[2] = {0, 0};
-        int parameterSetCount = 0;
-        
-        if ([self extractSPSAndPPS:data size:size
-                    parameterSets:parameterSetPointers
-                parameterSetSizes:parameterSetSizes
-                           count:&parameterSetCount]) {
-            
-            OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                kCFAllocatorDefault,
-                parameterSetCount,
-                parameterSetPointers,
-                parameterSetSizes,
-                4,
-                &formatDescription
-            );
-            
-            if (status != noErr) {
-                NSLog(@"Failed to create format description: %d", (int)status);
-                return NULL;
-            }
-        } else {
-            // Tentar criar format description com valores padrão
-            const uint8_t defaultSPS[] = { /* ... valores padrão do SPS ... */ };
-            const uint8_t defaultPPS[] = { /* ... valores padrão do PPS ... */ };
-            const uint8_t *defaultParameterSets[2] = {defaultSPS, defaultPPS};
-            const size_t defaultParameterSetSizes[2] = {sizeof(defaultSPS), sizeof(defaultPPS)};
-            
-            OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                kCFAllocatorDefault,
-                2,
-                defaultParameterSets,
-                defaultParameterSetSizes,
-                4,
-                &formatDescription
-            );
-            
-            if (status != noErr) {
-                NSLog(@"Failed to create default format description: %d", (int)status);
-                return NULL;
-            }
-        }
-    }
-    
-    // Criar timing info
-    CMTime presentationTime = CMTimeMake(timestamp, 1000);
-    CMSampleTimingInfo timing = {
-        .duration = kCMTimeInvalid,
-        .presentationTimeStamp = presentationTime,
-        .decodeTimeStamp = presentationTime
-    };
-    
-    // Criar sample buffer
-    CMSampleBufferRef sampleBuffer = NULL;
-    uint8_t *dataBuffer = malloc(size);
-    if (!dataBuffer) return NULL;
-    
-    memcpy(dataBuffer, data, size);
-    
-    CMBlockBufferRef blockBuffer = NULL;
-    OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault,
-        dataBuffer,
-        size,
-        kCFAllocatorMalloc,
-        NULL,
-        0,
-        size,
-        0,
-        &blockBuffer
-    );
-    
-    if (status == noErr) {
-        status = CMSampleBufferCreate(
-            kCFAllocatorDefault,
-            blockBuffer,
-            YES,
-            NULL,
-            NULL,
-            formatDescription,
-            1,
-            1,
-            &timing,
-            0,
-            NULL,
-            &sampleBuffer
-        );
-    }
-    
-    if (blockBuffer) {
-        CFRelease(blockBuffer);
-    }
-    
-    if (status != noErr) {
-        NSLog(@"Failed to create sample buffer: %d", (int)status);
-        return NULL;
-    }
-    
-    return sampleBuffer;
+    // Audio preview not implemented yet
 }
 
 - (BOOL)extractSPSAndPPS:(const uint8_t *)data 
@@ -325,6 +237,124 @@
     }
     
     return *count > 0;
+}
+
+- (CMSampleBufferRef)createSampleBufferFromH264Data:(const uint8_t *)data 
+                                              size:(size_t)size 
+                                        timestamp:(uint32_t)timestamp {
+    // Create format description if needed
+    if (!self.formatDescription) {
+        const uint8_t *parameterSetPointers[2] = {NULL, NULL};
+        size_t parameterSetSizes[2] = {0, 0};
+        int parameterSetCount = 0;
+        
+        if ([self extractSPSAndPPS:data size:size
+                    parameterSets:parameterSetPointers
+                parameterSetSizes:parameterSetSizes
+                           count:&parameterSetCount]) {
+            
+            OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault,
+                parameterSetCount,
+                parameterSetPointers,
+                parameterSetSizes,
+                4,
+                &_formatDescription
+            );
+            
+            if (status != noErr) {
+                if ([self.previewView.delegate respondsToSelector:@selector(preview:didFailWithError:)]) {
+                    NSError *error = [NSError errorWithDomain:@"com.rtmpcamera"
+                                                       code:status
+                                                   userInfo:@{NSLocalizedDescriptionKey: @"Failed to create format description"}];
+                    [self.previewView.delegate preview:self.previewView didFailWithError:error];
+                }
+                return NULL;
+            }
+        }
+    }
+    
+    if (!self.formatDescription) return NULL;
+    
+    // Create timing info
+    CMTime presentationTime = CMTimeMake(timestamp, 1000);
+    CMSampleTimingInfo timing = {
+        .duration = kCMTimeInvalid,
+        .presentationTimeStamp = presentationTime,
+        .decodeTimeStamp = presentationTime
+    };
+    
+    // Create sample buffer
+    CMBlockBufferRef blockBuffer = NULL;
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault,
+        (void *)data,  // data will be copied
+        size,
+        kCFAllocatorNull,
+        NULL,
+        0,
+        size,
+        0,
+        &blockBuffer
+    );
+    
+    if (status != noErr) {
+        if ([self.previewView.delegate respondsToSelector:@selector(preview:didFailWithError:)]) {
+            NSError *error = [NSError errorWithDomain:@"com.rtmpcamera"
+                                               code:status
+                                           userInfo:@{NSLocalizedDescriptionKey: @"Failed to create block buffer"}];
+            [self.previewView.delegate preview:self.previewView didFailWithError:error];
+        }
+        return NULL;
+    }
+    
+    CMSampleBufferRef sampleBuffer = NULL;
+    status = CMSampleBufferCreate(
+        kCFAllocatorDefault,
+        blockBuffer,
+        YES,
+        NULL,
+        NULL,
+        self.formatDescription,
+        1,
+        1,
+        &timing,
+        0,
+        NULL,
+        &sampleBuffer
+    );
+    
+    CFRelease(blockBuffer);
+    
+    if (status != noErr) {
+        if ([self.previewView.delegate respondsToSelector:@selector(preview:didFailWithError:)]) {
+            NSError *error = [NSError errorWithDomain:@"com.rtmpcamera"
+                                               code:status
+                                           userInfo:@{NSLocalizedDescriptionKey: @"Failed to create sample buffer"}];
+            [self.previewView.delegate preview:self.previewView didFailWithError:error];
+        }
+        return NULL;
+    }
+    
+    return sampleBuffer;
+}
+
+#pragma mark - RTMPPreviewDelegate
+
+- (void)previewDidStart:(id)preview {
+    NSLog(@"[RTMPCamera] Preview started");
+}
+
+- (void)previewDidStop:(id)preview {
+    NSLog(@"[RTMPCamera] Preview stopped");
+}
+
+- (void)previewDidCleanup:(id)preview {
+    NSLog(@"[RTMPCamera] Preview cleaned up");
+}
+
+- (void)preview:(id)preview didFailWithError:(NSError *)error {
+    NSLog(@"[RTMPCamera] Preview failed with error: %@", error);
 }
 
 @end
