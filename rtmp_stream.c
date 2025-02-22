@@ -1,182 +1,218 @@
-// rtmp_stream.c
 #include "rtmp_stream.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Estrutura para análise de qualidade
+#define STREAM_BUFFER_SIZE 1024 * 1024 // 1MB
+#define MAX_FRAME_QUEUE_SIZE 60 // 2 segundos @ 30fps
+#define MIN_FRAME_INTERVAL 1000 / 60 // 60fps max
+
 typedef struct {
-    uint32_t last_keyframe_timestamp;
-    uint32_t frames_since_keyframe;
-    uint32_t total_bytes;
-    uint32_t frame_count;
-    float avg_frame_size;
-    uint32_t dropped_frames;
-} StreamQualityMetrics;
+    uint8_t* data;
+    size_t length;
+    uint64_t timestamp;
+    int type; // 1 = video, 2 = audio
+} StreamFrame;
 
-static StreamQualityMetrics quality_metrics = {0};
+typedef struct {
+    StreamFrame* frames[MAX_FRAME_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} FrameQueue;
 
-int rtmp_stream_process_video(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message || !message->payload) {
-        return RTMP_ERROR_MEMORY;
+typedef struct {
+    int running;
+    pthread_t thread;
+    FrameQueue videoQueue;
+    FrameQueue audioQueue;
+    uint64_t lastVideoTimestamp;
+    uint64_t lastAudioTimestamp;
+    int videoFrameDropped;
+    int audioFrameDropped;
+    RTMPStreamStats stats;
+    void* userData;
+    StreamCallback callback;
+} StreamProcessor;
+
+static StreamProcessor* processor = NULL;
+
+// Inicialização da fila de frames
+static void frame_queue_init(FrameQueue* queue) {
+    memset(queue, 0, sizeof(FrameQueue));
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
+}
+
+// Destruição da fila de frames
+static void frame_queue_destroy(FrameQueue* queue) {
+    pthread_mutex_lock(&queue->mutex);
+    for (int i = 0; i < MAX_FRAME_QUEUE_SIZE; i++) {
+        if (queue->frames[i]) {
+            free(queue->frames[i]->data);
+            free(queue->frames[i]);
+        }
     }
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
+}
 
-    RTMPVideoPacket packet = {0};
-    int ret = rtmp_stream_parse_video_packet(message->payload, message->message_length, &packet);
-    if (ret != RTMP_OK) {
-        return ret;
+// Adiciona frame à fila
+static int frame_queue_push(FrameQueue* queue, StreamFrame* frame) {
+    int dropped = 0;
+    pthread_mutex_lock(&queue->mutex);
+    
+    if (queue->count >= MAX_FRAME_QUEUE_SIZE) {
+        // Política de dropping: descarta frame mais antigo
+        StreamFrame* oldFrame = queue->frames[queue->tail];
+        queue->tail = (queue->tail + 1) % MAX_FRAME_QUEUE_SIZE;
+        queue->count--;
+        
+        if (oldFrame) {
+            free(oldFrame->data);
+            free(oldFrame);
+        }
+        dropped = 1;
     }
+    
+    queue->frames[queue->head] = frame;
+    queue->head = (queue->head + 1) % MAX_FRAME_QUEUE_SIZE;
+    queue->count++;
+    
+    pthread_cond_signal(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+    
+    return dropped;
+}
 
-    // Atualiza informações do stream
-    session->stream_info.video_codec[0] = '\0';
-    strncpy(session->stream_info.video_codec, 
-            rtmp_stream_get_codec_name(packet.codec),
-            sizeof(session->stream_info.video_codec) - 1);
-
-    // Analisa qualidade do stream
-    rtmp_stream_analyze_quality(session, &packet);
-
-    // Se for um keyframe com sequence header, extrai resolução
-    if (packet.is_keyframe && packet.is_sequence_header) {
-        if (packet.codec == RTMP_VIDEO_CODEC_H264) {
-            // Parse do SPS para obter resolução
-            // Nota: Implementação simplificada, ajustar conforme necessário
-            uint8_t* sps = packet.data;
-            uint32_t sps_size = packet.length;
+// Thread de processamento
+static void* process_stream(void* arg) {
+    StreamProcessor* proc = (StreamProcessor*)arg;
+    uint8_t* buffer = malloc(STREAM_BUFFER_SIZE);
+    
+    while (proc->running) {
+        // Processa vídeo
+        pthread_mutex_lock(&proc->videoQueue.mutex);
+        while (proc->videoQueue.count > 0) {
+            StreamFrame* frame = proc->videoQueue.frames[proc->videoQueue.tail];
+            proc->videoQueue.frames[proc->videoQueue.tail] = NULL;
+            proc->videoQueue.tail = (proc->videoQueue.tail + 1) % MAX_FRAME_QUEUE_SIZE;
+            proc->videoQueue.count--;
             
-            // Exemplo de log para análise do SPS
-            rtmp_log(RTMP_LOG_DEBUG, "Received H264 SPS (size: %u)", sps_size);
-            if (sps_size > 0) {
-                rtmp_log(RTMP_LOG_DEBUG, "SPS first byte: 0x%02X", sps[0]);
+            if (frame) {
+                // Verifica intervalo mínimo entre frames
+                uint64_t delta = frame->timestamp - proc->lastVideoTimestamp;
+                if (delta >= MIN_FRAME_INTERVAL) {
+                    proc->callback(frame->data, frame->length, frame->timestamp, 1, proc->userData);
+                    proc->lastVideoTimestamp = frame->timestamp;
+                    proc->stats.videoFramesProcessed++;
+                } else {
+                    proc->videoFrameDropped++;
+                    proc->stats.videoFramesDropped++;
+                }
+                
+                free(frame->data);
+                free(frame);
             }
         }
-    }
-
-    rtmp_stream_free_video_packet(&packet);
-    return RTMP_OK;
-}
-
-int rtmp_stream_parse_video_packet(uint8_t* data, uint32_t length, RTMPVideoPacket* packet) {
-    if (!data || !packet || length < 2) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    packet->type = (data[0] >> 4) & 0x0F;
-    packet->codec = data[0] & 0x0F;
-    packet->is_keyframe = (packet->type == RTMP_VIDEO_KEYFRAME);
-    
-    // O segundo byte contém flags adicionais
-    packet->is_sequence_header = (data[1] == 0);
-
-    // Copia os dados do payload
-    packet->length = length - 2;
-    packet->data = malloc(packet->length);
-    if (!packet->data) {
-        return RTMP_ERROR_MEMORY;
-    }
-    memcpy(packet->data, data + 2, packet->length);
-
-    rtmp_log(RTMP_LOG_DEBUG, "Video packet: codec=%s, keyframe=%d, seq_header=%d, size=%u",
-             rtmp_stream_get_codec_name(packet->codec),
-             packet->is_keyframe,
-             packet->is_sequence_header,
-             packet->length);
-
-    return RTMP_OK;
-}
-
-void rtmp_stream_free_video_packet(RTMPVideoPacket* packet) {
-    if (packet) {
-        free(packet->data);
-        packet->data = NULL;
-    }
-}
-
-int rtmp_stream_process_audio(RTMPSession* session, RTMPMessage* message) {
-    if (!session || !message || !message->payload) {
-        return RTMP_ERROR_MEMORY;
-    }
-
-    RTMPAudioPacket packet = {0};
-    int ret = rtmp_stream_parse_audio_packet(message->payload, message->message_length, &packet);
-    if (ret != RTMP_OK) {
-        return ret;
-    }
-
-    // Atualiza bitrate de áudio
-    session->stream_info.audio_bitrate = (packet.length * 8 * 1000) / 
-                                       (message->timestamp - session->stream_info.start_time);
-
-    rtmp_stream_free_audio_packet(&packet);
-    return RTMP_OK;
-}
-
-int rtmp_stream_parse_audio_packet(uint8_t* data, uint32_t length, RTMPAudioPacket* packet) {
-    if (!data || !packet || length < 1) {
-        return RTMP_ERROR_PROTOCOL;
-    }
-
-    packet->codec = (data[0] >> 4) & 0x0F;
-    packet->is_sequence_header = (data[1] == 0);
-
-    packet->length = length - 2;
-    packet->data = malloc(packet->length);
-    if (!packet->data) {
-        return RTMP_ERROR_MEMORY;
-    }
-    memcpy(packet->data, data + 2, packet->length);
-
-    return RTMP_OK;
-}
-
-void rtmp_stream_free_audio_packet(RTMPAudioPacket* packet) {
-    if (packet) {
-        free(packet->data);
-        packet->data = NULL;
-    }
-}
-
-void rtmp_stream_analyze_quality(RTMPSession* session, RTMPVideoPacket* packet) {
-    if (!session || !packet) return;
-
-    quality_metrics.frame_count++;
-    quality_metrics.total_bytes += packet->length;
-    quality_metrics.avg_frame_size = (float)quality_metrics.total_bytes / quality_metrics.frame_count;
-
-    if (packet->is_keyframe) {
-        uint32_t keyframe_interval = 0;
-        if (quality_metrics.last_keyframe_timestamp > 0) {
-            keyframe_interval = packet->timestamp - quality_metrics.last_keyframe_timestamp;
+        pthread_mutex_unlock(&proc->videoQueue.mutex);
+        
+        // Processa áudio
+        pthread_mutex_lock(&proc->audioQueue.mutex);
+        while (proc->audioQueue.count > 0) {
+            StreamFrame* frame = proc->audioQueue.frames[proc->audioQueue.tail];
+            proc->audioQueue.frames[proc->audioQueue.tail] = NULL;
+            proc->audioQueue.tail = (proc->audioQueue.tail + 1) % MAX_FRAME_QUEUE_SIZE;
+            proc->audioQueue.count--;
+            
+            if (frame) {
+                proc->callback(frame->data, frame->length, frame->timestamp, 2, proc->userData);
+                proc->lastAudioTimestamp = frame->timestamp;
+                proc->stats.audioFramesProcessed++;
+                
+                free(frame->data);
+                free(frame);
+            }
         }
-        quality_metrics.last_keyframe_timestamp = packet->timestamp;
-        quality_metrics.frames_since_keyframe = 0;
-
-        rtmp_log(RTMP_LOG_INFO, "Keyframe received - Interval: %u ms", keyframe_interval);
-    } else {
-        quality_metrics.frames_since_keyframe++;
+        pthread_mutex_unlock(&proc->audioQueue.mutex);
+        
+        usleep(1000); // 1ms sleep para não sobrecarregar CPU
     }
-
-    // Calcula bitrate de vídeo
-    if (packet->timestamp > session->stream_info.start_time) {
-        session->stream_info.video_bitrate = 
-            (quality_metrics.total_bytes * 8 * 1000) / 
-            (packet->timestamp - session->stream_info.start_time);
-    }
-
-    // Log periódico de qualidade (a cada 100 frames)
-    if (quality_metrics.frame_count % 100 == 0) {
-        rtmp_log(RTMP_LOG_INFO, "Stream Quality Metrics:");
-        rtmp_log(RTMP_LOG_INFO, "  Average Frame Size: %.2f bytes", quality_metrics.avg_frame_size);
-        rtmp_log(RTMP_LOG_INFO, "  Video Bitrate: %u kbps", session->stream_info.video_bitrate / 1000);
-        rtmp_log(RTMP_LOG_INFO, "  Frames Since Last Keyframe: %u", quality_metrics.frames_since_keyframe);
-        rtmp_log(RTMP_LOG_INFO, "  Dropped Frames: %u", quality_metrics.dropped_frames);
-    }
+    
+    free(buffer);
+    return NULL;
 }
 
-const char* rtmp_stream_get_codec_name(uint8_t codec) {
-    switch (codec) {
-        case RTMP_VIDEO_CODEC_H264: return "H264";
-        case RTMP_VIDEO_CODEC_H265: return "H265";
-        case RTMP_VIDEO_CODEC_VP6:  return "VP6";
-        default: return "Unknown";
+int rtmp_stream_init(StreamCallback cb, void* userData) {
+    if (processor) return -1;
+    
+    processor = calloc(1, sizeof(StreamProcessor));
+    processor->callback = cb;
+    processor->userData = userData;
+    
+    frame_queue_init(&processor->videoQueue);
+    frame_queue_init(&processor->audioQueue);
+    
+    processor->running = 1;
+    pthread_create(&processor->thread, NULL, process_stream, processor);
+    
+    return 0;
+}
+
+void rtmp_stream_destroy(void) {
+    if (!processor) return;
+    
+    processor->running = 0;
+    pthread_join(processor->thread, NULL);
+    
+    frame_queue_destroy(&processor->videoQueue);
+    frame_queue_destroy(&processor->audioQueue);
+    
+    free(processor);
+    processor = NULL;
+}
+
+int rtmp_stream_push_video(uint8_t* data, size_t length, uint64_t timestamp) {
+    if (!processor) return -1;
+    
+    StreamFrame* frame = malloc(sizeof(StreamFrame));
+    frame->data = malloc(length);
+    memcpy(frame->data, data, length);
+    frame->length = length;
+    frame->timestamp = timestamp;
+    frame->type = 1;
+    
+    int dropped = frame_queue_push(&processor->videoQueue, frame);
+    if (dropped) {
+        processor->videoFrameDropped++;
     }
+    
+    return dropped;
+}
+
+int rtmp_stream_push_audio(uint8_t* data, size_t length, uint64_t timestamp) {
+    if (!processor) return -1;
+    
+    StreamFrame* frame = malloc(sizeof(StreamFrame));
+    frame->data = malloc(length);
+    memcpy(frame->data, data, length);
+    frame->length = length;
+    frame->timestamp = timestamp;
+    frame->type = 2;
+    
+    int dropped = frame_queue_push(&processor->audioQueue, frame);
+    if (dropped) {
+        processor->audioFrameDropped++;
+    }
+    
+    return dropped;
+}
+
+void rtmp_stream_get_stats(RTMPStreamStats* stats) {
+    if (!processor || !stats) return;
+    
+    memcpy(stats, &processor->stats, sizeof(RTMPStreamStats));
 }
