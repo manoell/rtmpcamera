@@ -1,24 +1,121 @@
 #include "rtmp_session.h"
-#include "rtmp_protocol.h"
-#include "rtmp_utils.h"
-#include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
 
-rtmp_session_t* rtmp_session_create(int socket_fd) {
+// Internal session structure
+struct rtmp_session_t {
+    rtmp_session_config_t config;
+    rtmp_session_callbacks_t callbacks;
+    rtmp_session_state_t state;
+    rtmp_session_stats_t stats;
+    
+    rtmp_context_t *rtmp;
+    uint32_t stream_id;
+    uint32_t transaction_id;
+    uint64_t session_start_time;
+    uint64_t last_ping_time;
+    uint64_t last_activity_time;
+    
+    char error_message[256];
+    bool is_publisher;
+    bool is_playing;
+    
+    // Buffer management
+    uint8_t *temp_buffer;
+    size_t temp_buffer_size;
+    
+    // Metadata
+    char *metadata_name;
+    uint8_t *metadata;
+    size_t metadata_size;
+};
+
+// Internal utility functions
+static uint64_t get_current_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+}
+
+static void rtmp_session_handle_error(rtmp_session_t *session, const char *fmt, ...) {
+    if (!session) return;
+    
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(session->error_message, sizeof(session->error_message), fmt, args);
+    va_end(args);
+    
+    if (session->callbacks.on_error) {
+        session->callbacks.on_error(session, session->error_message);
+    }
+}
+
+static void rtmp_session_update_state(rtmp_session_t *session, rtmp_session_state_t new_state) {
+    if (!session || session->state == new_state) return;
+    
+    rtmp_session_state_t old_state = session->state;
+    session->state = new_state;
+    
+    if (session->callbacks.on_state_change) {
+        session->callbacks.on_state_change(session, old_state, new_state);
+    }
+}
+
+rtmp_session_t* rtmp_session_create(const rtmp_session_config_t *config, const rtmp_session_callbacks_t *callbacks) {
+    if (!config) return NULL;
+    
     rtmp_session_t *session = (rtmp_session_t*)calloc(1, sizeof(rtmp_session_t));
     if (!session) return NULL;
     
-    session->socket_fd = socket_fd;
-    session->state = RTMP_SESSION_STATE_INIT;
-    session->in_chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    session->out_chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    session->window_ack_size = RTMP_DEFAULT_WINDOW_SIZE;
-    session->peer_bandwidth = RTMP_DEFAULT_WINDOW_SIZE;
+    // Copy configuration
+    session->config = *config;
     
-    // Initialize chunk streams array
-    memset(session->chunk_streams, 0, sizeof(session->chunk_streams));
+    // Set callbacks if provided
+    if (callbacks) {
+        session->callbacks = *callbacks;
+    }
+    
+    // Initialize RTMP context
+    rtmp_config_t rtmp_config = {
+        .chunk_size = config->chunk_size,
+        .window_size = 2500000,
+        .peer_bandwidth = 2500000,
+        .peer_bandwidth_limit_type = 2,
+        .tcp_nodelay = true,
+        .timeout_ms = config->timeout_ms
+    };
+    
+    rtmp_callbacks_t rtmp_callbacks = {
+        .on_state_change = NULL,  // Will be set internally
+        .on_chunk_received = NULL,
+        .on_message_received = NULL,
+        .on_error = NULL
+    };
+    
+    session->rtmp = rtmp_create(&rtmp_config, &rtmp_callbacks);
+    if (!session->rtmp) {
+        free(session);
+        return NULL;
+    }
+    
+    // Initialize other members
+    session->state = RTMP_SESSION_STATE_NEW;
+    session->stream_id = 0;
+    session->transaction_id = 1;
+    session->session_start_time = get_current_time_ms();
+    session->last_ping_time = session->session_start_time;
+    session->last_activity_time = session->session_start_time;
+    
+    // Allocate temporary buffer
+    session->temp_buffer_size = 64 * 1024;  // 64KB initial size
+    session->temp_buffer = (uint8_t*)malloc(session->temp_buffer_size);
+    if (!session->temp_buffer) {
+        rtmp_destroy(session->rtmp);
+        free(session);
+        return NULL;
+    }
     
     return session;
 }
@@ -26,284 +123,252 @@ rtmp_session_t* rtmp_session_create(int socket_fd) {
 void rtmp_session_destroy(rtmp_session_t *session) {
     if (!session) return;
     
-    // Close socket
-    if (session->socket_fd >= 0) {
-        close(session->socket_fd);
+    // Stop session if still active
+    if (session->state != RTMP_SESSION_STATE_CLOSED) {
+        rtmp_session_stop(session);
     }
     
-    // Free chunk streams
-    for (int i = 0; i < RTMP_MAX_CHUNK_STREAMS; i++) {
-        if (session->chunk_streams[i]) {
-            rtmp_free_chunk_stream(session->chunk_streams[i]);
-        }
+    // Cleanup RTMP context
+    if (session->rtmp) {
+        rtmp_destroy(session->rtmp);
     }
     
-    // Free stream name
-    if (session->stream_name) {
-        free(session->stream_name);
-    }
-    
-    // Free sequence headers
-    if (session->aac_sequence_header) {
-        free(session->aac_sequence_header);
-    }
-    if (session->avc_sequence_header) {
-        free(session->avc_sequence_header);
-    }
+    // Free buffers
+    free(session->temp_buffer);
+    free(session->metadata_name);
+    free(session->metadata);
     
     free(session);
 }
 
-int rtmp_session_send_data(rtmp_session_t *session, const uint8_t *data, size_t size) {
-    if (!session || !data || !size) return -1;
+rtmp_error_t rtmp_session_start(rtmp_session_t *session) {
+    if (!session) return RTMP_ERROR_INVALID_STATE;
     
-    size_t total_sent = 0;
-    while (total_sent < size) {
-        ssize_t sent = send(session->socket_fd, data + total_sent, size - total_sent, 0);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full, wait a bit
-                usleep(1000);
-                continue;
-            }
-            return -1;
-        }
-        total_sent += sent;
+    // Update state
+    rtmp_session_update_state(session, RTMP_SESSION_STATE_HANDSHAKING);
+    
+    // Start RTMP connection
+    rtmp_error_t err = rtmp_connect(session->rtmp, session->config.app_name, RTMP_DEFAULT_PORT);
+    if (err != RTMP_ERROR_OK) {
+        rtmp_session_handle_error(session, "Failed to connect: %s", rtmp_get_error_string(err));
+        rtmp_session_update_state(session, RTMP_SESSION_STATE_ERROR);
+        return err;
     }
     
-    return 0;
+    // Start publisher or player
+    if (session->config.is_publisher) {
+        err = rtmp_session_start_publish(session);
+    } else {
+        err = rtmp_session_start_play(session);
+    }
+    
+    if (err != RTMP_ERROR_OK) {
+        rtmp_session_update_state(session, RTMP_SESSION_STATE_ERROR);
+        return err;
+    }
+    
+    return RTMP_ERROR_OK;
 }
 
-int rtmp_session_close(rtmp_session_t *session) {
-    if (!session) return -1;
+rtmp_error_t rtmp_session_stop(rtmp_session_t *session) {
+    if (!session) return RTMP_ERROR_INVALID_STATE;
     
-    session->state = RTMP_SESSION_STATE_CLOSING;
+    rtmp_session_update_state(session, RTMP_SESSION_STATE_CLOSING);
     
-    // Send any pending data
-    // TODO: Implement flush mechanism if needed
+    // Stop publishing/playing
+    if (session->is_publisher) {
+        rtmp_session_stop_publish(session);
+    } else if (session->is_playing) {
+        rtmp_session_stop_play(session);
+    }
     
-    shutdown(session->socket_fd, SHUT_RDWR);
-    close(session->socket_fd);
-    session->socket_fd = -1;
+    // Disconnect RTMP
+    rtmp_error_t err = rtmp_disconnect(session->rtmp);
+    if (err != RTMP_ERROR_OK) {
+        rtmp_session_handle_error(session, "Failed to disconnect: %s", rtmp_get_error_string(err));
+        rtmp_session_update_state(session, RTMP_SESSION_STATE_ERROR);
+        return err;
+    }
     
-    session->state = RTMP_SESSION_STATE_CLOSED;
-    return 0;
+    rtmp_session_update_state(session, RTMP_SESSION_STATE_CLOSED);
+    return RTMP_ERROR_OK;
 }
 
-// Stream management functions
-uint32_t rtmp_session_create_stream(rtmp_session_t *session) {
-    if (!session) return 0;
+rtmp_error_t rtmp_session_send_audio(rtmp_session_t *session, const uint8_t *data, size_t len, uint32_t timestamp) {
+    if (!session || !data || !len) return RTMP_ERROR_INVALID_STATE;
+    if (!session->is_publisher) return RTMP_ERROR_INVALID_STATE;
     
-    static uint32_t next_stream_id = 1;
+    rtmp_error_t err = rtmp_send_audio(session->rtmp, data, len, timestamp);
+    if (err == RTMP_ERROR_OK) {
+        session->stats.bytes_sent += len;
+        session->stats.messages_sent++;
+        session->last_activity_time = get_current_time_ms();
+    }
     
-    // Simple stream ID generation
-    uint32_t stream_id = next_stream_id++;
-    if (next_stream_id == 0) next_stream_id = 1;
-    
-    session->stream_id = stream_id;
-    return stream_id;
+    return err;
 }
 
-int rtmp_session_delete_stream(rtmp_session_t *session, uint32_t stream_id) {
-    if (!session) return -1;
+rtmp_error_t rtmp_session_send_video(rtmp_session_t *session, const uint8_t *data, size_t len, uint32_t timestamp) {
+    if (!session || !data || !len) return RTMP_ERROR_INVALID_STATE;
+    if (!session->is_publisher) return RTMP_ERROR_INVALID_STATE;
     
-    if (session->stream_id == stream_id) {
-        // Clear stream state
-        session->stream_id = 0;
-        session->is_publishing = 0;
+    rtmp_error_t err = rtmp_send_video(session->rtmp, data, len, timestamp);
+    if (err == RTMP_ERROR_OK) {
+        session->stats.bytes_sent += len;
+        session->stats.messages_sent++;
+        session->last_activity_time = get_current_time_ms();
+    }
+    
+    return err;
+}
+
+rtmp_error_t rtmp_session_send_metadata(rtmp_session_t *session, const char *name, const uint8_t *data, size_t len) {
+    if (!session || !name || !data || !len) return RTMP_ERROR_INVALID_STATE;
+    if (!session->is_publisher) return RTMP_ERROR_INVALID_STATE;
+    
+    // Update stored metadata
+    free(session->metadata_name);
+    free(session->metadata);
+    
+    session->metadata_name = strdup(name);
+    session->metadata = malloc(len);
+    if (!session->metadata_name || !session->metadata) {
+        free(session->metadata_name);
+        free(session->metadata);
+        session->metadata_name = NULL;
+        session->metadata = NULL;
+        session->metadata_size = 0;
+        return RTMP_ERROR_MEMORY;
+    }
+    
+    memcpy(session->metadata, data, len);
+    session->metadata_size = len;
+    
+    // Send metadata message
+    rtmp_error_t err = rtmp_send_message(session->rtmp, 
+                                        RTMP_MSG_DATA_AMF0, 
+                                        session->stream_id,
+                                        data, len);
+    
+    if (err == RTMP_ERROR_OK) {
+        session->stats.bytes_sent += len;
+        session->stats.messages_sent++;
+        session->last_activity_time = get_current_time_ms();
+    }
+    
+    return err;
+}
+
+rtmp_error_t rtmp_session_ping(rtmp_session_t *session) {
+    if (!session) return RTMP_ERROR_INVALID_STATE;
+    
+    uint64_t current_time = get_current_time_ms();
+    
+    // Check if it's time to send ping
+    if (current_time - session->last_ping_time >= session->config.ping_interval) {
+        uint8_t ping_data[6];
+        uint16_t type = htons(RTMP_USER_PING_REQUEST);
+        uint32_t timestamp = htonl((uint32_t)current_time);
         
-        if (session->stream_name) {
-            free(session->stream_name);
-            session->stream_name = NULL;
-        }
-    }
-    
-    return 0;
-}
-
-int rtmp_session_set_publish_stream(rtmp_session_t *session, const char *stream_name) {
-    if (!session || !stream_name) return -1;
-    
-    // Check if already publishing
-    if (session->is_publishing) {
-        return -1;
-    }
-    
-    // Store stream name
-    char *new_name = strdup(stream_name);
-    if (!new_name) return -1;
-    
-    if (session->stream_name) {
-        free(session->stream_name);
-    }
-    session->stream_name = new_name;
-    session->is_publishing = 1;
-    
-    return 0;
-}
-
-int rtmp_session_set_play_stream(rtmp_session_t *session, const char *stream_name) {
-    if (!session || !stream_name) return -1;
-    
-    // Check if already publishing
-    if (session->is_publishing) {
-        return -1;
-    }
-    
-    // Store stream name
-    char *new_name = strdup(stream_name);
-    if (!new_name) return -1;
-    
-    if (session->stream_name) {
-        free(session->stream_name);
-    }
-    session->stream_name = new_name;
-    session->is_publishing = 0;
-    
-    return 0;
-}
-
-// Chunk stream management
-rtmp_chunk_stream_t* rtmp_get_chunk_stream(rtmp_session_t *session, uint32_t chunk_stream_id) {
-    if (!session || chunk_stream_id >= RTMP_MAX_CHUNK_STREAMS) return NULL;
-    
-    if (!session->chunk_streams[chunk_stream_id]) {
-        // Create new chunk stream
-        rtmp_chunk_stream_t *chunk_stream = (rtmp_chunk_stream_t*)calloc(1, sizeof(rtmp_chunk_stream_t));
-        if (!chunk_stream) return NULL;
+        memcpy(ping_data, &type, 2);
+        memcpy(ping_data + 2, &timestamp, 4);
         
-        session->chunk_streams[chunk_stream_id] = chunk_stream;
+        rtmp_error_t err = rtmp_send_message(session->rtmp, 
+                                          RTMP_MSG_USER_CONTROL,
+                                          0, ping_data, sizeof(ping_data));
+        
+        if (err == RTMP_ERROR_OK) {
+            session->last_ping_time = current_time;
+        }
+        
+        return err;
     }
     
-    return session->chunk_streams[chunk_stream_id];
+    return RTMP_ERROR_OK;
 }
 
-void rtmp_free_chunk_stream(rtmp_chunk_stream_t *chunk_stream) {
-    if (!chunk_stream) return;
+rtmp_error_t rtmp_session_process(rtmp_session_t *session) {
+    if (!session) return RTMP_ERROR_INVALID_STATE;
     
-    if (chunk_stream->msg_data) {
-        free(chunk_stream->msg_data);
+    // Process RTMP messages
+    rtmp_error_t err = RTMP_ERROR_OK;
+    while (err == RTMP_ERROR_OK) {
+        rtmp_chunk_t *chunk = rtmp_chunk_create();
+        if (!chunk) return RTMP_ERROR_MEMORY;
+        
+        err = rtmp_receive_chunk(session->rtmp, chunk);
+        if (err == RTMP_ERROR_OK) {
+            err = rtmp_session_handle_message(session, chunk);
+        }
+        
+        rtmp_chunk_destroy(chunk);
     }
     
-    free(chunk_stream);
-}
-
-// Buffer management
-int rtmp_session_handle_acknowledgement(rtmp_session_t *session) {
-    if (!session) return -1;
-    
-    if (session->bytes_received >= session->window_ack_size) {
-        // Send acknowledgement
-        uint32_t ack_size = session->bytes_received;
-        return rtmp_send_message(session, RTMP_MSG_ACKNOWLEDGEMENT, 0, 
-                               (uint8_t*)&ack_size, sizeof(ack_size));
+    // Check for timeout
+    uint64_t current_time = get_current_time_ms();
+    if (current_time - session->last_activity_time > session->config.timeout_ms) {
+        rtmp_session_handle_error(session, "Session timeout");
+        return RTMP_ERROR_TIMEOUT;
     }
     
-    return 0;
-}
-
-int rtmp_session_update_bytes_received(rtmp_session_t *session, size_t bytes) {
-    if (!session) return -1;
-    
-    session->bytes_received += bytes;
-    return rtmp_session_handle_acknowledgement(session);
-}
-
-// Media handling functions
-int rtmp_session_send_video(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp) {
-    if (!session || !data || !size) return -1;
-    
-    // Create video message
-    uint8_t *message = (uint8_t*)malloc(size + 5);
-    if (!message) return -1;
-    
-    // FLV video tag header
-    message[0] = 0x17; // KeyFrame(1) + AVC(7)
-    message[1] = 0x01; // AVC NALU
-    message[2] = 0x00; // Composition time offset
-    message[3] = 0x00;
-    message[4] = 0x00;
-    
-    // Copy video data
-    memcpy(message + 5, data, size);
-    
-    // Send message
-    int result = rtmp_send_message(session, RTMP_MSG_VIDEO, session->stream_id, 
-                                 message, size + 5);
-    
-    free(message);
-    return result;
-}
-
-int rtmp_session_send_audio(rtmp_session_t *session, const uint8_t *data, size_t size, uint32_t timestamp) {
-    if (!session || !data || !size) return -1;
-    
-    // Create audio message
-    uint8_t *message = (uint8_t*)malloc(size + 2);
-    if (!message) return -1;
-    
-    // FLV audio tag header
-    message[0] = 0xaf; // AAC(10) + 44kHz(3) + 16bit(1) + Stereo(1)
-    message[1] = 0x01; // AAC raw data
-    
-    // Copy audio data
-    memcpy(message + 2, data, size);
-    
-    // Send message
-    int result = rtmp_send_message(session, RTMP_MSG_AUDIO, session->stream_id, 
-                                 message, size + 2);
-    
-    free(message);
-    return result;
-}
-
-int rtmp_session_send_metadata(rtmp_session_t *session, const uint8_t *data, size_t size) {
-    if (!session || !data || !size) return -1;
-    
-    rtmp_amf_t *amf = rtmp_amf_create();
-    if (!amf) return -1;
-    
-    // @setDataFrame marker
-    rtmp_amf_encode_string(amf, "@setDataFrame");
-    
-    // onMetaData event
-    rtmp_amf_encode_string(amf, "onMetaData");
-    
-    // Copy metadata
-    size_t amf_size;
-    const uint8_t *amf_data = rtmp_amf_get_data(amf, &amf_size);
-    
-    uint8_t *message = (uint8_t*)malloc(amf_size + size);
-    if (!message) {
-        rtmp_amf_destroy(amf);
-        return -1;
+    // Send periodic ping if needed
+    err = rtmp_session_ping(session);
+    if (err != RTMP_ERROR_OK) {
+        rtmp_session_handle_error(session, "Failed to send ping");
+        return err;
     }
     
-    memcpy(message, amf_data, amf_size);
-    memcpy(message + amf_size, data, size);
-    
-    // Send message
-    int result = rtmp_send_message(session, RTMP_MSG_DATA_AMF0, session->stream_id, 
-                                 message, amf_size + size);
-    
-    free(message);
-    rtmp_amf_destroy(amf);
-    return result;
+    return RTMP_ERROR_OK;
 }
 
-// State management
-int rtmp_session_set_state(rtmp_session_t *session, int state) {
-    if (!session) return -1;
-    
-    if (state < RTMP_SESSION_STATE_INIT || state > RTMP_SESSION_STATE_CLOSED) {
-        return -1;
+bool rtmp_session_is_connected(const rtmp_session_t *session) {
+    if (!session) return false;
+    return session->state == RTMP_SESSION_STATE_CONNECTED ||
+           session->state == RTMP_SESSION_STATE_PUBLISHING ||
+           session->state == RTMP_SESSION_STATE_PLAYING;
+}
+
+bool rtmp_session_is_active(const rtmp_session_t *session) {
+    if (!session) return false;
+    return session->state != RTMP_SESSION_STATE_CLOSED &&
+           session->state != RTMP_SESSION_STATE_ERROR;
+}
+
+rtmp_session_state_t rtmp_session_get_state(const rtmp_session_t *session) {
+    return session ? session->state : RTMP_SESSION_STATE_ERROR;
+}
+
+const rtmp_session_stats_t* rtmp_session_get_stats(const rtmp_session_t *session) {
+    return session ? &session->stats : NULL;
+}
+
+const char* rtmp_session_get_error(const rtmp_session_t *session) {
+    return session ? session->error_message : "Invalid session";
+}
+
+void rtmp_session_set_chunk_size(rtmp_session_t *session, uint32_t size) {
+    if (session && size > 0) {
+        rtmp_set_chunk_size(session->rtmp, size);
     }
-    
-    session->state = state;
-    return 0;
 }
 
-int rtmp_session_get_state(rtmp_session_t *session) {
-    if (!session) return -1;
-    return session->state;
+void rtmp_session_set_buffer_time(rtmp_session_t *session, uint32_t ms) {
+    if (session) {
+        uint8_t buffer_data[10];
+        uint16_t type = htons(RTMP_USER_SET_BUFFER_LEN);
+        uint32_t stream_id = htonl(session->stream_id);
+        uint32_t buffer_time = htonl(ms);
+        
+        memcpy(buffer_data, &type, 2);
+        memcpy(buffer_data + 2, &stream_id, 4);
+        memcpy(buffer_data + 6, &buffer_time, 4);
+        
+        rtmp_send_message(session->rtmp, RTMP_MSG_USER_CONTROL, 0, buffer_data, sizeof(buffer_data));
+    }
+}
+
+void rtmp_session_set_stream_id(rtmp_session_t *session, uint32_t stream_id) {
+    if (session) {
+        session->stream_id = stream_id;
+    }
 }

@@ -1,177 +1,306 @@
 #import "rtmp_camera_compat.h"
+#import "rtmp_preview.h"
+#import <objc/runtime.h>
 #import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
 
-@implementation RTMPCameraCompat {
-    AVCaptureDevice *originalDevice;
-    NSDictionary *originalProperties;
-    CMTime originalFrameDuration;
-    AVCaptureDeviceFormat *originalFormat;
-    AVCaptureDeviceInput *virtualInput;
-    NSString *originalDeviceID;
-    NSString *originalModelID;
-    NSString *originalLocalizedName;
+// Private API hooks
+@interface AVCaptureDevice (Private)
+- (void)_setTransportControlsPresented:(BOOL)presented;
+@end
+
+@interface CAMCaptureEngine : NSObject
+- (void)setDelegate:(id)delegate;
+- (void)startCapture;
+- (void)stopCapture;
+@end
+
+@interface RTMPCameraController () {
+    AVCaptureSession *_captureSession;
+    AVCaptureDeviceInput *_deviceInput;
+    AVCaptureVideoDataOutput *_videoOutput;
+    dispatch_queue_t _captureQueue;
+    RTMPPreviewController *_previewController;
+    
+    CMTime _lastFrameTime;
+    float _originalISO;
+    CGFloat _originalZoomFactor;
+    AVCaptureWhiteBalanceGains _originalWBGains;
+    CMTime _originalExposureDuration;
+    CGPoint _originalFocusPoint;
+    
+    BOOL _isStreaming;
+    BOOL _isUsingRTMP;
+    NSMutableDictionary *_cameraSettings;
 }
 
-- (instancetype)init {
+@property (nonatomic, strong) NSMutableDictionary *streamMetrics;
+@end
+
+@implementation RTMPCameraController
+
++ (instancetype)sharedInstance {
+    static RTMPCameraController *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[self alloc] init];
+    });
+    return instance;
+}
+
+- (id)init {
     self = [super init];
     if (self) {
-        [self setupOriginalCameraProperties];
+        _captureQueue = dispatch_queue_create("com.rtmp.camera", DISPATCH_QUEUE_SERIAL);
+        _streamMetrics = [NSMutableDictionary dictionary];
+        _cameraSettings = [NSMutableDictionary dictionary];
+        _previewController = [[RTMPPreviewController alloc] init];
+        [self setupCaptureSession];
+        [self setupMethodSwizzling];
     }
     return self;
 }
 
-- (void)setupOriginalCameraProperties {
-    // Get the original back camera
-    originalDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    if (!originalDevice) return;
+- (void)setupCaptureSession {
+    _captureSession = [[AVCaptureSession alloc] init];
+    [_captureSession setSessionPreset:AVCaptureSessionPresetHigh];
     
-    // Store original device identifiers
-    originalDeviceID = [originalDevice.uniqueID copy];
-    originalModelID = [originalDevice.modelID copy];
-    originalLocalizedName = [originalDevice.localizedName copy];
-    
-    // Store full device configuration
-    originalProperties = @{
-        // Basic properties
-        @"uniqueID": originalDevice.uniqueID,
-        @"modelID": originalDevice.modelID,
-        @"localizedName": originalDevice.localizedName,
-        
-        // Camera capabilities
-        @"hasFlash": @(originalDevice.hasFlash),
-        @"hasTorch": @(originalDevice.hasTorch),
-        @"flashAvailable": @(originalDevice.flashAvailable),
-        @"torchAvailable": @(originalDevice.torchAvailable),
-        @"focusPointOfInterestSupported": @(originalDevice.focusPointOfInterestSupported),
-        @"exposurePointOfInterestSupported": @(originalDevice.exposurePointOfInterestSupported),
-        
-        // Current settings
-        @"exposureMode": @(originalDevice.exposureMode),
-        @"whiteBalanceMode": @(originalDevice.whiteBalanceMode),
-        @"focusMode": @(originalDevice.focusMode),
-        @"iso": @(originalDevice.iso),
-        @"exposureDuration": [NSValue valueWithCMTime:originalDevice.exposureDuration],
-        @"deviceWhiteBalanceGains": [NSValue valueWithCGPoint:CGPointMake(
-            originalDevice.deviceWhiteBalanceGains.redGain,
-            originalDevice.deviceWhiteBalanceGains.greenGain)],
-        @"lensPosition": @(originalDevice.lensPosition),
-        @"videoZoomFactor": @(originalDevice.videoZoomFactor),
-        
-        // Ranges and limits
-        @"activeFormat": originalDevice.activeFormat,
-        @"activeVideoMinFrameDuration": [NSValue valueWithCMTime:originalDevice.activeVideoMinFrameDuration],
-        @"activeVideoMaxFrameDuration": [NSValue valueWithCMTime:originalDevice.activeVideoMaxFrameDuration],
-        @"minExposureDuration": [NSValue valueWithCMTime:originalDevice.minExposureDuration],
-        @"maxExposureDuration": [NSValue valueWithCMTime:originalDevice.maxExposureDuration],
-        @"minISO": @(originalDevice.minISO),
-        @"maxISO": @(originalDevice.maxISO),
-        @"videoZoomFactorUpscaleThreshold": @(originalDevice.videoZoomFactorUpscaleThreshold),
-        @"maxWhiteBalanceGain": @(originalDevice.maxWhiteBalanceGain),
+    // Setup video output
+    _videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    _videoOutput.videoSettings = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
     };
+    [_videoOutput setSampleBufferDelegate:self queue:_captureQueue];
     
-    originalFormat = originalDevice.activeFormat;
-    originalFrameDuration = originalDevice.activeVideoMinFrameDuration;
-}
-
-- (AVCaptureDeviceInput *)createVirtualDeviceInput {
-    // Create a virtual camera device that perfectly mimics the original
-    Class virtualDeviceClass = NSClassFromString(@"AVCaptureDeviceVirtual");
-    id virtualDevice = [[virtualDeviceClass alloc] init];
-    
-    // Set all basic properties
-    [virtualDevice setValue:originalDeviceID forKey:@"uniqueID"];
-    [virtualDevice setValue:originalModelID forKey:@"modelID"];
-    [virtualDevice setValue:originalLocalizedName forKey:@"localizedName"];
-    
-    // Set capabilities
-    [virtualDevice setValue:originalProperties[@"hasFlash"] forKey:@"hasFlash"];
-    [virtualDevice setValue:originalProperties[@"hasTorch"] forKey:@"hasTorch"];
-    [virtualDevice setValue:originalProperties[@"flashAvailable"] forKey:@"flashAvailable"];
-    [virtualDevice setValue:originalProperties[@"torchAvailable"] forKey:@"torchAvailable"];
-    [virtualDevice setValue:originalProperties[@"focusPointOfInterestSupported"] forKey:@"focusPointOfInterestSupported"];
-    [virtualDevice setValue:originalProperties[@"exposurePointOfInterestSupported"] forKey:@"exposurePointOfInterestSupported"];
-    
-    // Configure format and ranges
-    [virtualDevice setValue:originalFormat forKey:@"activeFormat"];
-    [virtualDevice setValue:originalProperties[@"activeVideoMinFrameDuration"] forKey:@"activeVideoMinFrameDuration"];
-    [virtualDevice setValue:originalProperties[@"activeVideoMaxFrameDuration"] forKey:@"activeVideoMaxFrameDuration"];
-    [virtualDevice setValue:originalProperties[@"minExposureDuration"] forKey:@"minExposureDuration"];
-    [virtualDevice setValue:originalProperties[@"maxExposureDuration"] forKey:@"maxExposureDuration"];
-    [virtualDevice setValue:originalProperties[@"minISO"] forKey:@"minISO"];
-    [virtualDevice setValue:originalProperties[@"maxISO"] forKey:@"maxISO"];
-    
-    // Create input
-    NSError *error = nil;
-    virtualInput = [[AVCaptureDeviceInput alloc] initWithDevice:virtualDevice error:&error];
-    
-    if (error) {
-        NSLog(@"[RTMPCamera] Failed to create virtual device input: %@", error);
-        return nil;
+    if ([_captureSession canAddOutput:_videoOutput]) {
+        [_captureSession addOutput:_videoOutput];
     }
     
-    return virtualInput;
+    // Store original camera settings
+    [self backupOriginalCameraSettings];
 }
 
-- (void)configureVirtualCameraWithStream:(RTMPStream *)stream {
-    if (!stream) return;
+- (void)backupOriginalCameraSettings {
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    if (!device) return;
     
-    // Configure video format to match original camera
-    stream->video_width = (uint32_t)CMVideoFormatDescriptionGetDimensions(originalFormat.formatDescription).width;
-    stream->video_height = (uint32_t)CMVideoFormatDescriptionGetDimensions(originalFormat.formatDescription).height;
-    stream->video_fps = (uint32_t)(CMTimeGetSeconds(CMTimeMake(1, 1)) / CMTimeGetSeconds(originalFrameDuration));
+    _originalISO = device.ISO;
+    _originalZoomFactor = device.videoZoomFactor;
+    _originalWBGains = device.deviceWhiteBalanceGains;
+    _originalExposureDuration = device.exposureDuration;
+    _originalFocusPoint = device.focusPointOfInterest;
     
-    // Set camera properties
-    stream->camera_properties.exposure_mode = [originalProperties[@"exposureMode"] intValue];
-    stream->camera_properties.exposure_duration = [[originalProperties[@"exposureDuration"] CMTimeValue] timeValue];
-    stream->camera_properties.iso = [originalProperties[@"iso"] floatValue];
-    stream->camera_properties.white_balance_mode = [originalProperties[@"whiteBalanceMode"] intValue];
-    
-    CGPoint whiteBalanceGains = [[originalProperties[@"deviceWhiteBalanceGains"] CGPointValue];
-    stream->camera_properties.white_balance_gains[0] = whiteBalanceGains.x;
-    stream->camera_properties.white_balance_gains[1] = whiteBalanceGains.y;
-    
-    stream->camera_properties.focus_mode = [originalProperties[@"focusMode"] intValue];
-    stream->camera_properties.lens_position = [originalProperties[@"lensPosition"] floatValue];
-    stream->camera_properties.zoom_factor = [originalProperties[@"videoZoomFactor"] floatValue];
-    
-    if ([originalFormat respondsToSelector:@selector(videoFieldOfView)]) {
-        stream->camera_properties.field_of_view = originalFormat.videoFieldOfView;
-    }
+    // Store additional settings
+    _cameraSettings[@"focusMode"] = @(device.focusMode);
+    _cameraSettings[@"exposureMode"] = @(device.exposureMode);
+    _cameraSettings[@"whiteBalanceMode"] = @(device.whiteBalanceMode);
 }
 
-- (void)updateStreamMetadata:(RTMPStream *)stream {
-    if (!stream) return;
-    
-    // Update device information
-    stream->device_info.model_name = [originalModelID UTF8String];
-    stream->device_info.unique_identifier = [originalDeviceID UTF8String];
-    
-    // Update camera capabilities
-    stream->camera_capabilities.has_flash = [originalProperties[@"hasFlash"] boolValue];
-    stream->camera_capabilities.has_torch = [originalProperties[@"hasTorch"] boolValue];
-    stream->camera_capabilities.supports_focus_lock = true;
-    stream->camera_capabilities.supports_exposure_lock = true;
-    
-    // Get supported formats
-    NSArray *formats = [originalDevice formats];
-    stream->camera_capabilities.supported_formats_count = MIN((uint32_t)formats.count, MAX_SUPPORTED_FORMATS);
-    
-    for (uint32_t i = 0; i < stream->camera_capabilities.supported_formats_count; i++) {
-        AVCaptureDeviceFormat *format = formats[i];
-        CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+- (void)setupMethodSwizzling {
+    // Swizzle camera related methods
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class avCaptureDeviceClass = objc_getClass("AVCaptureDevice");
         
-        stream->camera_capabilities.supported_formats[i].width = dims.width;
-        stream->camera_capabilities.supported_formats[i].height = dims.height;
-        stream->camera_capabilities.supported_formats[i].fps = 
-            (uint32_t)format.videoSupportedFrameRateRanges.firstObject.maxFrameRate;
+        // Swizzle device property methods
+        [self swizzleMethod:@selector(ISO)
+                withMethod:@selector(rtmp_ISO)
+                  forClass:avCaptureDeviceClass];
+        
+        [self swizzleMethod:@selector(exposureDuration)
+                withMethod:@selector(rtmp_exposureDuration)
+                  forClass:avCaptureDeviceClass];
+        
+        [self swizzleMethod:@selector(focusPointOfInterest)
+                withMethod:@selector(rtmp_focusPointOfInterest)
+                  forClass:avCaptureDeviceClass];
+    });
+}
+
+- (void)swizzleMethod:(SEL)originalSelector withMethod:(SEL)swizzledSelector forClass:(Class)class {
+    Method originalMethod = class_getInstanceMethod(class, originalSelector);
+    Method swizzledMethod = class_getInstanceMethod(class, swizzledSelector);
+    
+    BOOL didAddMethod = class_addMethod(class,
+                                      originalSelector,
+                                      method_getImplementation(swizzledMethod),
+                                      method_getTypeEncoding(swizzledMethod));
+    
+    if (didAddMethod) {
+        class_replaceMethod(class,
+                          swizzledSelector,
+                          method_getImplementation(originalMethod),
+                          method_getTypeEncoding(originalMethod));
+    } else {
+        method_exchangeImplementations(originalMethod, swizzledMethod);
     }
 }
 
-- (void)dealloc {
-    originalProperties = nil;
-    originalDevice = nil;
-    virtualInput = nil;
+#pragma mark - RTMP Control
+
+- (void)startRTMPSession {
+    if (_isStreaming) return;
+    
+    _isStreaming = YES;
+    _isUsingRTMP = YES;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_previewController showPreview];
+    });
+    
+    // Start monitoring stream health
+    [self startStreamMonitoring];
+}
+
+- (void)stopRTMPSession {
+    _isStreaming = NO;
+    _isUsingRTMP = NO;
+    
+    // Restore original camera settings
+    [self restoreOriginalCameraSettings];
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_previewController hidePreview];
+    });
+    
+    [self stopStreamMonitoring];
+}
+
+- (void)restoreOriginalCameraSettings {
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    if (!device) return;
+    
+    [device lockForConfiguration:nil];
+    
+    device.videoZoomFactor = _originalZoomFactor;
+    
+    if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+        device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+    }
+    
+    if ([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+        device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+    }
+    
+    [device setExposureModeCustomWithDuration:_originalExposureDuration
+                                         ISO:_originalISO
+                           completionHandler:nil];
+    
+    [device setWhiteBalanceGains:_originalWBGains completionHandler:nil];
+    
+    [device unlockForConfiguration];
+}
+
+#pragma mark - Camera Parameter Emulation
+
+// Swizzled methods
+- (float)rtmp_ISO {
+    if (_isUsingRTMP) {
+        return [_cameraSettings[@"currentISO"] floatValue];
+    }
+    return [self rtmp_ISO];
+}
+
+- (CMTime)rtmp_exposureDuration {
+    if (_isUsingRTMP) {
+        return [_cameraSettings[@"currentExposureDuration"] CMTimeValue];
+    }
+    return [self rtmp_exposureDuration];
+}
+
+- (CGPoint)rtmp_focusPointOfInterest {
+    if (_isUsingRTMP) {
+        return [_cameraSettings[@"currentFocusPoint"] CGPointValue];
+    }
+    return [self rtmp_focusPointOfInterest];
+}
+
+#pragma mark - Stream Monitoring
+
+- (void)startStreamMonitoring {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        while (self->_isStreaming) {
+            [self updateStreamMetrics];
+            [NSThread sleepForTimeInterval:1.0];
+        }
+    });
+}
+
+- (void)updateStreamMetrics {
+    // Calculate current stream metrics
+    NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval elapsed = currentTime - [self.streamMetrics[@"lastUpdate"] doubleValue];
+    
+    if (elapsed >= 1.0) {
+        // Update metrics
+        NSInteger frameCount = [self.streamMetrics[@"frameCount"] integerValue];
+        float fps = frameCount / elapsed;
+        
+        self.streamMetrics[@"fps"] = @(fps);
+        self.streamMetrics[@"frameCount"] = @(0);
+        self.streamMetrics[@"lastUpdate"] = @(currentTime);
+        
+        // Update preview
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self->_previewController updateStreamMetrics:self.streamMetrics];
+        });
+    }
+}
+
+#pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
+
+- (void)captureOutput:(AVCaptureOutput *)output
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+    if (!_isStreaming) return;
+    
+    // Process frame
+    [self processVideoFrame:sampleBuffer];
+    
+    // Update preview if needed
+    if (_isUsingRTMP) {
+        [_previewController updateFrame:sampleBuffer];
+    }
+    
+    // Update metrics
+    NSInteger frameCount = [self.streamMetrics[@"frameCount"] integerValue];
+    self.streamMetrics[@"frameCount"] = @(frameCount + 1);
+}
+
+- (void)processVideoFrame:(CMSampleBufferRef)sampleBuffer {
+    if (!_isUsingRTMP) return;
+    
+    // Extract frame metadata
+    CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    Float64 frameInterval = CMTimeGetSeconds(CMTimeSubtract(presentationTime, _lastFrameTime));
+    _lastFrameTime = presentationTime;
+    
+    // Update camera settings based on RTMP stream
+    [self updateCameraSettingsFromFrame:sampleBuffer];
+    
+    // Calculate frame metrics
+    float instantFPS = frameInterval > 0 ? 1.0 / frameInterval : 0;
+    self.streamMetrics[@"instantFPS"] = @(instantFPS);
+}
+
+- (void)updateCameraSettingsFromFrame:(CMSampleBufferRef)sampleBuffer {
+    // Extract frame metadata
+    CFDictionaryRef metadataDict = CMGetAttachment(sampleBuffer, kCGImagePropertyExifDictionary, NULL);
+    if (metadataDict) {
+        CFNumberRef isoNumber = CFDictionaryGetValue(metadataDict, kCGImagePropertyExifISOSpeedRatings);
+        if (isoNumber) {
+            float iso;
+            CFNumberGetValue(isoNumber, kCFNumberFloatType, &iso);
+            _cameraSettings[@"currentISO"] = @(iso);
+        }
+        
+        CFNumberRef exposureTimeNumber = CFDictionaryGetValue(metadataDict, kCGImagePropertyExifExposureTime);
+        if (exposureTimeNumber) {
+            Float64 exposureTime;
+            CFNumberGetValue(exposureTimeNumber, kCFNumberFloat64Type, &exposureTime);
+            CMTime exposureDuration = CMTimeMakeWithSeconds(exposureTime, 1000000000);
+            _cameraSettings[@"currentExposureDuration"] = [NSValue valueWithCMTime:exposureDuration];
+        }
+    }
 }
 
 @end

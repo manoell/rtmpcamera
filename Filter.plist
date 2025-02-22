@@ -1,7 +1,29 @@
-{
-    Filter = {
-        Bundles = (
-            "com.apple.UIKit"
-        );
-    };
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Filter</key>
+    <dict>
+        <key>Bundles</key>
+        <array>
+            <string>com.apple.UIKit</string>
+            <string>com.apple.AVFoundation</string>
+            <string>com.apple.camera</string>
+        </array>
+        <key>Executables</key>
+        <array>
+            <string>SpringBoard</string>
+            <string>Camera</string>
+        </array>
+        <key>Classes</key>
+        <array>
+            <string>AVCaptureDevice</string>
+            <string>AVCaptureSession</string>
+            <string>AVCaptureVideoPreviewLayer</string>
+            <string>UIImagePickerController</string>
+        </array>
+        <key>Mode</key>
+        <string>Any</string>
+    </dict>
+</dict>
+</plist>

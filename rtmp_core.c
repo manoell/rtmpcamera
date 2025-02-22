@@ -1,381 +1,539 @@
 #include "rtmp_core.h"
-#include "rtmp_chunk.h"
-#include "rtmp_protocol.h"
-#include "rtmp_quality.h"
+#include "rtmp_utils.h"
 #include "rtmp_diagnostics.h"
+#include "rtmp_handshake.h"
+#include "rtmp_protocol.h"
+#include "rtmp_stream.h"
 #include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <errno.h>
 
+// Configuration constants
 #define RTMP_DEFAULT_PORT 1935
-#define RTMP_BUFFER_SIZE 65536
-#define RTMP_MAX_STREAMS 8
-#define RTMP_PING_INTERVAL 5000 // 5 seconds
+#define RTMP_MAX_CONNECTIONS 100
+#define RTMP_BUFFER_SIZE 4096
+#define RTMP_HEARTBEAT_INTERVAL 30
+#define RTMP_RECOVERY_ATTEMPTS 3
 
-struct RTMPContext {
-    int socket;
-    bool connected;
-    bool running;
-    
-    // Connection info
-    char hostname[256];
-    int port;
-    char app_name[128];
-    char stream_name[128];
-    
-    // Buffers
-    uint8_t *in_buffer;
-    uint8_t *out_buffer;
-    size_t in_buffer_size;
-    size_t out_buffer_size;
-    
-    // Stream management
-    RTMPStream *streams[RTMP_MAX_STREAMS];
-    uint32_t stream_count;
-    uint32_t current_stream_id;
-    
-    // Protocol state
-    uint32_t chunk_size;
-    uint32_t window_size;
-    uint32_t bandwidth;
-    
-    // Threading
-    pthread_t network_thread;
-    pthread_mutex_t mutex;
-    
-    // Callbacks
-    rtmp_core_callback_t callback;
-    void *callback_context;
-    
-    // Stats and monitoring
-    struct {
-        uint64_t bytes_sent;
-        uint64_t bytes_received;
-        uint32_t messages_sent;
-        uint32_t messages_received;
-        struct timeval last_ping;
-    } stats;
-};
+// Server context
+typedef struct {
+    int active_connections;
+    pthread_mutex_t conn_mutex;
+    pthread_mutex_t stats_mutex;
+    rtmp_connection_t *connections[RTMP_MAX_CONNECTIONS];
+    int server_socket;
+    int running;
+    rtmp_config_t config;
+    rtmp_stats_t stats;
+    int recovery_mode;
+} rtmp_server_context_t;
 
-static void rtmp_handle_error(RTMPContext *ctx, const char *message) {
-    if (ctx && ctx->callback) {
-        RTMPCoreEvent event = {
-            .type = RTMP_CORE_EVENT_ERROR,
-            .error_message = message
-        };
-        ctx->callback(&event, ctx->callback_context);
+static rtmp_server_context_t server_ctx;
+
+// Forward declarations
+static void* rtmp_core_accept_loop(void *arg);
+static void* rtmp_core_monitor_loop(void *arg);
+static int rtmp_core_recover_connection(rtmp_connection_t *conn);
+
+// Initialize the RTMP core
+int rtmp_core_init(void) {
+    memset(&server_ctx, 0, sizeof(server_ctx));
+    
+    // Initialize mutexes
+    if (pthread_mutex_init(&server_ctx.conn_mutex, NULL) != 0) {
+        rtmp_log_error("Failed to initialize connection mutex");
+        return RTMP_ERROR_INIT_FAILED;
     }
-    rtmp_diagnostic_log("Error: %s", message);
+    
+    if (pthread_mutex_init(&server_ctx.stats_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&server_ctx.conn_mutex);
+        rtmp_log_error("Failed to initialize stats mutex");
+        return RTMP_ERROR_INIT_FAILED;
+    }
+    
+    // Set default configuration
+    server_ctx.config.port = RTMP_DEFAULT_PORT;
+    server_ctx.config.max_connections = RTMP_MAX_CONNECTIONS;
+    server_ctx.config.buffer_size = RTMP_BUFFER_SIZE;
+    server_ctx.config.enable_recovery = 1;
+    
+    // Initialize statistics
+    server_ctx.stats.start_time = time(NULL);
+    server_ctx.stats.total_connections = 0;
+    server_ctx.stats.active_streams = 0;
+    server_ctx.stats.bytes_received = 0;
+    server_ctx.stats.bytes_sent = 0;
+    server_ctx.stats.dropped_frames = 0;
+    
+    rtmp_log_info("RTMP Core initialized successfully");
+    return RTMP_SUCCESS;
 }
 
-static bool rtmp_send_packet(RTMPContext *ctx, RTMPPacket *packet) {
-    if (!ctx || !packet) return false;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    
-    // Prepare chunk
-    size_t chunk_size = rtmp_chunk_get_size(packet);
-    if (chunk_size > ctx->out_buffer_size) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_handle_error(ctx, "Packet too large for output buffer");
-        return false;
+// Start the RTMP server
+int rtmp_core_start(void) {
+    if (server_ctx.running) {
+        rtmp_log_warning("Server already running");
+        return RTMP_ERROR_ALREADY_RUNNING;
     }
     
-    // Serialize packet to chunk
-    size_t written = rtmp_chunk_serialize(packet, ctx->out_buffer, ctx->out_buffer_size);
-    if (written == 0) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_handle_error(ctx, "Failed to serialize packet");
-        return false;
+    // Create server socket
+    struct sockaddr_in server_addr;
+    server_ctx.server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_ctx.server_socket < 0) {
+        rtmp_log_error("Failed to create server socket");
+        return RTMP_ERROR_SOCKET_CREATE;
     }
     
-    // Send chunk
-    ssize_t sent = send(ctx->socket, ctx->out_buffer, written, 0);
-    if (sent < 0) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_handle_error(ctx, "Send failed");
-        return false;
+    // Configure socket
+    int opt = 1;
+    setsockopt(server_ctx.server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    // Bind socket
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(server_ctx.config.port);
+    
+    if (bind(server_ctx.server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(server_ctx.server_socket);
+        rtmp_log_error("Failed to bind server socket");
+        return RTMP_ERROR_SOCKET_BIND;
     }
     
-    // Update stats
-    ctx->stats.bytes_sent += sent;
-    ctx->stats.messages_sent++;
+    // Listen for connections
+    if (listen(server_ctx.server_socket, RTMP_MAX_CONNECTIONS) < 0) {
+        close(server_ctx.server_socket);
+        rtmp_log_error("Failed to listen on server socket");
+        return RTMP_ERROR_SOCKET_LISTEN;
+    }
     
-    pthread_mutex_unlock(&ctx->mutex);
-    return true;
+    server_ctx.running = 1;
+    
+    // Start accept thread
+    pthread_t accept_thread;
+    if (pthread_create(&accept_thread, NULL, rtmp_core_accept_loop, NULL) != 0) {
+        server_ctx.running = 0;
+        close(server_ctx.server_socket);
+        rtmp_log_error("Failed to create accept thread");
+        return RTMP_ERROR_THREAD_CREATE;
+    }
+    
+    // Start monitor thread
+    pthread_t monitor_thread;
+    if (pthread_create(&monitor_thread, NULL, rtmp_core_monitor_loop, NULL) != 0) {
+        server_ctx.running = 0;
+        close(server_ctx.server_socket);
+        rtmp_log_error("Failed to create monitor thread");
+        return RTMP_ERROR_THREAD_CREATE;
+    }
+    
+    rtmp_log_info("RTMP Server started on port %d", server_ctx.config.port);
+    return RTMP_SUCCESS;
 }
 
-static RTMPPacket* rtmp_receive_packet(RTMPContext *ctx) {
-    if (!ctx) return NULL;
+// Handle client connection
+static void* rtmp_core_handle_connection(void *arg) {
+    rtmp_connection_t *conn = (rtmp_connection_t*)arg;
+    int handshake_attempts = 0;
     
-    pthread_mutex_lock(&ctx->mutex);
-    
-    // Read chunk header
-    uint8_t header[RTMP_MAX_HEADER_SIZE];
-    ssize_t received = recv(ctx->socket, header, RTMP_MAX_HEADER_SIZE, MSG_PEEK);
-    if (received <= 0) {
-        pthread_mutex_unlock(&ctx->mutex);
-        return NULL;
+    // Perform handshake
+    while (handshake_attempts < RTMP_RECOVERY_ATTEMPTS) {
+        if (rtmp_handshake_perform(conn) == RTMP_SUCCESS) {
+            break;
+        }
+        handshake_attempts++;
+        if (handshake_attempts < RTMP_RECOVERY_ATTEMPTS) {
+            rtmp_log_warning("Handshake failed, retrying...");
+            usleep(1000000); // Wait 1 second before retry
+        }
     }
     
-    // Parse chunk size
-    size_t chunk_size = rtmp_chunk_get_header_size(header);
-    if (chunk_size > ctx->in_buffer_size) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_handle_error(ctx, "Incoming chunk too large");
-        return NULL;
+    if (handshake_attempts >= RTMP_RECOVERY_ATTEMPTS) {
+        rtmp_log_error("Handshake failed after multiple attempts");
+        goto cleanup;
     }
     
-    // Read full chunk
-    received = recv(ctx->socket, ctx->in_buffer, chunk_size, 0);
-    if (received != chunk_size) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_handle_error(ctx, "Failed to receive complete chunk");
-        return NULL;
-    }
-    
-    // Update stats
-    ctx->stats.bytes_received += received;
-    ctx->stats.messages_received++;
-    
-    // Parse packet
-    RTMPPacket *packet = rtmp_chunk_parse(ctx->in_buffer, received);
-    
-    pthread_mutex_unlock(&ctx->mutex);
-    return packet;
-}
-
-static void* rtmp_network_thread(void *arg) {
-    RTMPContext *ctx = (RTMPContext*)arg;
-    struct timeval now;
-    
-    while (ctx->running) {
-        RTMPPacket *packet = rtmp_receive_packet(ctx);
-        if (packet) {
-            // Handle packet based on type
-            switch (packet->m_packetType) {
-                case RTMP_PACKET_TYPE_CHUNK_SIZE:
-                    ctx->chunk_size = rtmp_protocol_get_chunk_size(packet);
-                    break;
-                    
-                case RTMP_PACKET_TYPE_BYTES_READ:
-                    ctx->window_size = rtmp_protocol_get_bytes_read(packet);
-                    break;
-                    
-                case RTMP_PACKET_TYPE_BANDWIDTH:
-                    ctx->bandwidth = rtmp_protocol_get_bandwidth(packet);
-                    break;
-                    
-                case RTMP_PACKET_TYPE_VIDEO:
-                case RTMP_PACKET_TYPE_AUDIO:
-                    if (ctx->current_stream_id < ctx->stream_count) {
-                        RTMPStream *stream = ctx->streams[ctx->current_stream_id];
-                        rtmp_quality_update(stream, packet);
-                    }
-                    break;
-                    
-                default:
-                    // Handle other packet types through protocol layer
-                    rtmp_protocol_handle_packet(packet);
-                    break;
+    // Connection loop
+    while (conn->active && server_ctx.running) {
+        // Process incoming messages
+        int result = rtmp_protocol_process_message(conn);
+        if (result != RTMP_SUCCESS) {
+            if (server_ctx.config.enable_recovery && rtmp_core_recover_connection(conn) == RTMP_SUCCESS) {
+                continue;
             }
-            
-            // Notify callback
-            if (ctx->callback) {
-                RTMPCoreEvent event = {
-                    .type = RTMP_CORE_EVENT_PACKET,
-                    .packet = packet
-                };
-                ctx->callback(&event, ctx->callback_context);
-            }
-            
-            rtmp_packet_free(packet);
+            break;
         }
         
-        // Handle ping/keepalive
-        gettimeofday(&now, NULL);
-        if ((now.tv_sec - ctx->stats.last_ping.tv_sec) * 1000 + 
-            (now.tv_usec - ctx->stats.last_ping.tv_usec) / 1000 >= RTMP_PING_INTERVAL) {
-            RTMPPacket ping_packet;
-            rtmp_protocol_create_ping(&ping_packet);
-            rtmp_send_packet(ctx, &ping_packet);
-            ctx->stats.last_ping = now;
+        // Handle stream if active
+        if (conn->has_stream) {
+            result = rtmp_stream_process(conn);
+            if (result != RTMP_SUCCESS) {
+                if (server_ctx.config.enable_recovery && rtmp_core_recover_connection(conn) == RTMP_SUCCESS) {
+                    continue;
+                }
+                break;
+            }
         }
         
-        // Small sleep to prevent CPU hogging
-        usleep(1000);
+        // Update statistics
+        pthread_mutex_lock(&server_ctx.stats_mutex);
+        server_ctx.stats.bytes_received += conn->bytes_received;
+        server_ctx.stats.bytes_sent += conn->bytes_sent;
+        pthread_mutex_unlock(&server_ctx.stats_mutex);
+        
+        // Perform heartbeat check
+        if (time(NULL) - conn->last_heartbeat > RTMP_HEARTBEAT_INTERVAL) {
+            if (rtmp_protocol_send_ping(conn) != RTMP_SUCCESS) {
+                break;
+            }
+            conn->last_heartbeat = time(NULL);
+        }
+        
+        usleep(1000); // Prevent CPU overload
+    }
+    
+cleanup:
+    // Clean up connection
+    pthread_mutex_lock(&server_ctx.conn_mutex);
+    for (int i = 0; i < server_ctx.active_connections; i++) {
+        if (server_ctx.connections[i] == conn) {
+            // Shift remaining connections
+            for (int j = i; j < server_ctx.active_connections - 1; j++) {
+                server_ctx.connections[j] = server_ctx.connections[j + 1];
+            }
+            server_ctx.active_connections--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&server_ctx.conn_mutex);
+    
+    // Update statistics
+    pthread_mutex_lock(&server_ctx.stats_mutex);
+    if (conn->has_stream) {
+        server_ctx.stats.active_streams--;
+    }
+    pthread_mutex_unlock(&server_ctx.stats_mutex);
+    
+    rtmp_connection_destroy(conn);
+    return NULL;
+}
+
+// Accept new connections
+static void* rtmp_core_accept_loop(void *arg) {
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    
+    while (server_ctx.running) {
+        // Accept new connection
+        int client_socket = accept(server_ctx.server_socket, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_socket < 0) {
+            if (server_ctx.running) {
+                rtmp_log_warning("Failed to accept connection");
+            }
+            continue;
+        }
+        
+        // Check connection limit
+        pthread_mutex_lock(&server_ctx.conn_mutex);
+        if (server_ctx.active_connections >= server_ctx.config.max_connections) {
+            pthread_mutex_unlock(&server_ctx.conn_mutex);
+            close(client_socket);
+            rtmp_log_warning("Connection limit reached");
+            continue;
+        }
+        
+        // Create new connection
+        rtmp_connection_t *conn = rtmp_connection_create(client_socket);
+        if (!conn) {
+            pthread_mutex_unlock(&server_ctx.conn_mutex);
+            close(client_socket);
+            rtmp_log_error("Failed to create connection");
+            continue;
+        }
+        
+        // Store client info
+        conn->client_ip = strdup(inet_ntoa(client_addr.sin_addr));
+        conn->client_port = ntohs(client_addr.sin_port);
+        
+        // Start connection thread
+        pthread_t conn_thread;
+        if (pthread_create(&conn_thread, NULL, rtmp_core_handle_connection, conn) != 0) {
+            pthread_mutex_unlock(&server_ctx.conn_mutex);
+            rtmp_connection_destroy(conn);
+            rtmp_log_error("Failed to create connection thread");
+            continue;
+        }
+        
+        // Add to connections array
+        server_ctx.connections[server_ctx.active_connections++] = conn;
+        
+        // Update statistics
+        pthread_mutex_lock(&server_ctx.stats_mutex);
+        server_ctx.stats.total_connections++;
+        pthread_mutex_unlock(&server_ctx.stats_mutex);
+        
+        pthread_mutex_unlock(&server_ctx.conn_mutex);
+        
+        rtmp_log_info("New connection from %s:%d", conn->client_ip, conn->client_port);
     }
     
     return NULL;
 }
 
-RTMPContext* rtmp_core_create(void) {
-    RTMPContext *ctx = (RTMPContext*)calloc(1, sizeof(RTMPContext));
-    if (!ctx) return NULL;
-    
-    ctx->in_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
-    ctx->out_buffer = (uint8_t*)malloc(RTMP_BUFFER_SIZE);
-    ctx->in_buffer_size = RTMP_BUFFER_SIZE;
-    ctx->out_buffer_size = RTMP_BUFFER_SIZE;
-    
-    pthread_mutex_init(&ctx->mutex, NULL);
-    
-    ctx->chunk_size = RTMP_DEFAULT_CHUNK_SIZE;
-    ctx->port = RTMP_DEFAULT_PORT;
-    
-    gettimeofday(&ctx->stats.last_ping, NULL);
-    
-    return ctx;
-}
-
-void rtmp_core_destroy(RTMPContext *ctx) {
-    if (!ctx) return;
-    
-    rtmp_core_disconnect(ctx);
-    
-    pthread_mutex_destroy(&ctx->mutex);
-    
-    free(ctx->in_buffer);
-    free(ctx->out_buffer);
-    free(ctx);
-}
-
-bool rtmp_core_connect(RTMPContext *ctx, const char *url) {
-    if (!ctx || !url) return false;
-    
-    // Parse URL
-    if (!rtmp_protocol_parse_url(url, ctx->hostname, sizeof(ctx->hostname),
-                                &ctx->port, ctx->app_name, sizeof(ctx->app_name),
-                                ctx->stream_name, sizeof(ctx->stream_name))) {
-        rtmp_handle_error(ctx, "Invalid RTMP URL");
-        return false;
-    }
-    
-    // Create socket
-    ctx->socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (ctx->socket < 0) {
-        rtmp_handle_error(ctx, "Failed to create socket");
-        return false;
-    }
-    
-    // Set socket options
-    int flag = 1;
-    setsockopt(ctx->socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    
-    // Connect
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(ctx->port);
-    if (inet_pton(AF_INET, ctx->hostname, &addr.sin_addr) <= 0) {
-        rtmp_handle_error(ctx, "Invalid address");
-        close(ctx->socket);
-        return false;
-    }
-    
-    if (connect(ctx->socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        rtmp_handle_error(ctx, "Connection failed");
-        close(ctx->socket);
-        return false;
-    }
-    
-    // Set non-blocking
-    int flags = fcntl(ctx->socket, F_GETFL, 0);
-    fcntl(ctx->socket, F_SETFL, flags | O_NONBLOCK);
-    
-    // Start network thread
-    ctx->running = true;
-    if (pthread_create(&ctx->network_thread, NULL, rtmp_network_thread, ctx) != 0) {
-        rtmp_handle_error(ctx, "Failed to create network thread");
-        close(ctx->socket);
-        ctx->running = false;
-        return false;
-    }
-    
-    ctx->connected = true;
-    
-    // Notify connection
-    if (ctx->callback) {
-        RTMPCoreEvent event = {
-            .type = RTMP_CORE_EVENT_CONNECTED
-        };
-        ctx->callback(&event, ctx->callback_context);
-    }
-    
-    return true;
-}
-
-void rtmp_core_disconnect(RTMPContext *ctx) {
-    if (!ctx || !ctx->connected) return;
-    
-    ctx->running = false;
-    pthread_join(ctx->network_thread, NULL);
-    
-    close(ctx->socket);
-    ctx->socket = -1;
-    ctx->connected = false;
-    
-    // Notify disconnection
-    if (ctx->callback) {
-        RTMPCoreEvent event = {
-            .type = RTMP_CORE_EVENT_DISCONNECTED
-        };
-        ctx->callback(&event, ctx->callback_context);
-    }
-}
-
-bool rtmp_core_add_stream(RTMPContext *ctx, RTMPStream *stream) {
-    if (!ctx || !stream || ctx->stream_count >= RTMP_MAX_STREAMS) return false;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    ctx->streams[ctx->stream_count] = stream;
-    ctx->stream_count++;
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    return true;
-}
-
-void rtmp_core_remove_stream(RTMPContext *ctx, RTMPStream *stream) {
-    if (!ctx || !stream) return;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    for (uint32_t i = 0; i < ctx->stream_count; i++) {
-        if (ctx->streams[i] == stream) {
-            // Shift remaining streams
-            for (uint32_t j = i; j < ctx->stream_count - 1; j++) {
-                ctx->streams[j] = ctx->streams[j + 1];
+// Monitor server health
+static void* rtmp_core_monitor_loop(void *arg) {
+    while (server_ctx.running) {
+        pthread_mutex_lock(&server_ctx.conn_mutex);
+        
+        // Check each connection
+        for (int i = 0; i < server_ctx.active_connections; i++) {
+            rtmp_connection_t *conn = server_ctx.connections[i];
+            
+            // Check connection health
+            if (!rtmp_connection_is_healthy(conn)) {
+                if (server_ctx.config.enable_recovery) {
+                    if (rtmp_core_recover_connection(conn) != RTMP_SUCCESS) {
+                        conn->active = 0;
+                    }
+                } else {
+                    conn->active = 0;
+                }
             }
-            ctx->stream_count--;
-            break;
+        }
+        
+        pthread_mutex_unlock(&server_ctx.conn_mutex);
+        
+        // Update statistics
+        pthread_mutex_lock(&server_ctx.stats_mutex);
+        server_ctx.stats.uptime = time(NULL) - server_ctx.stats.start_time;
+        if (server_ctx.stats.uptime > 0) {
+            server_ctx.stats.avg_bandwidth = (server_ctx.stats.bytes_sent + server_ctx.stats.bytes_received) / server_ctx.stats.uptime;
+        }
+        pthread_mutex_unlock(&server_ctx.stats_mutex);
+        
+        sleep(1); // Check every second
+    }
+    
+    return NULL;
+}
+
+// Attempt to recover a failing connection
+static int rtmp_core_recover_connection(rtmp_connection_t *conn) {
+    if (!conn || !conn->active) {
+        return RTMP_ERROR_INVALID_CONNECTION;
+    }
+    
+    rtmp_log_warning("Attempting to recover connection from %s:%d", conn->client_ip, conn->client_port);
+    
+    // Reset connection state
+    conn->bytes_received = 0;
+    conn->bytes_sent = 0;
+    conn->last_heartbeat = time(NULL);
+    
+    // Attempt to re-establish stream if needed
+    if (conn->has_stream) {
+        if (rtmp_stream_reset(conn) != RTMP_SUCCESS) {
+            rtmp_log_error("Failed to reset stream");
+            return RTMP_ERROR_STREAM_RESET;
         }
     }
-    pthread_mutex_unlock(&ctx->mutex);
-}
-
-void rtmp_core_set_callback(RTMPContext *ctx, rtmp_core_callback_t callback, void *context) {
-    if (!ctx) return;
     
-    pthread_mutex_lock(&ctx->mutex);
-    ctx->callback = callback;
-    ctx->callback_context = context;
-    pthread_mutex_unlock(&ctx->mutex);
+    rtmp_log_info("Connection recovered successfully");
+    return RTMP_SUCCESS;
 }
 
-bool rtmp_core_is_connected(RTMPContext *ctx) {
-    return ctx ? ctx->connected : false;
-}
-
-void rtmp_core_get_stats(RTMPContext *ctx, RTMPCoreStats *stats) {
-    if (!ctx || !stats) return;
+// Stop the RTMP server
+int rtmp_core_stop(void) {
+    if (!server_ctx.running) {
+        return RTMP_SUCCESS;
+    }
     
-    pthread_mutex_lock(&ctx->mutex);
-    stats->bytes_sent = ctx->stats.bytes_sent;
-    stats->bytes_received = ctx->stats.bytes_received;
-    stats->messages_sent = ctx->stats.messages_sent;
-    stats->messages_received = ctx->stats.messages_received;
-    pthread_mutex_unlock(&ctx->mutex);
+    server_ctx.running = 0;
+    
+    // Close server socket
+    if (server_ctx.server_socket >= 0) {
+        close(server_ctx.server_socket);
+    }
+    
+    // Clean up connections
+    pthread_mutex_lock(&server_ctx.conn_mutex);
+    for (int i = 0; i < server_ctx.active_connections; i++) {
+        rtmp_connection_t *conn = server_ctx.connections[i];
+        conn->active = 0;
+        rtmp_connection_destroy(conn);
+    }
+    server_ctx.active_connections = 0;
+    pthread_mutex_unlock(&server_ctx.conn_mutex);
+    
+    // Destroy mutexes
+    pthread_mutex_destroy(&server_ctx.conn_mutex);
+    pthread_mutex_destroy(&server_ctx.stats_mutex);
+    
+    rtmp_log_info("RTMP Server stopped");
+	// Final cleanup
+    free(server_ctx.config.cert_file);
+    free(server_ctx.config.key_file);
+    
+    return RTMP_SUCCESS;
+}
+
+// Get server statistics
+const rtmp_stats_t* rtmp_core_get_stats(void) {
+    const rtmp_stats_t *stats = NULL;
+    
+    pthread_mutex_lock(&server_ctx.stats_mutex);
+    stats = &server_ctx.stats;
+    pthread_mutex_unlock(&server_ctx.stats_mutex);
+    
+    return stats;
+}
+
+// Connection management functions
+rtmp_connection_t* rtmp_connection_create(int socket) {
+    rtmp_connection_t *conn = (rtmp_connection_t*)calloc(1, sizeof(rtmp_connection_t));
+    if (!conn) {
+        rtmp_log_error("Failed to allocate connection");
+        return NULL;
+    }
+    
+    conn->socket = socket;
+    conn->active = 1;
+    conn->last_heartbeat = time(NULL);
+    conn->has_stream = 0;
+    conn->bytes_received = 0;
+    conn->bytes_sent = 0;
+    
+    return conn;
+}
+
+void rtmp_connection_destroy(rtmp_connection_t *conn) {
+    if (!conn) {
+        return;
+    }
+    
+    if (conn->socket >= 0) {
+        close(conn->socket);
+    }
+    
+    if (conn->has_stream && conn->stream_data) {
+        rtmp_stream_cleanup(conn->stream_data);
+    }
+    
+    free(conn->client_ip);
+    free(conn->user_data);
+    free(conn);
+}
+
+int rtmp_connection_is_healthy(const rtmp_connection_t *conn) {
+    if (!conn || !conn->active) {
+        return 0;
+    }
+    
+    // Check socket validity
+    if (conn->socket < 0) {
+        return 0;
+    }
+    
+    // Check heartbeat timeout
+    if (time(NULL) - conn->last_heartbeat > RTMP_HEARTBEAT_INTERVAL * 2) {
+        return 0;
+    }
+    
+    // Check stream health if active
+    if (conn->has_stream && !rtmp_stream_is_healthy(conn->stream_data)) {
+        return 0;
+    }
+    
+    return 1;
+}
+
+// Configuration functions
+int rtmp_core_set_config(const rtmp_config_t *config) {
+    if (!config) {
+        return RTMP_ERROR_INVALID_PARAM;
+    }
+    
+    pthread_mutex_lock(&server_ctx.conn_mutex);
+    
+    // Update configuration
+    server_ctx.config.port = config->port > 0 ? config->port : RTMP_DEFAULT_PORT;
+    server_ctx.config.max_connections = config->max_connections > 0 ? 
+        config->max_connections : RTMP_MAX_CONNECTIONS;
+    server_ctx.config.buffer_size = config->buffer_size > 0 ? 
+        config->buffer_size : RTMP_BUFFER_SIZE;
+    server_ctx.config.enable_recovery = config->enable_recovery;
+    server_ctx.config.log_level = config->log_level;
+    
+    // Update SSL configuration if provided
+    if (config->cert_file) {
+        free(server_ctx.config.cert_file);
+        server_ctx.config.cert_file = strdup(config->cert_file);
+    }
+    
+    if (config->key_file) {
+        free(server_ctx.config.key_file);
+        server_ctx.config.key_file = strdup(config->key_file);
+    }
+    
+    pthread_mutex_unlock(&server_ctx.conn_mutex);
+    
+    return RTMP_SUCCESS;
+}
+
+// Advanced stream control
+int rtmp_core_force_keyframe(rtmp_connection_t *conn) {
+    if (!conn || !conn->has_stream) {
+        return RTMP_ERROR_INVALID_CONNECTION;
+    }
+    
+    return rtmp_stream_request_keyframe(conn->stream_data);
+}
+
+int rtmp_core_adjust_quality(rtmp_connection_t *conn, int quality) {
+    if (!conn || !conn->has_stream) {
+        return RTMP_ERROR_INVALID_CONNECTION;
+    }
+    
+    return rtmp_stream_set_quality(conn->stream_data, quality);
+}
+
+// Debug and diagnostics
+void rtmp_core_dump_stats(void) {
+    pthread_mutex_lock(&server_ctx.stats_mutex);
+    
+    rtmp_log_info("=== RTMP Server Statistics ===");
+    rtmp_log_info("Uptime: %lu seconds", server_ctx.stats.uptime);
+    rtmp_log_info("Total Connections: %lu", server_ctx.stats.total_connections);
+    rtmp_log_info("Active Streams: %u", server_ctx.stats.active_streams);
+    rtmp_log_info("Bytes Received: %lu", server_ctx.stats.bytes_received);
+    rtmp_log_info("Bytes Sent: %lu", server_ctx.stats.bytes_sent);
+    rtmp_log_info("Average Bandwidth: %.2f KB/s", server_ctx.stats.avg_bandwidth / 1024.0);
+    rtmp_log_info("Dropped Frames: %lu", server_ctx.stats.dropped_frames);
+    
+    pthread_mutex_unlock(&server_ctx.stats_mutex);
+}
+
+// Emergency shutdown handling
+static void rtmp_core_emergency_shutdown(void) {
+    rtmp_log_error("Emergency shutdown initiated");
+    
+    // Force stop all connections
+    pthread_mutex_lock(&server_ctx.conn_mutex);
+    for (int i = 0; i < server_ctx.active_connections; i++) {
+        rtmp_connection_t *conn = server_ctx.connections[i];
+        conn->active = 0;
+        close(conn->socket);
+    }
+    pthread_mutex_unlock(&server_ctx.conn_mutex);
+    
+    // Close server socket
+    if (server_ctx.server_socket >= 0) {
+        close(server_ctx.server_socket);
+    }
+    
+    server_ctx.running = 0;
 }

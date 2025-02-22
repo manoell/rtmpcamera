@@ -1,32 +1,38 @@
-#ifndef RTMP_CAMERA_COMPAT_H
-#define RTMP_CAMERA_COMPAT_H
-
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 
-#define MAX_SUPPORTED_FORMATS 32
+@interface RTMPCameraController : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 
-// Forward declaration of RTMPStream
-typedef struct RTMPStream RTMPStream;
+// Singleton instance
++ (instancetype)sharedInstance;
 
-typedef enum {
-    CAMERA_CONTROL_FOCUS,
-    CAMERA_CONTROL_EXPOSURE,
-    CAMERA_CONTROL_ISO,
-    CAMERA_CONTROL_ZOOM,
-    CAMERA_CONTROL_WHITE_BALANCE
-} CameraControlCommand;
+// RTMP session control
+- (void)startRTMPSession;
+- (void)stopRTMPSession;
 
-@interface RTMPCameraCompat : NSObject
+// Camera settings control
+- (void)backupOriginalCameraSettings;
+- (void)restoreOriginalCameraSettings;
 
-// Initialize and configure virtual camera properties
-- (instancetype)init;
-- (void)configureVirtualCameraWithStream:(RTMPStream *)stream;
-
-// Update stream metadata and properties
-- (void)updateStreamMetadata:(RTMPStream *)stream;
-- (void)handleCameraControl:(RTMPStream *)stream command:(CameraControlCommand)command value:(float)value;
+// Stream monitoring
+- (void)startStreamMonitoring;
+- (void)updateStreamMetrics;
 
 @end
 
-#endif // RTMP_CAMERA_COMPAT_H
+// Notification names
+extern NSString *const RTMPCameraStreamStartedNotification;
+extern NSString *const RTMPCameraStreamStoppedNotification;
+extern NSString *const RTMPCameraStreamErrorNotification;
+
+// Error domain
+extern NSString *const RTMPCameraErrorDomain;
+
+// Error codes
+typedef NS_ENUM(NSInteger, RTMPCameraError) {
+    RTMPCameraErrorUnknown = -1,
+    RTMPCameraErrorNoCamera = -2,
+    RTMPCameraErrorPermissionDenied = -3,
+    RTMPCameraErrorStreamFailed = -4,
+    RTMPCameraErrorInvalidState = -5
+};

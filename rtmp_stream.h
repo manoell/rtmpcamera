@@ -2,58 +2,90 @@
 #define RTMP_STREAM_H
 
 #include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
+#include <stddef.h>
 
-// Forward declaration
-typedef struct RTMPStream RTMPStream;
+// Stream handle
+typedef struct rtmp_stream rtmp_stream_t;
 
-// Event types for stream callbacks
-typedef enum {
-    RTMP_EVENT_CONNECTED,
-    RTMP_EVENT_DISCONNECTED,
-    RTMP_EVENT_FRAME_PROCESSED,
-    RTMP_EVENT_ERROR
-} RTMPStreamEventType;
+// Error codes
+#define RTMP_SUCCESS 0
+#define RTMP_ERROR_INVALID_PARAM -1
+#define RTMP_ERROR_MEMORY -2
+#define RTMP_ERROR_ALREADY_RUNNING -3
+#define RTMP_ERROR_NOT_RUNNING -4
+#define RTMP_ERROR_THREAD_CREATE -5
+#define RTMP_ERROR_NO_CALLBACK -6
+#define RTMP_ERROR_FRAME_TOO_LARGE -7
 
-// Stream statistics structure
+// Health status flags
+#define RTMP_HEALTH_OK 0
+#define RTMP_HEALTH_HIGH_LATENCY (1 << 0)
+#define RTMP_HEALTH_HIGH_DROP_RATE (1 << 1)
+#define RTMP_HEALTH_HIGH_FAILURE_RATE (1 << 2)
+#define RTMP_HEALTH_LOW_QUALITY (1 << 3)
+
+// Stream configuration
 typedef struct {
-    uint32_t current_fps;
-    uint32_t current_bitrate;
-    uint32_t buffer_ms;
-    uint32_t quality_percent;
-    uint32_t dropped_frames;
-} RTMPStreamStats;
+    int width;
+    int height;
+    int fps;
+    int bitrate;
+    int gop_size;
+    float quality;
+} rtmp_stream_config_t;
 
-// Event structure for callbacks
+// Stream statistics
 typedef struct {
-    RTMPStreamEventType type;
-    int64_t timestamp;
-    const uint8_t *data;
-    size_t data_size;
-    const char *error_message;  // Only valid for RTMP_EVENT_ERROR
-} RTMPStreamEvent;
+    uint64_t start_time;
+    uint64_t uptime;
+    uint64_t total_frames;
+    uint64_t processed_frames;
+    uint64_t dropped_frames;
+    uint64_t failed_frames;
+    uint64_t keyframes;
+    uint64_t bytes_received;
+    uint64_t bytes_sent;
+    uint64_t current_latency;
+    uint64_t max_latency;
+    uint64_t average_bitrate;
+    float current_quality;
+} rtmp_stream_stats_t;
 
-// Callback function type
-typedef void (*rtmp_stream_callback_t)(const RTMPStreamEvent *event, void *context);
+// Stream callbacks
+typedef struct {
+    int (*process_frame)(const uint8_t *data, size_t size, uint64_t timestamp, void *user_data);
+    int (*request_keyframe)(void *user_data);
+    void (*quality_changed)(float quality, const rtmp_stream_config_t *config, void *user_data);
+} rtmp_stream_callbacks_t;
 
-// Stream management functions
-RTMPStream* rtmp_stream_create(const char *url);
-void rtmp_stream_destroy(RTMPStream *stream);
-bool rtmp_stream_start(RTMPStream *stream);
-void rtmp_stream_stop(RTMPStream *stream);
+// Core functions
+rtmp_stream_t* rtmp_stream_create(const rtmp_stream_config_t *config);
+void rtmp_stream_destroy(rtmp_stream_t *stream);
+int rtmp_stream_start(rtmp_stream_t *stream);
+int rtmp_stream_stop(rtmp_stream_t *stream);
 
-// Frame and data handling
-bool rtmp_stream_push_frame(RTMPStream *stream, const uint8_t *data, size_t size, 
-                          int64_t timestamp, bool is_keyframe);
-void rtmp_stream_set_callback(RTMPStream *stream, rtmp_stream_callback_t callback, 
-                            void *context);
+// Frame handling
+int rtmp_stream_push_frame(rtmp_stream_t *stream, const uint8_t *data, size_t size, 
+                          uint64_t timestamp, int is_keyframe);
+int rtmp_stream_request_keyframe(rtmp_stream_t *stream);
 
-// Configuration and status
-bool rtmp_stream_set_video_params(RTMPStream *stream, uint32_t width, uint32_t height, 
-                                uint32_t fps, uint32_t bitrate);
-void rtmp_stream_get_stats(RTMPStream *stream, RTMPStreamStats *stats);
-bool rtmp_stream_is_connected(RTMPStream *stream);
-void rtmp_stream_set_connected(RTMPStream *stream, bool connected);
+// Configuration and callbacks
+void rtmp_stream_set_callbacks(rtmp_stream_t *stream, const rtmp_stream_callbacks_t *callbacks,
+                             void *user_data);
+int rtmp_stream_set_config(rtmp_stream_t *stream, const rtmp_stream_config_t *config);
+int rtmp_stream_get_config(rtmp_stream_t *stream, rtmp_stream_config_t *config);
+
+// Statistics and monitoring
+const rtmp_stream_stats_t* rtmp_stream_get_stats(rtmp_stream_t *stream);
+float rtmp_stream_get_quality(rtmp_stream_t *stream);
+void rtmp_stream_reset_stats(rtmp_stream_t *stream);
+int rtmp_stream_health_check(rtmp_stream_t *stream);
+
+// Buffer management
+int rtmp_stream_clear_buffer(rtmp_stream_t *stream);
+int rtmp_stream_is_active(rtmp_stream_t *stream);
+
+// Debug functions
+void rtmp_stream_dump_debug_info(rtmp_stream_t *stream);
 
 #endif // RTMP_STREAM_H

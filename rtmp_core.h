@@ -1,60 +1,69 @@
 #ifndef RTMP_CORE_H
 #define RTMP_CORE_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <pthread.h>
-#include "rtmp_stream.h"
+#include <time.h>
 
-// Forward declarations
-typedef struct RTMPContext RTMPContext;
-typedef struct RTMPPacket RTMPPacket;
+// Error codes
+#define RTMP_SUCCESS 0
+#define RTMP_ERROR_INIT_FAILED -1
+#define RTMP_ERROR_ALREADY_RUNNING -2
+#define RTMP_ERROR_SOCKET_CREATE -3
+#define RTMP_ERROR_SOCKET_BIND -4
+#define RTMP_ERROR_SOCKET_LISTEN -5
+#define RTMP_ERROR_THREAD_CREATE -6
+#define RTMP_ERROR_INVALID_CONNECTION -7
+#define RTMP_ERROR_STREAM_RESET -8
 
-// Default RTMP chunk size
-#define RTMP_DEFAULT_CHUNK_SIZE 128
-#define RTMP_MAX_HEADER_SIZE 18
-
-// Event types for core callbacks
-typedef enum {
-    RTMP_CORE_EVENT_CONNECTED,
-    RTMP_CORE_EVENT_DISCONNECTED,
-    RTMP_CORE_EVENT_PACKET,
-    RTMP_CORE_EVENT_ERROR
-} RTMPCoreEventType;
-
-// Statistics structure
+// Server configuration
 typedef struct {
-    uint64_t bytes_sent;
-    uint64_t bytes_received;
-    uint32_t messages_sent;
-    uint32_t messages_received;
-} RTMPCoreStats;
+    int port;
+    int max_connections;
+    int buffer_size;
+    int enable_recovery;
+    int log_level;
+} rtmp_config_t;
 
-// Event structure for callbacks
+// Connection structure
 typedef struct {
-    RTMPCoreEventType type;
-    RTMPPacket *packet;        // Valid for RTMP_CORE_EVENT_PACKET
-    const char *error_message; // Valid for RTMP_CORE_EVENT_ERROR
-} RTMPCoreEvent;
+    int socket;
+    int active;
+    char *client_ip;
+    int client_port;
+    time_t last_heartbeat;
+    int has_stream;
+    void *stream_data;
+    unsigned long bytes_received;
+    unsigned long bytes_sent;
+    void *user_data;
+} rtmp_connection_t;
 
-// Callback function type
-typedef void (*rtmp_core_callback_t)(const RTMPCoreEvent *event, void *context);
+// Server statistics
+typedef struct {
+    time_t start_time;
+    unsigned long uptime;
+    unsigned long total_connections;
+    unsigned int active_streams;
+    unsigned long bytes_received;
+    unsigned long bytes_sent;
+    unsigned long dropped_frames;
+    float avg_bandwidth;
+} rtmp_stats_t;
 
-// Core RTMP functions
-RTMPContext* rtmp_core_create(void);
-void rtmp_core_destroy(RTMPContext *ctx);
+// Core functions
+int rtmp_core_init(void);
+int rtmp_core_start(void);
+int rtmp_core_stop(void);
+const rtmp_stats_t* rtmp_core_get_stats(void);
 
 // Connection management
-bool rtmp_core_connect(RTMPContext *ctx, const char *url);
-void rtmp_core_disconnect(RTMPContext *ctx);
-bool rtmp_core_is_connected(RTMPContext *ctx);
+rtmp_connection_t* rtmp_connection_create(int socket);
+void rtmp_connection_destroy(rtmp_connection_t *conn);
+int rtmp_connection_is_healthy(const rtmp_connection_t *conn);
 
-// Stream management
-bool rtmp_core_add_stream(RTMPContext *ctx, RTMPStream *stream);
-void rtmp_core_remove_stream(RTMPContext *ctx, RTMPStream *stream);
-
-// Callback and statistics
-void rtmp_core_set_callback(RTMPContext *ctx, rtmp_core_callback_t callback, void *context);
-void rtmp_core_get_stats(RTMPContext *ctx, RTMPCoreStats *stats);
+// Logging functions
+void rtmp_log_error(const char *message);
+void rtmp_log_warning(const char *message);
+void rtmp_log_info(const char *message);
+void rtmp_log_debug(const char *message);
 
 #endif // RTMP_CORE_H

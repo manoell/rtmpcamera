@@ -3,42 +3,71 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <arpa/inet.h>
+#include <openssl/sha.h>
+#include <zlib.h>
 
-// Endian conversion macros
-#define RTMP_HTONL(x) htonl(x)
-#define RTMP_NTOHL(x) ntohl(x)
-#define RTMP_HTONS(x) htons(x)
-#define RTMP_NTOHS(x) ntohs(x)
+// Buffer structure
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+} rtmp_buffer_t;
 
-// For 64-bit integers
-#define RTMP_HTONLL(x) ((((uint64_t)htonl(x)) << 32) + htonl((x) >> 32))
-#define RTMP_NTOHLL(x) ((((uint64_t)ntohl(x)) << 32) + ntohl((x) >> 32))
+// Time functions
+uint64_t rtmp_utils_get_time_ms(void);
+void rtmp_utils_sleep_ms(uint32_t milliseconds);
 
-// Helper macros for 3-byte integers
-#define RTMP_HTON24(x) ((((x) & 0xFF0000) >> 16) | ((x) & 0x00FF00) | (((x) & 0x0000FF) << 16))
-#define RTMP_NTOH24(x) RTMP_HTON24(x)
+// Socket functions
+int rtmp_utils_create_server_socket(int port);
+int rtmp_utils_accept_connection(int server_socket);
+int rtmp_utils_send(int socket, const void *data, size_t size, int timeout_ms);
+int rtmp_utils_receive(int socket, void *buffer, size_t size, int timeout_ms);
+int rtmp_utils_set_socket_nonblocking(int socket);
+int rtmp_utils_set_socket_nodelay(int socket);
+int rtmp_utils_set_socket_keepalive(int socket);
 
-// Buffer utilities
-void rtmp_buffer_init(uint8_t *buffer, size_t size);
-int rtmp_buffer_append(uint8_t *buffer, size_t *offset, size_t max_size, const uint8_t *data, size_t data_size);
-int rtmp_buffer_read(const uint8_t *buffer, size_t *offset, size_t max_size, uint8_t *data, size_t data_size);
+// Crypto functions
+void rtmp_utils_init_random(void);
+void rtmp_utils_random_bytes(uint8_t *buffer, size_t size);
+void rtmp_utils_hmac_sha256(const uint8_t *key, size_t key_size,
+                          const uint8_t *data, size_t data_size,
+                          uint8_t *output);
 
-// Number utilities
-uint32_t rtmp_get_three_bytes(const uint8_t *data);
-void rtmp_set_three_bytes(uint8_t *data, uint32_t value);
+// Compression functions
+int rtmp_utils_compress(const uint8_t *input, size_t input_size,
+                      uint8_t *output, size_t *output_size);
+int rtmp_utils_decompress(const uint8_t *input, size_t input_size,
+                        uint8_t *output, size_t *output_size);
 
-// Time utilities
-uint64_t rtmp_get_current_time(void);
-uint32_t rtmp_get_uptime(void);
+// Byte order conversion
+uint16_t rtmp_utils_swap16(uint16_t value);
+uint32_t rtmp_utils_swap32(uint32_t value);
+uint64_t rtmp_utils_swap64(uint64_t value);
+
+// URL encoding/decoding
+char* rtmp_utils_url_encode(const char *str);
+char* rtmp_utils_url_decode(const char *str);
+
+// Base64 encoding/decoding
+char* rtmp_utils_base64_encode(const uint8_t *data, size_t size);
+uint8_t* rtmp_utils_base64_decode(const char *str, size_t *size);
+
+// Memory management
+void* rtmp_utils_malloc(size_t size);
+void* rtmp_utils_realloc(void *ptr, size_t new_size);
+void rtmp_utils_free(void *ptr);
+
+// Buffer management
+rtmp_buffer_t* rtmp_utils_buffer_create(size_t initial_size);
+int rtmp_utils_buffer_append(rtmp_buffer_t *buffer, const void *data, size_t size);
+void rtmp_utils_buffer_clear(rtmp_buffer_t *buffer);
+void rtmp_utils_buffer_destroy(rtmp_buffer_t *buffer);
 
 // String utilities
-char* rtmp_strdup(const char *str);
-void rtmp_string_to_lower(char *str);
-int rtmp_string_ends_with(const char *str, const char *suffix);
+char* rtmp_utils_strdup(const char *str);
+int rtmp_utils_strcasecmp(const char *s1, const char *s2);
 
-// Debug utilities
-void rtmp_hex_dump(const char *prefix, const uint8_t *data, size_t size);
-const char* rtmp_get_message_type_string(uint8_t msg_type_id);
+// Cleanup
+void rtmp_utils_cleanup(void);
 
 #endif // RTMP_UTILS_H

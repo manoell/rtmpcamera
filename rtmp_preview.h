@@ -1,18 +1,17 @@
-#ifndef RTMP_PREVIEW_H
-#define RTMP_PREVIEW_H
+#import <Foundation/Foundation.h>
+#import <CoreMedia/CoreMedia.h>
 
-#import <CoreVideo/CoreVideo.h>
+@interface RTMPPreviewController : NSObject
 
-// Forward declaration
-typedef struct RTMPStream RTMPStream;
+// Preview control
+- (void)showPreview;
+- (void)hidePreview;
+- (void)toggleMinimize;
 
-// Show preview window with stream statistics
-void rtmp_preview_show(RTMPStream *stream);
+// Frame handling
+- (void)updateFrame:(CMSampleBufferRef)sampleBuffer;
 
-// Hide preview window
-void rtmp_preview_hide(void);
+// Statistics and metrics
+- (void)updateStreamMetrics:(NSDictionary *)metrics;
 
-// Update preview with new frame
-void rtmp_preview_update_frame(CVImageBufferRef imageBuffer);
-
-#endif // RTMP_PREVIEW_H
+@end
