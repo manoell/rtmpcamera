@@ -1,83 +1,175 @@
 #import "rtmp_camera_compat.h"
-#import "rtmp_utils.h"
-#import <VideoToolbox/VideoToolbox.h>
+#import <objc/runtime.h>
+#import <libkern/OSAtomic.h>
 
-@interface RTMPCameraCompatibility () {
-    RTMPCameraConfig _config;
-    RTMPCameraStatus _status;
-    RTMPStream *_stream;
-    dispatch_queue_t _captureQueue;
-    dispatch_queue_t _encodeQueue;
-}
+// Static variables
+static RTMPCameraCompatibility *gSharedInstance = nil;
+static const char *kRTMPFrameQueueKey = "RTMPFrameQueue";
+static volatile int32_t gIsPublishing = 0;
+
+// Private interface
+@interface RTMPCameraCompatibility () <AVCaptureVideoDataOutputSampleBufferDelegate>
 
 @property (nonatomic, strong) AVCaptureSession *captureSession;
-@property (nonatomic, strong) AVCaptureDevice *videoDevice;
-@property (nonatomic, strong) AVCaptureDevice *audioDevice;
-@property (nonatomic, strong) AVCaptureDeviceInput *videoInput;
-@property (nonatomic, strong) AVCaptureDeviceInput *audioInput;
-@property (nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
-@property (nonatomic, strong) AVCaptureAudioDataOutput *audioOutput;
+@property (nonatomic, strong) AVCaptureDevice *device;
+@property (nonatomic, strong) AVCaptureDeviceInput *input;
+@property (nonatomic, strong) AVCaptureVideoDataOutput *output;
 @property (nonatomic, strong) AVCaptureVideoPreviewLayer *previewLayer;
-@property (nonatomic, strong) VTCompressionSessionRef compressionSession;
-@property (nonatomic, strong) CMFormatDescriptionRef formatDescription;
-@property (nonatomic, assign) CMTime presentationTime;
+@property (nonatomic, strong) dispatch_queue_t videoQueue;
+@property (nonatomic, strong) dispatch_queue_t processingQueue;
+@property (nonatomic, strong) NSMutableArray *frameQueue;
+@property (nonatomic, strong) RTMPCameraStats *stats;
+@property (nonatomic, strong) RTMPCameraSettings *settings;
+@property (nonatomic, assign) RTMPCameraState state;
+@property (nonatomic, assign) CVPixelBufferRef lastFrame;
+@property (nonatomic, strong) NSDate *startTime;
+@property (nonatomic, assign) BOOL isPreviewRunning;
+@property (nonatomic, assign) dispatch_semaphore_t frameLock;
 
-@property (nonatomic, strong) NSArray<AVCaptureDevice *> *availableDevices;
-@property (nonatomic, weak) UIView *previewView;
+@end
 
-@property (nonatomic, copy) RTMPCameraStateCallback stateCallback;
-@property (nonatomic, copy) RTMPCameraErrorCallback errorCallback;
-@property (nonatomic, copy) RTMPCameraFaceDetectionCallback faceCallback;
+@implementation RTMPCameraSettings
+
++ (instancetype)defaultSettings {
+    RTMPCameraSettings *settings = [[RTMPCameraSettings alloc] init];
+    settings.resolution = CGSizeMake(1280, 720);
+    settings.frameRate = 30.0f;
+    settings.position = AVCaptureDevicePositionBack;
+    settings.autoFocus = YES;
+    settings.autoExposure = YES;
+    settings.autoWhiteBalance = YES;
+    settings.zoom = 1.0f;
+    settings.focusPoint = 0.5f;
+    settings.exposurePoint = CGPointMake(0.5f, 0.5f);
+    return settings;
+}
+
+- (BOOL)isEqual:(RTMPCameraSettings *)other {
+    if (![other isKindOfClass:[RTMPCameraSettings class]]) return NO;
+    
+    return CGSizeEqualToSize(self.resolution, other.resolution) &&
+           fabs(self.frameRate - other.frameRate) < 0.1f &&
+           self.position == other.position &&
+           self.autoFocus == other.autoFocus &&
+           self.autoExposure == other.autoExposure &&
+           self.autoWhiteBalance == other.autoWhiteBalance &&
+           fabs(self.zoom - other.zoom) < 0.01f &&
+           fabs(self.focusPoint - other.focusPoint) < 0.01f &&
+           CGPointEqualToPoint(self.exposurePoint, other.exposurePoint);
+}
+
+- (NSDictionary *)serialize {
+    return @{
+        @"width": @(self.resolution.width),
+        @"height": @(self.resolution.height),
+        @"frameRate": @(self.frameRate),
+        @"position": @(self.position),
+        @"autoFocus": @(self.autoFocus),
+        @"autoExposure": @(self.autoExposure),
+        @"autoWhiteBalance": @(self.autoWhiteBalance),
+        @"zoom": @(self.zoom),
+        @"focusPoint": @(self.focusPoint),
+        @"exposureX": @(self.exposurePoint.x),
+        @"exposureY": @(self.exposurePoint.y)
+    };
+}
+
++ (instancetype)settingsWithDictionary:(NSDictionary *)dict {
+    RTMPCameraSettings *settings = [[RTMPCameraSettings alloc] init];
+    settings.resolution = CGSizeMake([dict[@"width"] floatValue], 
+                                   [dict[@"height"] floatValue]);
+    settings.frameRate = [dict[@"frameRate"] floatValue];
+    settings.position = [dict[@"position"] intValue];
+    settings.autoFocus = [dict[@"autoFocus"] boolValue];
+    settings.autoExposure = [dict[@"autoExposure"] boolValue];
+    settings.autoWhiteBalance = [dict[@"autoWhiteBalance"] boolValue];
+    settings.zoom = [dict[@"zoom"] floatValue];
+    settings.focusPoint = [dict[@"focusPoint"] floatValue];
+    settings.exposurePoint = CGPointMake([dict[@"exposureX"] floatValue],
+                                       [dict[@"exposureY"] floatValue]);
+    return settings;
+}
+
+@end
+
+@implementation RTMPCameraStats
+
+- (instancetype)init {
+    if (self = [super init]) {
+        _resolution = CGSizeZero;
+        _frameRate = 0;
+        _currentFPS = 0;
+        _frameCount = 0;
+        _droppedFrames = 0;
+        _totalBytes = 0;
+        _bitrate = 0;
+        _uptime = 0;
+        _hasVideo = NO;
+        _hasAudio = NO;
+        _isPublishing = NO;
+    }
+    return self;
+}
+
+- (NSDictionary *)serialize {
+    return @{
+        @"width": @(self.resolution.width),
+        @"height": @(self.resolution.height),
+        @"frameRate": @(self.frameRate),
+        @"currentFPS": @(self.currentFPS),
+        @"frameCount": @(self.frameCount),
+        @"droppedFrames": @(self.droppedFrames),
+        @"totalBytes": @(self.totalBytes),
+        @"bitrate": @(self.bitrate),
+        @"uptime": @(self.uptime),
+        @"hasVideo": @(self.hasVideo),
+        @"hasAudio": @(self.hasAudio),
+        @"isPublishing": @(self.isPublishing)
+    };
+}
+
++ (instancetype)statsWithDictionary:(NSDictionary *)dict {
+    RTMPCameraStats *stats = [[RTMPCameraStats alloc] init];
+    stats.resolution = CGSizeMake([dict[@"width"] floatValue],
+                                [dict[@"height"] floatValue]);
+    stats.frameRate = [dict[@"frameRate"] floatValue];
+    stats.currentFPS = [dict[@"currentFPS"] floatValue];
+    stats.frameCount = [dict[@"frameCount"] unsignedLongLongValue];
+    stats.droppedFrames = [dict[@"droppedFrames"] unsignedLongLongValue];
+    stats.totalBytes = [dict[@"totalBytes"] unsignedLongLongValue];
+    stats.bitrate = [dict[@"bitrate"] floatValue];
+    stats.uptime = [dict[@"uptime"] doubleValue];
+    stats.hasVideo = [dict[@"hasVideo"] boolValue];
+    stats.hasAudio = [dict[@"hasAudio"] boolValue];
+    stats.isPublishing = [dict[@"isPublishing"] boolValue];
+    return stats;
+}
 
 @end
 
 @implementation RTMPCameraCompatibility
 
-#pragma mark - Initialization
+#pragma mark - Initialization & Lifecycle
 
 + (instancetype)sharedInstance {
-    static RTMPCameraCompatibility *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        instance = [[self alloc] init];
+        gSharedInstance = [[RTMPCameraCompatibility alloc] init];
     });
-    return instance;
+    return gSharedInstance;
 }
 
 - (instancetype)init {
     if (self = [super init]) {
-        _captureQueue = dispatch_queue_create("com.rtmpcamera.capture", DISPATCH_QUEUE_SERIAL);
-        _encodeQueue = dispatch_queue_create("com.rtmpcamera.encode", DISPATCH_QUEUE_SERIAL);
+        _state = RTMPCameraStateOff;
+        _stats = [[RTMPCameraStats alloc] init];
+        _settings = [RTMPCameraSettings defaultSettings];
+        _frameQueue = [NSMutableArray array];
+        _videoQueue = dispatch_queue_create("com.rtmpcamera.video", DISPATCH_QUEUE_SERIAL);
+        _processingQueue = dispatch_queue_create("com.rtmpcamera.processing", DISPATCH_QUEUE_SERIAL);
+        _frameLock = dispatch_semaphore_create(1);
         
-        // Set default config
-        _config.width = 1280;
-        _config.height = 720;
-        _config.frameRate = 30;
-        _config.bitrate = 1000000;
-        _config.keyframeInterval = 2;
-        _config.jpegQuality = 0.8;
-        _config.enableHardwareEncoder = YES;
-        _config.enableFaceDetection = NO;
-        _config.enableStabilization = YES;
-        _config.maintainAspectRatio = YES;
-        _config.orientation = RTMP_CAMERA_ORIENTATION_PORTRAIT;
-        _config.position = AVCaptureDevicePositionBack;
-        
-        _status.state = RTMP_CAMERA_STATE_IDLE;
-        
-        // Setup capture session
-        _captureSession = [[AVCaptureSession alloc] init];
-        
-        // Load available devices
-        [self loadAvailableDevices];
-        
-        // Register for orientation changes
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                               selector:@selector(orientationChanged:)
-                                                   name:UIDeviceOrientationDidChangeNotification
-                                                 object:nil];
-        
-        // Register for app lifecycle events
+        // Register for app lifecycle notifications
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                selector:@selector(applicationWillResignActive:)
                                                    name:UIApplicationWillResignActiveNotification
@@ -92,272 +184,456 @@
 }
 
 - (void)dealloc {
-    [self stopCapture];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self cleanup];
 }
 
 #pragma mark - Camera Control
 
-- (BOOL)startCapture {
-    if (_status.state != RTMP_CAMERA_STATE_IDLE) {
-        return NO;
-    }
+- (void)startWithSettings:(RTMPCameraSettings *)settings {
+    if (_state != RTMPCameraStateOff) return;
     
-    _status.state = RTMP_CAMERA_STATE_STARTING;
-    
-    // Configure capture session
-    if (![self configureCaptureSession]) {
-        _status.state = RTMP_CAMERA_STATE_ERROR;
-        return NO;
-    }
-    
-    // Configure hardware encoder if enabled
-    if (_config.enableHardwareEncoder) {
-        if (![self configureHardwareEncoder]) {
-            _config.enableHardwareEncoder = NO;
-        }
-    }
-    
-    // Start capture session
-    dispatch_async(_captureQueue, ^{
-        [self.captureSession startRunning];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self->_status.state = RTMP_CAMERA_STATE_CAPTURING;
-            if (self.stateCallback) {
-                self.stateCallback(self->_status.state);
-            }
-        });
-    });
-    
-    return YES;
+    _settings = settings ?: [RTMPCameraSettings defaultSettings];
+    [self setupCaptureSession];
 }
 
-- (void)stopCapture {
-    if (_status.state == RTMP_CAMERA_STATE_IDLE) {
-        return;
+- (void)stop {
+    if (_state == RTMPCameraStateOff) return;
+    
+    _state = RTMPCameraStateStopping;
+    [self cleanup];
+    _state = RTMPCameraStateOff;
+    
+    if ([_delegate respondsToSelector:@selector(cameraStateDidChange:)]) {
+        [_delegate cameraStateDidChange:_state];
+    }
+}
+
+- (void)restart {
+    RTMPCameraSettings *currentSettings = _settings;
+    [self stop];
+    [self startWithSettings:currentSettings];
+}
+
+- (BOOL)isRunning {
+    return _state == RTMPCameraStateRunning;
+}
+
+#pragma mark - Setup & Configuration
+
+- (void)setupCaptureSession {
+    _state = RTMPCameraStateStarting;
+    if ([_delegate respondsToSelector:@selector(cameraStateDidChange:)]) {
+        [_delegate cameraStateDidChange:_state];
     }
     
-    dispatch_async(_captureQueue, ^{
-        [self.captureSession stopRunning];
+    dispatch_async(_videoQueue, ^{
+        NSError *error = nil;
         
-        // Cleanup hardware encoder
-        if (self->_compressionSession) {
-            VTCompressionSessionCompleteFrames(self->_compressionSession, kCMTimeInvalid);
-            VTCompressionSessionInvalidate(self->_compressionSession);
-            CFRelease(self->_compressionSession);
-            self->_compressionSession = NULL;
-        }
+        // Create capture session
+        _captureSession = [[AVCaptureSession alloc] init];
         
-        // Cleanup format description
-        if (self->_formatDescription) {
-            CFRelease(self->_formatDescription);
-            self->_formatDescription = NULL;
+        // Configure resolution
+        if (_settings.resolution.width >= 1920) {
+            [_captureSession setSessionPreset:AVCaptureSessionPreset1920x1080];
+        } else if (_settings.resolution.width >= 1280) {
+            [_captureSession setSessionPreset:AVCaptureSessionPreset1280x720];
+        } else if (_settings.resolution.width >= 640) {
+            [_captureSession setSessionPreset:AVCaptureSessionPreset640x480];
+        } else {
+            [_captureSession setSessionPreset:AVCaptureSessionPresetLow];
         }
         
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self->_status.state = RTMP_CAMERA_STATE_IDLE;
-            if (self.stateCallback) {
-                self.stateCallback(self->_status.state);
-            }
-        });
-    });
-}
-
-- (void)pauseCapture {
-    if (_status.state != RTMP_CAMERA_STATE_CAPTURING) {
-        return;
-    }
-    
-    dispatch_async(_captureQueue, ^{
-        [self.captureSession stopRunning];
+        // Get camera device
+        _device = [self cameraWithPosition:_settings.position];
+        if (!_device) {
+            error = [NSError errorWithDomain:@"RTMPCamera" 
+                                      code:-1
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Failed to get camera device"}];
+            [self handleSetupError:error];
+            return;
+        }
+        
+        // Create device input
+        _input = [AVCaptureDeviceInput deviceInputWithDevice:_device error:&error];
+        if (!_input || error) {
+            [self handleSetupError:error];
+            return;
+        }
+        
+        if ([_captureSession canAddInput:_input]) {
+            [_captureSession addInput:_input];
+        } else {
+            error = [NSError errorWithDomain:@"RTMPCamera"
+                                      code:-2 
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Failed to add camera input"}];
+            [self handleSetupError:error];
+            return;
+        }
+        
+        // Create and configure video output
+        _output = [[AVCaptureVideoDataOutput alloc] init];
+        _output.videoSettings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey: @(_settings.resolution.width),
+            (id)kCVPixelBufferHeightKey: @(_settings.resolution.height)
+        };
+        _output.alwaysDiscardsLateVideoFrames = YES;
+        [_output setSampleBufferDelegate:self queue:_videoQueue];
+        
+        if ([_captureSession canAddOutput:_output]) {
+            [_captureSession addOutput:_output];
+        } else {
+            error = [NSError errorWithDomain:@"RTMPCamera"
+                                      code:-3
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Failed to add video output"}];
+            [self handleSetupError:error];
+            return;
+        }
+        
+        // Configure camera settings
+        [self configureCameraWithError:&error];
+        if (error) {
+            [self handleSetupError:error];
+            return;
+        }
+        
+        // Start capture session
+        [_captureSession startRunning];
+        
+        // Update state
+        _state = RTMPCameraStateRunning;
+        _startTime = [NSDate date];
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            self->_status.state = RTMP_CAMERA_STATE_PAUSED;
-            if (self.stateCallback) {
-                self.stateCallback(self->_status.state);
+            if ([_delegate respondsToSelector:@selector(cameraStateDidChange:)]) {
+                [_delegate cameraStateDidChange:_state];
             }
         });
     });
 }
 
-- (void)resumeCapture {
-    if (_status.state != RTMP_CAMERA_STATE_PAUSED) {
-        return;
-    }
-    
-    dispatch_async(_captureQueue, ^{
-        [self.captureSession startRunning];
+- (void)configureCameraWithError:(NSError **)error {
+    if ([_device lockForConfiguration:error]) {
+        // Configure frame rate
+        CMTime frameDuration = CMTimeMake(1, (int32_t)_settings.frameRate);
+        _device.activeVideoMinFrameDuration = frameDuration;
+        _device.activeVideoMaxFrameDuration = frameDuration;
         
+        // Configure focus
+        if ([_device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+            _device.focusMode = _settings.autoFocus ? 
+                AVCaptureFocusModeContinuousAutoFocus : AVCaptureFocusModeAutoFocus;
+        }
+        
+        // Configure exposure
+        if ([_device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+            _device.exposureMode = _settings.autoExposure ? 
+                AVCaptureExposureModeContinuousAutoExposure : AVCaptureExposureModeAutoExpose;
+        }
+        
+        // Configure white balance
+        if ([_device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance]) {
+            _device.whiteBalanceMode = _settings.autoWhiteBalance ? 
+                AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance : AVCaptureWhiteBalanceModeAutoWhiteBalance;
+        }
+        
+        // Configure zoom
+        if (_device.videoZoomFactor != _settings.zoom) {
+            _device.videoZoomFactor = MIN(_settings.zoom, _device.activeFormat.videoMaxZoomFactor);
+        }
+        
+        [_device unlockForConfiguration];
+    }
+}
+
+- (void)cleanup {
+    // Stop capture session
+    [_captureSession stopRunning];
+    
+    // Remove inputs and outputs
+    for (AVCaptureInput *input in _captureSession.inputs) {
+        [_captureSession removeInput:input];
+    }
+    
+    for (AVCaptureOutput *output in _captureSession.outputs) {
+        [_captureSession removeOutput:output];
+    }
+
+    // Release objects
+    _captureSession = nil;
+    _device = nil;
+    _input = nil;
+    _output = nil;
+    
+    // Clear frame queue
+    [_frameQueue removeAllObjects];
+    
+    // Release last frame
+    if (_lastFrame) {
+        CVPixelBufferRelease(_lastFrame);
+        _lastFrame = NULL;
+    }
+    
+    // Reset stats
+    _stats = [[RTMPCameraStats alloc] init];
+    
+    // Stop preview if running
+    if (_isPreviewRunning) {
+        [self stopPreview];
+    }
+}
+
+#pragma mark - Frame Processing
+
+- (void)processRTMPFrame:(void*)frameData 
+                   size:(size_t)frameSize 
+              timestamp:(uint32_t)timestamp 
+            isKeyframe:(BOOL)isKeyframe {
+    
+    if (_state != RTMPCameraStateRunning) return;
+    
+    dispatch_async(_processingQueue, ^{
+        // Update stats
+        _stats.hasVideo = YES;
+        _stats.totalBytes += frameSize;
+        _stats.frameCount++;
+        _stats.isPublishing = OSAtomicOr32(0, &gIsPublishing);
+        
+        // Calculate bitrate (bytes per second)
+        NSTimeInterval uptime = -[_startTime timeIntervalSinceNow];
+        _stats.uptime = uptime;
+        _stats.bitrate = (_stats.totalBytes * 8.0f) / (uptime * 1024.0f); // kbps
+        
+        // Convert RTMP frame to CVPixelBuffer
+        CVPixelBufferRef pixelBuffer = [self createPixelBufferFromRTMPFrame:frameData 
+                                                                      size:frameSize];
+        if (!pixelBuffer) {
+            _stats.droppedFrames++;
+            return;
+        }
+        
+        // Store last frame
+        dispatch_semaphore_wait(_frameLock, DISPATCH_TIME_FOREVER);
+        if (_lastFrame) {
+            CVPixelBufferRelease(_lastFrame);
+        }
+        _lastFrame = pixelBuffer;
+        dispatch_semaphore_signal(_frameLock);
+        
+        // Update stats
+        _stats.currentFPS = _stats.frameCount / uptime;
+        
+        // Notify delegate
         dispatch_async(dispatch_get_main_queue(), ^{
-            self->_status.state = RTMP_CAMERA_STATE_CAPTURING;
-            if (self.stateCallback) {
-                self.stateCallback(self->_status.state);
+            if ([_delegate respondsToSelector:@selector(cameraDidUpdateStats:)]) {
+                [_delegate cameraDidUpdateStats:_stats];
             }
         });
     });
 }
 
-#pragma mark - Configuration
-
-- (BOOL)configureCaptureSession {
-    [_captureSession beginConfiguration];
+- (CVPixelBufferRef)createPixelBufferFromRTMPFrame:(void*)frameData size:(size_t)frameSize {
+    if (!frameData || frameSize == 0) return NULL;
     
-    // Set session preset
-    if ([_captureSession canSetSessionPreset:AVCaptureSessionPreset1280x720]) {
-        _captureSession.sessionPreset = AVCaptureSessionPreset1280x720;
-    } else {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to set capture session preset"];
-        return NO;
-    }
-    
-    // Configure video input
-    NSError *error = nil;
-    _videoDevice = [self findDeviceWithPosition:_config.position];
-    if (!_videoDevice) {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to find video device"];
-        return NO;
-    }
-    
-    _videoInput = [AVCaptureDeviceInput deviceInputWithDevice:_videoDevice error:&error];
-    if (!_videoInput || error) {
-        [_captureSession commitConfiguration];
-        [self notifyError:error.localizedDescription];
-        return NO;
-    }
-    
-    if ([_captureSession canAddInput:_videoInput]) {
-        [_captureSession addInput:_videoInput];
-    } else {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to add video input"];
-        return NO;
-    }
-    
-    // Configure audio input
-    _audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-    _audioInput = [AVCaptureDeviceInput deviceInputWithDevice:_audioDevice error:&error];
-    if (!_audioInput || error) {
-        [_captureSession commitConfiguration];
-        [self notifyError:error.localizedDescription];
-        return NO;
-    }
-    
-    if ([_captureSession canAddInput:_audioInput]) {
-        [_captureSession addInput:_audioInput];
-    } else {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to add audio input"];
-        return NO;
-    }
-    
-    // Configure video output
-    _videoOutput = [[AVCaptureVideoDataOutput alloc] init];
-    _videoOutput.videoSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        (id)kCVPixelBufferWidthKey: @(_config.width),
-        (id)kCVPixelBufferHeightKey: @(_config.height)
+    // Create pixel buffer
+    CVPixelBufferRef pixelBuffer = NULL;
+    NSDictionary *options = @{
+        (NSString*)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (NSString*)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
     };
-    _videoOutput.alwaysDiscardsLateVideoFrames = YES;
-    [_videoOutput setSampleBufferDelegate:self queue:_captureQueue];
     
-    if ([_captureSession canAddOutput:_videoOutput]) {
-        [_captureSession addOutput:_videoOutput];
-    } else {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to add video output"];
-        return NO;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
+                                         _settings.resolution.width,
+                                         _settings.resolution.height,
+                                         kCVPixelFormatType_32BGRA,
+                                         (__bridge CFDictionaryRef)options,
+                                         &pixelBuffer);
+    
+    if (status != kCVReturnSuccess) {
+        return NULL;
     }
     
-    // Configure audio output
-    _audioOutput = [[AVCaptureAudioDataOutput alloc] init];
-    [_audioOutput setSampleBufferDelegate:self queue:_captureQueue];
+    // Lock buffer for writing
+    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
     
-    if ([_captureSession canAddOutput:_audioOutput]) {
-        [_captureSession addOutput:_audioOutput];
-    } else {
-        [_captureSession commitConfiguration];
-        [self notifyError:@"Failed to add audio output"];
-        return NO;
+    // Copy frame data
+    void *baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+    size_t height = CVPixelBufferGetHeight(pixelBuffer);
+    
+    // Ensure buffer has enough space
+    size_t maxSize = bytesPerRow * height;
+    if (frameSize > maxSize) {
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+        CVPixelBufferRelease(pixelBuffer);
+        return NULL;
     }
     
-    // Configure video connection
-    AVCaptureConnection *videoConnection = [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
-    if ([videoConnection isVideoStabilizationSupported] && _config.enableStabilization) {
-        videoConnection.preferredVideoStabilizationMode = AVCaptureVideoStabilizationModeAuto;
-    }
+    memcpy(baseAddress, frameData, frameSize);
     
-    videoConnection.videoOrientation = [self avOrientationFromRTMPOrientation:_config.orientation];
+    // Unlock buffer
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
     
-    // Configure preview layer
-    if (_previewView) {
-        _previewLayer = [AVCaptureVideoPreviewLayer layerWithSession:_captureSession];
-        _previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        _previewLayer.frame = _previewView.bounds;
-        [_previewView.layer addSublayer:_previewLayer];
-    }
-    
-    [_captureSession commitConfiguration];
-    return YES;
+    return pixelBuffer;
 }
 
-- (BOOL)configureHardwareEncoder {
-    // Create compression session
-    OSStatus status = VTCompressionSessionCreate(NULL,
-                                               _config.width,
-                                               _config.height,
-                                               kCMVideoCodecType_H264,
-                                               NULL,
-                                               NULL,
-                                               NULL,
-                                               VideoCompressedCallback,
-                                               (__bridge void *)self,
-                                               &_compressionSession);
+- (void)flushBuffers {
+    dispatch_async(_processingQueue, ^{
+        dispatch_semaphore_wait(_frameLock, DISPATCH_TIME_FOREVER);
+        
+        if (_lastFrame) {
+            CVPixelBufferRelease(_lastFrame);
+            _lastFrame = NULL;
+        }
+        
+        [_frameQueue removeAllObjects];
+        
+        dispatch_semaphore_signal(_frameLock);
+    });
+}
+
+- (CVPixelBufferRef)copyLastFrame {
+    __block CVPixelBufferRef frame = NULL;
     
-    if (status != noErr) {
-        [self notifyError:@"Failed to create compression session"];
-        return NO;
+    dispatch_semaphore_wait(_frameLock, DISPATCH_TIME_FOREVER);
+    if (_lastFrame) {
+        CVPixelBufferRetain(_lastFrame);
+        frame = _lastFrame;
+    }
+    dispatch_semaphore_signal(_frameLock);
+    
+    return frame;
+}
+
+#pragma mark - Preview
+
+- (UIView *)previewView {
+    if (!_previewLayer) {
+        UIView *view = [[UIView alloc] initWithFrame:CGRectZero];
+        view.backgroundColor = [UIColor blackColor];
+        
+        _previewLayer = [[AVCaptureVideoPreviewLayer alloc] initWithSession:_captureSession];
+        _previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        _previewLayer.frame = view.bounds;
+        
+        [view.layer addSublayer:_previewLayer];
+        
+        view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        
+        _isPreviewRunning = NO;
     }
     
-    // Configure encoder properties
-    status = VTSessionSetProperty(_compressionSession,
-                                kVTCompressionPropertyKey_RealTime,
-                                kCFBooleanTrue);
+    return _previewLayer.superview;
+}
+
+- (void)startPreview {
+    if (!_isPreviewRunning && _state == RTMPCameraStateRunning) {
+        [_captureSession startRunning];
+        _isPreviewRunning = YES;
+    }
+}
+
+- (void)stopPreview {
+    if (_isPreviewRunning) {
+        [_captureSession stopRunning];
+        _isPreviewRunning = NO;
+    }
+}
+
+- (void)updatePreviewOrientation {
+    if (!_previewLayer) return;
     
-    status |= VTSessionSetProperty(_compressionSession,
-                                 kVTCompressionPropertyKey_ProfileLevel,
-                                 kVTProfileLevel_H264_Baseline_AutoLevel);
+    UIInterfaceOrientation orientation = [[UIApplication sharedApplication] statusBarOrientation];
     
-    status |= VTSessionSetProperty(_compressionSession,
-                                 kVTCompressionPropertyKey_AllowFrameReordering,
-                                 kCFBooleanFalse);
+    _previewLayer.connection.videoOrientation = (AVCaptureVideoOrientation)orientation;
+}
+
+#pragma mark - Utilities
+
+- (NSArray<NSValue *> *)supportedResolutions {
+    NSMutableArray *resolutions = [NSMutableArray array];
     
-    status |= VTSessionSetProperty(_compressionSession,
-                                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                                 (__bridge CFTypeRef)@(_config.keyframeInterval * _config.frameRate));
+    AVCaptureDevice *device = [self cameraWithPosition:_settings.position];
+    if (!device) return resolutions;
     
-    status |= VTSessionSetProperty(_compressionSession,
-                                 kVTCompressionPropertyKey_ExpectedFrameRate,
-                                 (__bridge CFTypeRef)@(_config.frameRate));
-    
-    status |= VTSessionSetProperty(_compressionSession,
-                                 kVTCompressionPropertyKey_AverageBitRate,
-                                 (__bridge CFTypeRef)@(_config.bitrate));
-    
-    if (status != noErr) {
-        [self notifyError:@"Failed to configure compression session"];
-        return NO;
+    for (AVCaptureDeviceFormat *format in device.formats) {
+        CMVideoFormatDescriptionRef desc = format.formatDescription;
+        CGSize dimensions = CMVideoFormatDescriptionGetDimensions(desc);
+        [resolutions addObject:[NSValue valueWithCGSize:dimensions]];
     }
     
-    status = VTCompressionSessionPrepareToEncodeFrames(_compressionSession);
-    if (status != noErr) {
-        [self notifyError:@"Failed to prepare compression session"];
-        return NO;
+    return resolutions;
+}
+
+- (NSArray<NSNumber *> *)supportedFrameRates {
+    NSMutableArray *frameRates = [NSMutableArray array];
+    
+    AVCaptureDevice *device = [self cameraWithPosition:_settings.position];
+    if (!device) return frameRates;
+    
+    for (AVFrameRateRange *range in device.activeFormat.videoSupportedFrameRateRanges) {
+        [frameRates addObject:@(range.maxFrameRate)];
     }
     
-    return YES;
+    return frameRates;
+}
+
+- (BOOL)supportsCamera:(AVCaptureDevicePosition)position {
+    return [self cameraWithPosition:position] != nil;
+}
+
+- (BOOL)hasMultipleCameras {
+    return [[AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo] count] > 1;
+}
+
+- (AVCaptureDevice *)currentDevice {
+    return _device;
+}
+
+#pragma mark - Private Methods
+
+- (AVCaptureDevice *)cameraWithPosition:(AVCaptureDevicePosition)position {
+    NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    for (AVCaptureDevice *device in devices) {
+        if (device.position == position) {
+            return device;
+        }
+    }
+    return nil;
+}
+
+- (void)handleSetupError:(NSError *)error {
+    // Cleanup any partially initialized objects
+    [self cleanup];
+    
+    // Update state
+    _state = RTMPCameraStateError;
+    
+    // Notify delegate
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([_delegate respondsToSelector:@selector(cameraStateDidChange:)]) {
+            [_delegate cameraStateDidChange:_state];
+        }
+        
+        if ([_delegate respondsToSelector:@selector(cameraDidEncounterError:)]) {
+            [_delegate cameraDidEncounterError:error];
+        }
+    });
+}
+
+#pragma mark - App Lifecycle
+
+- (void)applicationWillResignActive:(NSNotification *)notification {
+    if (_state == RTMPCameraStateRunning) {
+        [self stopPreview];
+    }
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    if (_state == RTMPCameraStateRunning && _isPreviewRunning) {
+        [self startPreview];
+    }
 }
 
 #pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -366,259 +642,108 @@
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer 
        fromConnection:(AVCaptureConnection *)connection {
     
-    if (!_stream || _status.state != RTMP_CAMERA_STATE_CAPTURING) {
-        return;
+    if (_state != RTMPCameraStateRunning) return;
+    
+    // Get image buffer
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) return;
+    
+    // Lock buffer
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    // Get buffer info
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    size_t size = bytesPerRow * height;
+    
+    // Copy to new buffer to avoid threading issues
+    void *frameData = malloc(size);
+    if (frameData) {
+        memcpy(frameData, baseAddress, size);
+        
+        // Add to frame queue
+        [_frameQueue addObject:[NSData dataWithBytesNoCopy:frameData 
+                                                   length:size 
+                                             freeWhenDone:YES]];
     }
     
-    CFRetain(sampleBuffer);
-    
-    if (connection == [_videoOutput connectionWithMediaType:AVMediaTypeVideo]) {
-        // Handle video sample buffer
-        dispatch_async(_encodeQueue, ^{
-            [self processVideoSampleBuffer:sampleBuffer];
-            CFRelease(sampleBuffer);
-        });
-    } else if (connection == [_audioOutput connectionWithMediaType:AVMediaTypeAudio]) {
-        // Handle audio sample buffer
-        dispatch_async(_encodeQueue, ^{
-            [self processAudioSampleBuffer:sampleBuffer];
-            CFRelease(sampleBuffer);
-        });
-    }
-}
-
-#pragma mark - Sample Buffer Processing
-
-- (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    _status.framesCapture++;
-    
-    uint32_t captureTime = rtmp_get_timestamp();
-
-    if (_config.enableHardwareEncoder) {
-        // Hardware encoding
-        CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (imageBuffer == NULL) {
-            return;
-        }
-
-        // Get frame timing info
-        CMTime presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        CMTime duration = CMSampleBufferGetDuration(sampleBuffer);
-        
-        // Prepare encode info
-        VTEncodeInfoFlags flags;
-        OSStatus status = VTCompressionSessionEncodeFrame(_compressionSession,
-                                                        imageBuffer,
-                                                        presentationTimeStamp,
-                                                        duration,
-                                                        NULL,
-                                                        NULL,
-                                                        &flags);
-        
-        if (status != noErr) {
-            [self notifyError:@"Failed to encode video frame"];
-            return;
-        }
-    } else {
-        // Software encoding
-        CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (imageBuffer == NULL) {
-            return;
-        }
-
-        // Lock base address
-        CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-        
-        // Get buffer dimensions
-        size_t width = CVPixelBufferGetWidth(imageBuffer);
-        size_t height = CVPixelBufferGetHeight(imageBuffer);
-        size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
-        uint8_t *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
-        
-        // Create RTMP packet
-        RTMPPacket packet;
-        memset(&packet, 0, sizeof(packet));
-        packet.type = RTMP_MSG_VIDEO;
-        packet.timestamp = rtmp_get_timestamp();
-        
-        // Convert to YUV and encode
-        // TODO: Implement software encoding
-        
-        // Send packet
-        if (_stream) {
-            rtmp_send_packet(_stream->rtmp, &packet);
-        }
-        
-        // Unlock buffer
-        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
-        
-        // Update stats
-        _status.framesEncoded++;
-        _status.framesSent++;
-        _status.encodeTime = rtmp_get_timestamp() - captureTime;
-    }
-}
-
-- (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!_stream) return;
-
-    // Get audio data
-    CMBlockBufferRef blockBuffer;
-    AudioBufferList audioBufferList;
-    CMSampleBufferGetAudioBufferList(sampleBuffer, NULL, &audioBufferList, sizeof(audioBufferList));
-    CMSampleBufferGetDataBuffer(sampleBuffer, &blockBuffer);
-    
-    // Create RTMP packet
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_AUDIO;
-    packet.timestamp = rtmp_get_timestamp();
-    
-    for (int i = 0; i < audioBufferList.mNumberBuffers; i++) {
-        AudioBuffer audioBuffer = audioBufferList.mBuffers[i];
-        
-        // Encode audio data
-        // TODO: Implement AAC encoding
-        
-        // Send packet
-        if (_stream) {
-            rtmp_send_packet(_stream->rtmp, &packet);
-        }
-    }
-}
-
-#pragma mark - Hardware Encoder Callback
-
-static void VideoCompressedCallback(void *outputCallbackRefCon,
-                                  void *sourceFrameRefCon,
-                                  OSStatus status,
-                                  VTEncodeInfoFlags infoFlags,
-                                  CMSampleBufferRef sampleBuffer) {
-    if (status != noErr || !sampleBuffer) return;
-    
-    RTMPCameraCompatibility *camera = (__bridge RTMPCameraCompatibility *)outputCallbackRefCon;
-    [camera handleEncodedVideoFrame:sampleBuffer];
-}
-
-- (void)handleEncodedVideoFrame:(CMSampleBufferRef)sampleBuffer {
-    // Get encoded data
-    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    size_t length, totalLength;
-    char *dataPointer;
-    OSStatus status = CMBlockBufferGetDataPointer(blockBuffer, 0, &length, &totalLength, &dataPointer);
-    
-    if (status != kCMBlockBufferNoErr) return;
-    
-    // Create RTMP packet
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_VIDEO;
-    packet.timestamp = rtmp_get_timestamp();
-    
-    // Check for keyframe
-    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, YES);
-    BOOL keyframe = NO;
-    
-    if (attachments != NULL && CFArrayGetCount(attachments) > 0) {
-        CFDictionaryRef attachment = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-        keyframe = !CFDictionaryContainsKey(attachment, kCMSampleAttachmentKey_NotSync);
-    }
-    
-    // Set packet data
-    uint8_t *data = malloc(totalLength + 5);
-    data[0] = keyframe ? 0x17 : 0x27;
-    data[1] = 0x01; // AVC NALU
-    data[2] = 0x00;
-    data[3] = 0x00;
-    data[4] = 0x00;
-    memcpy(data + 5, dataPointer, totalLength);
-    
-    packet.data = data;
-    packet.size = totalLength + 5;
-    
-    // Send packet
-    if (_stream) {
-        rtmp_send_packet(_stream->rtmp, &packet);
-    }
-    
-    free(data);
-    
-    // Update stats
-    _status.framesEncoded++;
-    _status.framesSent++;
-    _status.currentBitrate = totalLength * 8 * _config.frameRate; // approximate
-}
-
-#pragma mark - Device Management
-
-- (void)loadAvailableDevices {
-    NSMutableArray *devices = [NSMutableArray array];
-    
-    AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession 
-        discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
-        mediaType:AVMediaTypeVideo
-        position:AVCaptureDevicePositionUnspecified];
-    
-    for (AVCaptureDevice *device in discoverySession.devices) {
-        [devices addObject:device];
-    }
-    
-    _availableDevices = [devices copy];
-}
-
-- (AVCaptureDevice *)findDeviceWithPosition:(AVCaptureDevicePosition)position {
-    for (AVCaptureDevice *device in _availableDevices) {
-        if (device.position == position) {
-            return device;
-        }
-    }
-    return nil;
-}
-
-#pragma mark - Utility Methods
-
-- (void)notifyError:(NSString *)message {
-    NSError *error = [NSError errorWithDomain:@"RTMPCamera"
-                                        code:-1
-                                    userInfo:@{NSLocalizedDescriptionKey: message}];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.errorCallback) {
-            self.errorCallback(error);
-        }
-    });
-}
-
-- (AVCaptureVideoOrientation)avOrientationFromRTMPOrientation:(RTMPCameraOrientation)orientation {
-    switch (orientation) {
-        case RTMP_CAMERA_ORIENTATION_PORTRAIT:
-            return AVCaptureVideoOrientationPortrait;
-        case RTMP_CAMERA_ORIENTATION_LANDSCAPE_LEFT:
-            return AVCaptureVideoOrientationLandscapeLeft;
-        case RTMP_CAMERA_ORIENTATION_LANDSCAPE_RIGHT:
-            return AVCaptureVideoOrientationLandscapeRight;
-        case RTMP_CAMERA_ORIENTATION_PORTRAIT_UPSIDE_DOWN:
-            return AVCaptureVideoOrientationPortraitUpsideDown;
-        default:
-            return AVCaptureVideoOrientationPortrait;
-    }
-}
-
-#pragma mark - Notifications
-
-- (void)orientationChanged:(NSNotification *)notification {
-    UIDeviceOrientation deviceOrientation = [[UIDevice currentDevice] orientation];
-    [self handleDeviceOrientationChange:deviceOrientation];
-}
-
-- (void)applicationWillResignActive:(NSNotification *)notification {
-    [self pauseCapture];
-}
-
-- (void)applicationDidBecomeActive:(NSNotification *)notification {
-    if (_status.state == RTMP_CAMERA_STATE_PAUSED) {
-        [self resumeCapture];
-    }
+    // Unlock buffer
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 }
 
 @end
+
+#pragma mark - C Interface
+
+bool rtmp_camera_compat_initialize(void) {
+    @autoreleasepool {
+        return [RTMPCameraCompatibility sharedInstance] != nil;
+    }
+}
+
+void rtmp_camera_compat_cleanup(void) {
+    @autoreleasepool {
+        [[RTMPCameraCompatibility sharedInstance] stop];
+    }
+}
+
+void rtmp_camera_compat_start(void) {
+    @autoreleasepool {
+        [[RTMPCameraCompatibility sharedInstance] startWithSettings:nil];
+    }
+}
+
+void rtmp_camera_compat_stop(void) {
+    @autoreleasepool {
+        [[RTMPCameraCompatibility sharedInstance] stop];
+    }
+}
+
+bool rtmp_camera_compat_is_running(void) {
+    @autoreleasepool {
+        return [[RTMPCameraCompatibility sharedInstance] isRunning];
+    }
+}
+
+void rtmp_camera_compat_process_frame(void* frame_data, 
+                                    size_t frame_size,
+                                    uint32_t timestamp,
+                                    bool is_keyframe) {
+    @autoreleasepool {
+        [[RTMPCameraCompatibility sharedInstance] processRTMPFrame:frame_data
+                                                            size:frame_size
+                                                       timestamp:timestamp
+                                                     isKeyframe:is_keyframe];
+    }
+}
+
+bool rtmp_camera_compat_get_resolution(int* width, int* height) {
+    @autoreleasepool {
+        RTMPCameraCompatibility *compat = [RTMPCameraCompatibility sharedInstance];
+        if (!compat.isRunning) return false;
+        
+        CGSize size = compat.settings.resolution;
+        if (width) *width = (int)size.width;
+        if (height) *height = (int)size.height;
+        return true;
+    }
+}
+
+float rtmp_camera_compat_get_framerate(void) {
+    @autoreleasepool {
+        return [RTMPCameraCompatibility sharedInstance].stats.currentFPS;
+    }
+}
+
+uint64_t rtmp_camera_compat_get_frame_count(void) {
+    @autoreleasepool {
+        return [RTMPCameraCompatibility sharedInstance].stats.frameCount;
+    }
+}
+
+bool rtmp_camera_compat_is_publishing(void) {
+    @autoreleasepool {
+        return [RTMPCameraCompatibility sharedInstance].stats.isPublishing;
+    }
+}

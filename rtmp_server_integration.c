@@ -1,1068 +1,901 @@
+// rtmp_server_integration.c
 #include "rtmp_server_integration.h"
-#include "rtmp_utils.h"
-#include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/time.h>
 
-#define MAX_PENDING_CONNECTIONS 10
-#define MAX_CLIENTS 100
-#define BUFFER_SIZE 8192
-#define CLIENT_TIMEOUT 30000  // 30 seconds
-#define HEALTH_CHECK_INTERVAL 1000 // 1 second
-#define DEFAULT_CHUNK_SIZE 128
-#define DEFAULT_WINDOW_SIZE 2500000
+// Private variables
+static rtmp_server_context_t server_ctx;
+static rtmp_connection_callback_t connection_callback;
+static rtmp_metadata_callback_t metadata_callback;
+static rtmp_frame_callback_t frame_callback;
+static rtmp_server_state_callback_t state_callback;
+static void* connection_callback_data;
+static void* metadata_callback_data;
+static void* frame_callback_data;
+static void* state_callback_data;
 
-// Client structure
-typedef struct {
-    int socket;
-    char id[64];
-    char ip[32];
-    uint32_t connectTime;
-    uint32_t lastActivity;
-    uint32_t bytesSent;
-    uint32_t bytesReceived;
-    bool authenticated;
-    bool isPublisher;
-    RTMPContext *rtmp;
-    char *streamName;
-    uint32_t streamId;
-    pthread_t thread;
-    bool threadRunning;
-} RTMPServerClient;
+// Forward declarations of internal functions
+static void* rtmp_server_accept_thread(void* arg);
+static void* rtmp_server_monitor_thread(void* arg);
+static bool rtmp_server_handle_connection(rtmp_connection_t* conn);
+static void rtmp_server_cleanup_connection(rtmp_connection_t* conn);
+static void rtmp_server_update_state(rtmp_server_state_t new_state);
+static bool rtmp_connection_send_chunk(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static bool rtmp_connection_receive_chunk(rtmp_connection_t* conn);
+static void rtmp_connection_handle_message(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static bool rtmp_handshake_process(rtmp_connection_t* conn);
+static void rtmp_handle_connect(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_create_stream(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_play(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_publish(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_video(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_audio(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
+static void rtmp_handle_metadata(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk);
 
-// Stream structure
-typedef struct RTMPServerStream {
-    char name[128];
-    RTMPServerClient *publisher;
-    RTMPServerClient **subscribers;
-    uint32_t numSubscribers;
-    uint32_t maxSubscribers;
-    uint32_t startTime;
-    uint32_t bandwidth;
-    RTMPStreamInfo info;
-    struct RTMPServerStream *next;
-} RTMPServerStream;
-
-struct RTMPServerContext {
-    RTMPServerConfig config;
-    RTMPServerStats stats;
-    RTMPServerState state;
-    int serverSocket;
-    RTMPServerClient *clients;
-    uint32_t numClients;
-    RTMPServerStream *streams;
-    pthread_t acceptThread;
-    pthread_t monitorThread;
-    pthread_mutex_t mutex;
-    pthread_mutex_t streamMutex;
-    bool threadsRunning;
-    RTMPServerClientCallback clientCallback;
-    RTMPServerStreamCallback streamCallback;
-    RTMPServerErrorCallback errorCallback;
-    void *clientCallbackData;
-    void *streamCallbackData;
-    void *errorCallbackData;
-    uint32_t startTime;
-};
-
-// Forward declarations
-static void *accept_thread(void *arg);
-static void *monitor_thread(void *arg);
-static void *client_thread(void *arg);
-
-// Private helper functions
-static bool init_server_socket(RTMPServerContext *ctx);
-static bool handle_client_connection(RTMPServerContext *ctx, int clientSocket, const char *clientIP);
-static void handle_client_disconnect(RTMPServerContext *ctx, RTMPServerClient *client);
-static bool authenticate_client(RTMPServerContext *ctx, RTMPServerClient *client);
-static void check_client_timeouts(RTMPServerContext *ctx);
-static void update_stats(RTMPServerContext *ctx);
-static bool is_ip_allowed(RTMPServerContext *ctx, const char *ip);
-static void log_error(RTMPServerContext *ctx, RTMPError error, const char *description);
-
-// Stream management helpers
-static RTMPServerStream *create_stream(const char *name, RTMPServerClient *publisher);
-static void destroy_stream(RTMPServerStream *stream);
-static RTMPServerStream *find_stream(RTMPServerContext *ctx, const char *name);
-static bool add_subscriber_to_stream(RTMPServerStream *stream, RTMPServerClient *client);
-static void remove_subscriber_from_stream(RTMPServerStream *stream, RTMPServerClient *client);
-static void broadcast_to_subscribers(RTMPServerStream *stream, RTMPPacket *packet);
-
-// Client management helpers
-static RTMPServerClient *create_client(int socket, const char *ip);
-static void destroy_client(RTMPServerClient *client);
-static bool handle_client_message(RTMPServerClient *client, RTMPPacket *packet);
-static bool send_server_bw(RTMPServerClient *client);
-static bool send_client_bw(RTMPServerClient *client);
-static bool send_chunk_size(RTMPServerClient *client);
-static bool handle_connect(RTMPServerClient *client, RTMPPacket *packet);
-static bool handle_createStream(RTMPServerClient *client, RTMPPacket *packet);
-static bool handle_publish(RTMPServerClient *client, RTMPPacket *packet);
-static bool handle_play(RTMPServerClient *client, RTMPPacket *packet);
-static bool handle_closeStream(RTMPServerClient *client, RTMPPacket *packet);
-
-// Buffer management
-static bool write_client_buffer(RTMPServerClient *client, const uint8_t *data, size_t size);
-static bool read_client_buffer(RTMPServerClient *client, uint8_t *data, size_t size);
-static void flush_client_buffer(RTMPServerClient *client);
-
-RTMPServerContext *rtmp_server_create(void) {
-    RTMPServerContext *ctx = (RTMPServerContext *)calloc(1, sizeof(RTMPServerContext));
-    if (!ctx) return NULL;
-
-    // Initialize mutexes
-    pthread_mutex_init(&ctx->mutex, NULL);
-    pthread_mutex_init(&ctx->streamMutex, NULL);
-
-    // Allocate client array
-    ctx->clients = (RTMPServerClient *)calloc(MAX_CLIENTS, sizeof(RTMPServerClient));
-    if (!ctx->clients) {
-        free(ctx);
-        return NULL;
-    }
-
-    // Set default config
-    ctx->config.port = 1935;
-    ctx->config.maxClients = MAX_CLIENTS;
-    ctx->config.maxBandwidthPerClient = 5000000; // 5 Mbps
-    ctx->config.chunkSize = DEFAULT_CHUNK_SIZE;
-    ctx->config.windowSize = DEFAULT_WINDOW_SIZE;
-    ctx->config.enableAuth = false;
-    ctx->config.numAllowedIPs = 0;
-
-    ctx->state = RTMP_SERVER_STATE_STOPPED;
-    ctx->streams = NULL;
-    ctx->startTime = rtmp_get_timestamp();
-
-    return ctx;
-}
-
-void rtmp_server_destroy(RTMPServerContext *ctx) {
-    if (!ctx) return;
-
-    rtmp_server_stop(ctx);
-
-    // Free all streams
-    pthread_mutex_lock(&ctx->streamMutex);
-    RTMPServerStream *stream = ctx->streams;
-    while (stream) {
-        RTMPServerStream *next = stream->next;
-        destroy_stream(stream);
-        stream = next;
-    }
-    pthread_mutex_unlock(&ctx->streamMutex);
-
-    // Free clients array
-    free(ctx->clients);
-
-    // Destroy mutexes
-    pthread_mutex_destroy(&ctx->mutex);
-    pthread_mutex_destroy(&ctx->streamMutex);
-
-    free(ctx);
-}
-
-bool rtmp_server_start(RTMPServerContext *ctx) {
-    if (!ctx || ctx->state != RTMP_SERVER_STATE_STOPPED) return false;
-
-    pthread_mutex_lock(&ctx->mutex);
-
-    // Initialize server socket
-    if (!init_server_socket(ctx)) {
-        pthread_mutex_unlock(&ctx->mutex);
-        return false;
-    }
-
-    // Reset statistics
-    memset(&ctx->stats, 0, sizeof(RTMPServerStats));
-    ctx->stats.uptime = 0;
-    ctx->startTime = rtmp_get_timestamp();
-
-    // Start threads
-    ctx->threadsRunning = true;
-    ctx->state = RTMP_SERVER_STATE_STARTING;
-
-    if (pthread_create(&ctx->acceptThread, NULL, accept_thread, ctx) != 0) {
-        log_error(ctx, RTMP_ERROR_THREAD_CREATE_FAILED, "Failed to create accept thread");
-        close(ctx->serverSocket);
-        ctx->state = RTMP_SERVER_STATE_STOPPED;
-        pthread_mutex_unlock(&ctx->mutex);
-        return false;
-    }
-
-    if (pthread_create(&ctx->monitorThread, NULL, monitor_thread, ctx) != 0) {
-        log_error(ctx, RTMP_ERROR_THREAD_CREATE_FAILED, "Failed to create monitor thread");
-        ctx->threadsRunning = false;
-        pthread_join(ctx->acceptThread, NULL);
-        close(ctx->serverSocket);
-        ctx->state = RTMP_SERVER_STATE_STOPPED;
-        pthread_mutex_unlock(&ctx->mutex);
-        return false;
-    }
-
-    ctx->state = RTMP_SERVER_STATE_RUNNING;
-    pthread_mutex_unlock(&ctx->mutex);
+// Initialize server
+bool rtmp_server_initialize(void) {
+    memset(&server_ctx, 0, sizeof(server_ctx));
+    pthread_mutex_init(&server_ctx.lock, NULL);
+    server_ctx.state = RTMP_SERVER_STATE_STOPPED;
     return true;
 }
 
-void rtmp_server_stop(RTMPServerContext *ctx) {
-    if (!ctx || ctx->state == RTMP_SERVER_STATE_STOPPED) return;
-
-    pthread_mutex_lock(&ctx->mutex);
-
-    // Stop threads
-    ctx->threadsRunning = false;
-    pthread_join(ctx->acceptThread, NULL);
-    pthread_join(ctx->monitorThread, NULL);
-
-    // Disconnect all clients
-    for (uint32_t i = 0; i < ctx->numClients; i++) {
-        handle_client_disconnect(ctx, &ctx->clients[i]);
+// Start server
+bool rtmp_server_start(uint16_t port) {
+    if (server_ctx.state != RTMP_SERVER_STATE_STOPPED) {
+        return false;
     }
 
-    // Close server socket
-    if (ctx->serverSocket >= 0) {
-        close(ctx->serverSocket);
-        ctx->serverSocket = -1;
-    }
-
-    ctx->state = RTMP_SERVER_STATE_STOPPED;
-    ctx->numClients = 0;
-
-    pthread_mutex_unlock(&ctx->mutex);
-}
-
-static bool init_server_socket(RTMPServerContext *ctx) {
-    // Create server socket
-    ctx->serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (ctx->serverSocket < 0) {
-        log_error(ctx, RTMP_ERROR_SOCKET_CREATE_FAILED, "Failed to create server socket");
+    // Create socket
+    server_ctx.listen_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_ctx.listen_socket < 0) {
         return false;
     }
 
     // Set socket options
-    int opt = 1;
-    setsockopt(ctx->serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    // Set non-blocking
-    int flags = fcntl(ctx->serverSocket, F_GETFL, 0);
-    fcntl(ctx->serverSocket, F_SETFL, flags | O_NONBLOCK);
+    int reuse = 1;
+    if (setsockopt(server_ctx.listen_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        close(server_ctx.listen_socket);
+        return false;
+    }
 
     // Bind socket
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(ctx->config.port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
 
-    if (bind(ctx->serverSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_error(ctx, RTMP_ERROR_SOCKET_BIND_FAILED, "Failed to bind server socket");
-        close(ctx->serverSocket);
+    if (bind(server_ctx.listen_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(server_ctx.listen_socket);
         return false;
     }
 
     // Listen for connections
-    if (listen(ctx->serverSocket, MAX_PENDING_CONNECTIONS) < 0) {
-        log_error(ctx, RTMP_ERROR_SOCKET_LISTEN_FAILED, "Failed to listen on server socket");
-        close(ctx->serverSocket);
+    if (listen(server_ctx.listen_socket, RTMP_MAX_CONNECTIONS) < 0) {
+        close(server_ctx.listen_socket);
         return false;
     }
 
+    // Start threads
+    server_ctx.running = true;
+    server_ctx.port = port;
+
+    if (pthread_create(&server_ctx.accept_thread, NULL, rtmp_server_accept_thread, NULL) != 0) {
+        close(server_ctx.listen_socket);
+        server_ctx.running = false;
+        return false;
+    }
+
+    if (pthread_create(&server_ctx.monitor_thread, NULL, rtmp_server_monitor_thread, NULL) != 0) {
+        server_ctx.running = false;
+        pthread_join(server_ctx.accept_thread, NULL);
+        close(server_ctx.listen_socket);
+        return false;
+    }
+
+    rtmp_server_update_state(RTMP_SERVER_STATE_RUNNING);
     return true;
 }
 
-static RTMPServerClient *create_client(int socket, const char *ip) {
-    RTMPServerClient *client = (RTMPServerClient *)calloc(1, sizeof(RTMPServerClient));
-    if (!client) return NULL;
-
-    client->socket = socket;
-    strncpy(client->ip, ip, sizeof(client->ip) - 1);
-    client->connectTime = rtmp_get_timestamp();
-    client->lastActivity = client->connectTime;
-    client->threadRunning = true;
-
-    // Set socket to non-blocking
-    int flags = fcntl(socket, F_GETFL, 0);
-    fcntl(socket, F_SETFL, flags | O_NONBLOCK);
-
-    // Create RTMP context
-    client->rtmp = rtmp_create();
-    if (!client->rtmp) {
-        free(client);
-        return NULL;
-    }
-
-    return client;
-}
-
-static void destroy_client(RTMPServerClient *client) {
-    if (!client) return;
-
-    // Stop client thread
-    if (client->threadRunning) {
-        client->threadRunning = false;
-        pthread_join(client->thread, NULL);
-    }
-
-    // Close socket
-    if (client->socket >= 0) {
-        close(client->socket);
-        client->socket = -1;
-    }
-
-    // Free RTMP context
-    if (client->rtmp) {
-        rtmp_destroy(client->rtmp);
-        client->rtmp = NULL;
-    }
-
-    // Free stream name
-    if (client->streamName) {
-        free(client->streamName);
-        client->streamName = NULL;
-    }
-
-    memset(client, 0, sizeof(RTMPServerClient));
-}
-
-static RTMPServerStream *create_stream(const char *name, RTMPServerClient *publisher) {
-    RTMPServerStream *stream = (RTMPServerStream *)calloc(1, sizeof(RTMPServerStream));
-    if (!stream) return NULL;
-
-    strncpy(stream->name, name, sizeof(stream->name) - 1);
-    stream->publisher = publisher;
-    stream->startTime = rtmp_get_timestamp();
-    stream->maxSubscribers = 100;
-
-    stream->subscribers = (RTMPServerClient **)calloc(stream->maxSubscribers, 
-                                                    sizeof(RTMPServerClient *));
-    if (!stream->subscribers) {
-        free(stream);
-        return NULL;
-    }
-
-    return stream;
-}
-
-static void destroy_stream(RTMPServerStream *stream) {
-    if (!stream) return;
-
-    // Notify all subscribers
-    for (uint32_t i = 0; i < stream->numSubscribers; i++) {
-        if (stream->subscribers[i]) {
-            RTMPPacket packet = {
-                .type = RTMP_MSG_USER_CONTROL,
-                .data = (uint8_t *)"\x02\x00\x00\x00\x00\x00", // Stream EOF
-                .size = 6
-            };
-            rtmp_send_packet(stream->subscribers[i]->rtmp, &packet);
-        }
-    }
-
-    free(stream->subscribers);
-    free(stream);
-}
-
-static void *accept_thread(void *arg) {
-    RTMPServerContext *ctx = (RTMPServerContext *)arg;
-    struct sockaddr_in clientAddr;
-    socklen_t addrLen = sizeof(clientAddr);
-
-    while (ctx->threadsRunning) {
-        // Accept new connection
-        int clientSocket = accept(ctx->serverSocket, 
-                                (struct sockaddr *)&clientAddr, 
-                                &addrLen);
-                                
-        if (clientSocket < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && ctx->threadsRunning) {
-                log_error(ctx, RTMP_ERROR_SOCKET_ACCEPT_FAILED, "Failed to accept client connection");
+// Accept thread function
+static void* rtmp_server_accept_thread(void* arg) {
+    while (server_ctx.running) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_socket = accept(server_ctx.listen_socket, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_socket < 0) {
+            if (errno != EINTR) {
+                // Log error
+                continue;
             }
-            rtmp_sleep_ms(10);
             continue;
         }
 
-        // Get client IP
-        char clientIP[32];
-        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, sizeof(clientIP));
-
-        pthread_mutex_lock(&ctx->mutex);
-
-        // Check if IP is allowed
-        if (ctx->config.numAllowedIPs > 0 && !is_ip_allowed(ctx, clientIP)) {
-            close(clientSocket);
-            ctx->stats.droppedConnections++;
-            pthread_mutex_unlock(&ctx->mutex);
+        // Create new connection
+        rtmp_connection_t* conn = calloc(1, sizeof(rtmp_connection_t));
+        if (!conn) {
+            close(client_socket);
             continue;
         }
 
-        // Check max clients
-        if (ctx->numClients >= ctx->config.maxClients) {
-            close(clientSocket);
-            ctx->stats.droppedConnections++;
-            pthread_mutex_unlock(&ctx->mutex);
-            continue;
-        }
+        conn->socket = client_socket;
+        conn->state = RTMP_CONN_STATE_NEW;
+        gettimeofday(&conn->last_recv_time, NULL);
+        gettimeofday(&conn->last_send_time, NULL);
 
-        // Create and initialize client
-        RTMPServerClient *client = create_client(clientSocket, clientIP);
-        if (!client) {
-            close(clientSocket);
-            ctx->stats.droppedConnections++;
-            pthread_mutex_unlock(&ctx->mutex);
-            continue;
-        }
-
-        // Add client to array
-        ctx->clients[ctx->numClients] = *client;
-        free(client);
-
-        // Start client thread
-        if (pthread_create(&ctx->clients[ctx->numClients].thread, NULL, 
-                          client_thread, &ctx->clients[ctx->numClients]) != 0) {
-            destroy_client(&ctx->clients[ctx->numClients]);
-            ctx->stats.droppedConnections++;
-            pthread_mutex_unlock(&ctx->mutex);
-            continue;
-        }
-
-        ctx->numClients++;
-        ctx->stats.totalClients++;
+        // Add to connection list
+        pthread_mutex_lock(&server_ctx.lock);
+        conn->next = server_ctx.connections;
+        server_ctx.connections = conn;
+        server_ctx.num_connections++;
+        pthread_mutex_unlock(&server_ctx.lock);
 
         // Notify callback
-        if (ctx->clientCallback) {
-            ctx->clientCallback(ctx, ctx->clients[ctx->numClients-1].id, 
-                              true, ctx->clientCallbackData);
+        if (connection_callback) {
+            connection_callback(conn, connection_callback_data);
         }
 
-        pthread_mutex_unlock(&ctx->mutex);
-    }
-
-    return NULL;
-}
-
-static void *monitor_thread(void *arg) {
-    RTMPServerContext *ctx = (RTMPServerContext *)arg;
-    uint32_t lastCheck = rtmp_get_timestamp();
-
-    while (ctx->threadsRunning) {
-        pthread_mutex_lock(&ctx->mutex);
-
-        uint32_t now = rtmp_get_timestamp();
-        if (now - lastCheck >= HEALTH_CHECK_INTERVAL) {
-            check_client_timeouts(ctx);
-            update_stats(ctx);
-            lastCheck = now;
-        }
-
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_sleep_ms(100);
-    }
-
-    return NULL;
-}
-
-static void *client_thread(void *arg) {
-    RTMPServerClient *client = (RTMPServerClient *)arg;
-    uint8_t buffer[BUFFER_SIZE];
-    RTMPPacket packet;
-
-    // Handshake
-    if (!rtmp_handshake(client->rtmp)) {
-        client->threadRunning = false;
-        return NULL;
-    }
-
-    while (client->threadRunning) {
-        // Read RTMP packet
-        if (!rtmp_read_packet(client->rtmp, &packet)) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                break;
-            }
-            rtmp_sleep_ms(1);
+        // Handle connection in new thread
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, (void*(*)(void*))rtmp_server_handle_connection, conn) != 0) {
+            rtmp_server_cleanup_connection(conn);
             continue;
         }
-
-        client->lastActivity = rtmp_get_timestamp();
-        client->bytesReceived += packet.size;
-
-        // Handle packet
-        if (!handle_client_message(client, &packet)) {
-            break;
-        }
-
-        // Free packet data if allocated
-        if (packet.data) {
-            free(packet.data);
-        }
+        pthread_detach(thread);
     }
 
-    client->threadRunning = false;
     return NULL;
 }
 
-static bool handle_client_message(RTMPServerClient *client, RTMPPacket *packet) {
-    if (!client || !packet) return false;
-
-    switch (packet->type) {
-        case RTMP_MSG_CHUNK_SIZE:
-            return rtmp_handle_chunk_size(client->rtmp, packet);
-
-        case RTMP_MSG_BYTES_READ:
-            return rtmp_handle_bytes_read(client->rtmp, packet);
-
-        case RTMP_MSG_CONTROL:
-            return rtmp_handle_control(client->rtmp, packet);
-
-        case RTMP_MSG_SERVER_BW:
-            return rtmp_handle_server_bw(client->rtmp, packet);
-
-        case RTMP_MSG_CLIENT_BW:
-            return rtmp_handle_client_bw(client->rtmp, packet);
-
-        case RTMP_MSG_AUDIO:
-        case RTMP_MSG_VIDEO:
-            if (client->isPublisher) {
-                return handle_media_packet(client, packet);
-            }
-            break;
-
-        case RTMP_MSG_AMF3_COMMAND:
-        case RTMP_MSG_AMF0_COMMAND:
-            return handle_command_packet(client, packet);
-
-        case RTMP_MSG_METADATA:
-            return handle_metadata_packet(client, packet);
-
-        default:
-            rtmp_log(RTMP_LOG_WARNING, "Unhandled message type: %d", packet->type);
-            break;
-    }
-
-    return true;
-}
-
-static bool handle_command_packet(RTMPServerClient *client, RTMPPacket *packet) {
-    char *command = NULL;
-    if (!rtmp_amf_decode_string(packet->data, packet->size, &command)) {
-        return false;
-    }
-
-    bool result = false;
-
-    if (strcmp(command, "connect") == 0) {
-        result = handle_connect(client, packet);
-    }
-    else if (strcmp(command, "createStream") == 0) {
-        result = handle_createStream(client, packet);
-    }
-    else if (strcmp(command, "publish") == 0) {
-        result = handle_publish(client, packet);
-    }
-    else if (strcmp(command, "play") == 0) {
-        result = handle_play(client, packet);
-    }
-    else if (strcmp(command, "closeStream") == 0) {
-        result = handle_closeStream(client, packet);
-    }
-    else if (strcmp(command, "deleteStream") == 0) {
-        result = handle_closeStream(client, packet);
-    }
-    else {
-        rtmp_log(RTMP_LOG_WARNING, "Unhandled command: %s", command);
-        result = true; // Don't disconnect for unknown commands
-    }
-
-    free(command);
-    return result;
-}
-
-static bool handle_connect(RTMPServerClient *client, RTMPPacket *packet) {
-    // Extract connect parameters
-    AMFObject *obj = NULL;
-    if (!rtmp_amf_decode_object(packet->data + packet->size - AMF_MAX_SIZE, &obj)) {
-        return false;
-    }
-
-    // Check authentication if enabled
-    if (client->rtmp->server->config.enableAuth) {
-        const char *token = amf_object_get_string(obj, "auth");
-        if (!token || strcmp(token, client->rtmp->server->config.authKey) != 0) {
-            amf_object_destroy(obj);
-            send_connect_error(client, "Authentication failed");
-            client->rtmp->server->stats.failedAuths++;
-            return false;
-        }
-    }
-
-    // Save app name
-    const char *app = amf_object_get_string(obj, "app");
-    if (app) {
-        strncpy(client->rtmp->app, app, sizeof(client->rtmp->app) - 1);
-    }
-
-    amf_object_destroy(obj);
-
-    // Send response
-    RTMPPacket response;
-    memset(&response, 0, sizeof(response));
-    response.type = RTMP_MSG_AMF0_COMMAND;
-    
-    char *resp = malloc(256);
-    size_t len = 0;
-    
-    // _result
-    len += rtmp_amf_encode_string(resp + len, "_result");
-    // transaction ID
-    len += rtmp_amf_encode_number(resp + len, 1.0);
-    // Properties object
-    len += rtmp_amf_encode_object_start(resp + len);
-    len += rtmp_amf_encode_named_string(resp + len, "fmsVer", "FMS/3,0,1,123");
-    len += rtmp_amf_encode_named_number(resp + len, "capabilities", 31.0);
-    len += rtmp_amf_encode_object_end(resp + len);
-    // Information object
-    len += rtmp_amf_encode_object_start(resp + len);
-    len += rtmp_amf_encode_named_string(resp + len, "level", "status");
-    len += rtmp_amf_encode_named_string(resp + len, "code", "NetConnection.Connect.Success");
-    len += rtmp_amf_encode_named_string(resp + len, "description", "Connection succeeded.");
-    len += rtmp_amf_encode_object_end(resp + len);
-
-    response.data = (uint8_t *)resp;
-    response.size = len;
-
-    bool result = rtmp_send_packet(client->rtmp, &response);
-    free(resp);
-
-    if (result) {
-        // Send window acknowledgement size
-        send_server_bw(client);
-        send_client_bw(client);
-        send_chunk_size(client);
-    }
-
-    return result;
-}
-
-static bool handle_createStream(RTMPServerClient *client, RTMPPacket *packet) {
-    // Extract transaction ID
-    double transactionId;
-    if (!rtmp_amf_decode_number(packet->data + AMF_STRING_SIZE, &transactionId)) {
-        return false;
-    }
-
-    // Create stream ID
-    uint32_t streamId = ++client->rtmp->server->stats.totalStreams;
-    client->streamId = streamId;
-
-    // Send response
-    RTMPPacket response;
-    memset(&response, 0, sizeof(response));
-    response.type = RTMP_MSG_AMF0_COMMAND;
-    
-    char *resp = malloc(256);
-    size_t len = 0;
-    
-    // _result
-    len += rtmp_amf_encode_string(resp + len, "_result");
-    // transaction ID
-    len += rtmp_amf_encode_number(resp + len, transactionId);
-    // NULL object
-    len += rtmp_amf_encode_null(resp + len);
-    // Stream ID
-    len += rtmp_amf_encode_number(resp + len, streamId);
-
-    response.data = (uint8_t *)resp;
-    response.size = len;
-
-    bool result = rtmp_send_packet(client->rtmp, &response);
-    free(resp);
-
-    return result;
-}
-
-static bool handle_publish(RTMPServerClient *client, RTMPPacket *packet) {
-    // Extract stream name and type
-    char *streamName = NULL;
-    char *publishType = NULL;
-    
-    size_t offset = AMF_STRING_SIZE + sizeof(double) + AMF_NULL_SIZE;
-    if (!rtmp_amf_decode_string(packet->data + offset, &streamName)) {
-        return false;
-    }
-    
-    offset += strlen(streamName) + 1;
-    if (!rtmp_amf_decode_string(packet->data + offset, &publishType)) {
-        free(streamName);
-        return false;
-    }
-
-    bool result = false;
-    pthread_mutex_lock(&client->rtmp->server->streamMutex);
-
-    // Check if stream already exists
-    RTMPServerStream *existingStream = find_stream(client->rtmp->server, streamName);
-    if (existingStream) {
-        send_error(client, "NetStream.Publish.BadName", "Stream already exists");
-    } else {
-        // Create new stream
-        RTMPServerStream *stream = create_stream(streamName, client);
-        if (stream) {
-            client->isPublisher = true;
-            client->streamName = strdup(streamName);
-            
-            // Add to stream list
-            stream->next = client->rtmp->server->streams;
-            client->rtmp->server->streams = stream;
-
-            // Send success response
-            send_status(client, "NetStream.Publish.Start", "Stream publishing started");
-            result = true;
-
-            // Notify callback
-            if (client->rtmp->server->streamCallback) {
-                client->rtmp->server->streamCallback(client->rtmp->server, 
-                                                   streamName, 
-                                                   true, 
-                                                   client->rtmp->server->streamCallbackData);
-            }
-        }
-    }
-
-    pthread_mutex_unlock(&client->rtmp->server->streamMutex);
-
-    free(streamName);
-    free(publishType);
-
-    return result;
-}
-
-static bool handle_play(RTMPServerClient *client, RTMPPacket *packet) {
-    // Extract stream name
-    char *streamName = NULL;
-    if (!rtmp_amf_decode_string(packet->data + AMF_STRING_SIZE + sizeof(double) + AMF_NULL_SIZE, 
-                               &streamName)) {
-        return false;
-    }
-
-    bool result = false;
-    pthread_mutex_lock(&client->rtmp->server->streamMutex);
-
-    // Find stream
-    RTMPServerStream *stream = find_stream(client->rtmp->server, streamName);
-    if (!stream) {
-        send_error(client, "NetStream.Play.StreamNotFound", "Stream not found");
-    } else {
-        // Add as subscriber
-        if (add_subscriber_to_stream(stream, client)) {
-            client->streamName = strdup(streamName);
-            
-            // Send success response
-            send_status(client, "NetStream.Play.Start", "Stream playback started");
-            
-            // Send stream begin signal
-            RTMPPacket beginPacket = {
-                .type = RTMP_MSG_USER_CONTROL,
-                .data = (uint8_t *)"\x00\x00\x00\x00\x00\x00", // Stream Begin
-                .size = 6
-            };
-            *(uint32_t *)(beginPacket.data + 2) = htonl(client->streamId);
-            
-            result = rtmp_send_packet(client->rtmp, &beginPacket);
-
-            // Send metadata and keyframe
-            if (stream->publisher) {
-                // Send cached metadata if available
-                if (stream->info.metadata) {
-                    RTMPPacket metaPacket = {
-                        .type = RTMP_MSG_METADATA,
-                        .data = stream->info.metadata,
-                        .size = stream->info.metadataSize
-                    };
-                    rtmp_send_packet(client->rtmp, &metaPacket);
-                }
-
-                // Send cached keyframe if available
-                if (stream->info.videoKeyframe) {
-                    RTMPPacket keyframePacket = {
-                        .type = RTMP_MSG_VIDEO,
-                        .data = stream->info.videoKeyframe,
-                        .size = stream->info.keyframeSize
-                    };
-                    rtmp_send_packet(client->rtmp, &keyframePacket);
-                }
-            }
-        }
-    }
-
-    pthread_mutex_unlock(&client->rtmp->server->streamMutex);
-    free(streamName);
-
-    return result;
-}
-
-static bool handle_media_packet(RTMPServerClient *client, RTMPPacket *packet) {
-    if (!client->isPublisher) return false;
-
-    pthread_mutex_lock(&client->rtmp->server->streamMutex);
-
-    RTMPServerStream *stream = find_stream(client->rtmp->server, client->streamName);
-    if (stream) {
-        // If video packet, check for keyframe
-        if (packet->type == RTMP_MSG_VIDEO && 
-            packet->data && 
-            (packet->data[0] & 0xf0) == 0x10) { // Keyframe
-            
-            // Cache keyframe
-            if (stream->info.videoKeyframe) {
-                free(stream->info.videoKeyframe);
-            }
-            stream->info.videoKeyframe = malloc(packet->size);
-            if (stream->info.videoKeyframe) {
-                memcpy(stream->info.videoKeyframe, packet->data, packet->size);
-                stream->info.keyframeSize = packet->size;
-            }
-        }
-
-        // Broadcast to all subscribers
-        broadcast_to_subscribers(stream, packet);
-
-        // Update stream statistics
-        stream->bandwidth += packet->size;
+// Monitor thread function
+static void* rtmp_server_monitor_thread(void* arg) {
+    while (server_ctx.running) {
+        pthread_mutex_lock(&server_ctx.lock);
         
-        // Update client statistics
-        client->bytesSent += packet->size;
-    }
+        struct timeval now;
+        gettimeofday(&now, NULL);
 
-    pthread_mutex_unlock(&client->rtmp->server->streamMutex);
-    return true;
-}
+        rtmp_connection_t* prev = NULL;
+        rtmp_connection_t* conn = server_ctx.connections;
 
-static bool handle_metadata_packet(RTMPServerClient *client, RTMPPacket *packet) {
-    if (!client->isPublisher) return false;
-
-    pthread_mutex_lock(&client->rtmp->server->streamMutex);
-
-    RTMPServerStream *stream = find_stream(client->rtmp->server, client->streamName);
-    if (stream) {
-        // Cache metadata
-        if (stream->info.metadata) {
-            free(stream->info.metadata);
-        }
-        stream->info.metadata = malloc(packet->size);
-        if (stream->info.metadata) {
-            memcpy(stream->info.metadata, packet->data, packet->size);
-            stream->info.metadataSize = packet->size;
-        }
-
-        // Parse metadata
-        AMFObject *obj = NULL;
-        if (rtmp_amf_decode_object(packet->data, &obj)) {
-            // Extract video dimensions
-            double width = 0, height = 0;
-            amf_object_get_number(obj, "width", &width);
-            amf_object_get_number(obj, "height", &height);
-            stream->info.width = (uint32_t)width;
-            stream->info.height = (uint32_t)height;
-
-            // Extract framerate
-            double frameRate = 0;
-            amf_object_get_number(obj, "framerate", &frameRate);
-            stream->info.frameRate = (uint32_t)frameRate;
-
-            // Extract video codec
-            const char *videoCodec = amf_object_get_string(obj, "videocodecid");
-            if (videoCodec) {
-                strncpy(stream->info.videoCodec, videoCodec, sizeof(stream->info.videoCodec) - 1);
-            }
-
-            // Extract audio codec
-            const char *audioCodec = amf_object_get_string(obj, "audiocodecid");
-            if (audioCodec) {
-                strncpy(stream->info.audioCodec, audioCodec, sizeof(stream->info.audioCodec) - 1);
-            }
-
-            amf_object_destroy(obj);
-        }
-
-        // Broadcast metadata to subscribers
-        broadcast_to_subscribers(stream, packet);
-    }
-
-    pthread_mutex_unlock(&client->rtmp->server->streamMutex);
-    return true;
-}
-
-static void broadcast_to_subscribers(RTMPServerStream *stream, RTMPPacket *packet) {
-    for (uint32_t i = 0; i < stream->numSubscribers; i++) {
-        RTMPServerClient *subscriber = stream->subscribers[i];
-        if (subscriber && subscriber->rtmp) {
-            RTMPPacket copy = *packet;
-            copy.data = malloc(packet->size);
-            if (copy.data) {
-                memcpy(copy.data, packet->data, packet->size);
-                if (rtmp_send_packet(subscriber->rtmp, &copy)) {
-                    subscriber->bytesSent += packet->size;
+        while (conn) {
+            rtmp_connection_t* next = conn->next;
+            
+            // Check timeout
+            if (now.tv_sec - conn->last_recv_time.tv_sec > RTMP_TIMEOUT_SEC) {
+                // Remove from list
+                if (prev) {
+                    prev->next = next;
+                } else {
+                    server_ctx.connections = next;
                 }
-                free(copy.data);
+                server_ctx.num_connections--;
+                
+                // Cleanup connection
+                rtmp_server_cleanup_connection(conn);
+            } else {
+                prev = conn;
             }
+            
+            conn = next;
         }
+
+        pthread_mutex_unlock(&server_ctx.lock);
+        sleep(1);
     }
-}
 
-static void send_error(RTMPServerClient *client, const char *code, const char *description) {
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_AMF0_COMMAND;
-
-    char *data = malloc(1024);
-    size_t len = 0;
-
-    // onStatus
-    len += rtmp_amf_encode_string(data + len, "onStatus");
-    // transaction ID = 0
-    len += rtmp_amf_encode_number(data + len, 0);
-    // NULL object
-    len += rtmp_amf_encode_null(data + len);
-    // Info object
-    len += rtmp_amf_encode_object_start(data + len);
-    len += rtmp_amf_encode_named_string(data + len, "level", "error");
-    len += rtmp_amf_encode_named_string(data + len, "code", code);
-    len += rtmp_amf_encode_named_string(data + len, "description", description);
-    len += rtmp_amf_encode_object_end(data + len);
-
-    packet.data = (uint8_t *)data;
-    packet.size = len;
-    packet.streamId = client->streamId;
-
-    rtmp_send_packet(client->rtmp, &packet);
-    free(data);
-}
-
-static void send_status(RTMPServerClient *client, const char *code, const char *description) {
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_AMF0_COMMAND;
-
-    char *data = malloc(1024);
-    size_t len = 0;
-
-    // onStatus
-    len += rtmp_amf_encode_string(data + len, "onStatus");
-    // transaction ID = 0
-    len += rtmp_amf_encode_number(data + len, 0);
-    // NULL object
-    len += rtmp_amf_encode_null(data + len);
-    // Info object
-    len += rtmp_amf_encode_object_start(data + len);
-    len += rtmp_amf_encode_named_string(data + len, "level", "status");
-    len += rtmp_amf_encode_named_string(data + len, "code", code);
-    len += rtmp_amf_encode_named_string(data + len, "description", description);
-    len += rtmp_amf_encode_object_end(data + len);
-
-    packet.data = (uint8_t *)data;
-    packet.size = len;
-    packet.streamId = client->streamId;
-
-    rtmp_send_packet(client->rtmp, &packet);
-    free(data);
-}
-
-static bool send_server_bw(RTMPServerClient *client) {
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_SERVER_BW;
-    
-    uint8_t *data = malloc(4);
-    *(uint32_t *)data = htonl(client->rtmp->server->config.maxBandwidthPerClient);
-    
-    packet.data = data;
-    packet.size = 4;
-    
-    bool result = rtmp_send_packet(client->rtmp, &packet);
-    free(data);
-    return result;
-}
-
-static bool send_client_bw(RTMPServerClient *client) {
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_CLIENT_BW;
-    
-    uint8_t *data = malloc(5);
-    *(uint32_t *)data = htonl(client->rtmp->server->config.maxBandwidthPerClient);
-    data[4] = 2; // Dynamic
-    
-    packet.data = data;
-    packet.size = 5;
-    
-    bool result = rtmp_send_packet(client->rtmp, &packet);
-    free(data);
-    return result;
-}
-
-static bool send_chunk_size(RTMPServerClient *client) {
-    RTMPPacket packet;
-    memset(&packet, 0, sizeof(packet));
-    packet.type = RTMP_MSG_CHUNK_SIZE;
-    
-    uint8_t *data = malloc(4);
-    *(uint32_t *)data = htonl(client->rtmp->server->config.chunkSize);
-    
-    packet.data = data;
-    packet.size = 4;
-    
-    bool result = rtmp_send_packet(client->rtmp, &packet);
-    free(data);
-    return result;
-}
-
-static RTMPServerStream *find_stream(RTMPServerContext *ctx, const char *name) {
-    RTMPServerStream *stream = ctx->streams;
-    while (stream) {
-        if (strcmp(stream->name, name) == 0) {
-            return stream;
-        }
-        stream = stream->next;
-    }
     return NULL;
 }
 
-static bool add_subscriber_to_stream(RTMPServerStream *stream, RTMPServerClient *client) {
-    if (stream->numSubscribers >= stream->maxSubscribers) {
+// Handle client connection
+static bool rtmp_server_handle_connection(rtmp_connection_t* conn) {
+    if (!conn) return false;
+
+    // Set non-blocking
+    int flags = fcntl(conn->socket, F_GETFL, 0);
+    fcntl(conn->socket, F_SETFL, flags | O_NONBLOCK);
+
+    // Initialize chunk stream
+    conn->chunk_stream = rtmp_chunk_stream_create();
+    if (!conn->chunk_stream) {
+        rtmp_server_cleanup_connection(conn);
         return false;
     }
-    
-    stream->subscribers[stream->numSubscribers++] = client;
+
+    // Handshake
+    if (!rtmp_handshake_process(conn)) {
+        rtmp_server_cleanup_connection(conn);
+        return false;
+    }
+
+    conn->state = RTMP_CONN_STATE_HANDSHAKE;
+
+    // Main connection loop
+    while (server_ctx.running) {
+        // Receive chunks
+        if (!rtmp_connection_receive_chunk(conn)) {
+            break;
+        }
+
+        // Process chunks
+        rtmp_chunk_stream_t* chunk;
+        while ((chunk = rtmp_chunk_stream_get_next(conn->chunk_stream)) != NULL) {
+            rtmp_connection_handle_message(conn, chunk);
+        }
+
+        // Update timestamps
+        gettimeofday(&conn->last_recv_time, NULL);
+    }
+
+    rtmp_server_cleanup_connection(conn);
     return true;
 }
 
-static void check_client_timeouts(RTMPServerContext *ctx) {
-    uint32_t now = rtmp_get_timestamp();
+// Cleanup connection
+static void rtmp_server_cleanup_connection(rtmp_connection_t* conn) {
+    if (!conn) return;
+
+    // Close socket
+    if (conn->socket >= 0) {
+        close(conn->socket);
+    }
+
+    // Free chunk stream
+    if (conn->chunk_stream) {
+        rtmp_chunk_stream_destroy(conn->chunk_stream);
+    }
+
+    // Free handshake data
+    if (conn->handshake_data) {
+        free(conn->handshake_data);
+    }
+
+    // Remove from list if still there
+    pthread_mutex_lock(&server_ctx.lock);
+    rtmp_connection_t* prev = NULL;
+    rtmp_connection_t* current = server_ctx.connections;
     
-    for (uint32_t i = 0; i < ctx->numClients; i++) {
-        RTMPServerClient *client = &ctx->clients[i];
-        if (now - client->lastActivity >= CLIENT_TIMEOUT) {
-            handle_client_disconnect(ctx, client);
-            i--; // Adjust index since array was modified
+    while (current) {
+        if (current == conn) {
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                server_ctx.connections = current->next;
+            }
+            server_ctx.num_connections--;
+            break;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&server_ctx.lock);
+
+    // Notify callback
+    if (connection_callback) {
+        connection_callback(conn, connection_callback_data);
+    }
+
+    free(conn);
+}
+
+// Update server state with notification
+static void rtmp_server_update_state(rtmp_server_state_t new_state) {
+    server_ctx.state = new_state;
+    if (state_callback) {
+        state_callback(new_state, state_callback_data);
+    }
+}
+
+// Process RTMP handshake
+static bool rtmp_handshake_process(rtmp_connection_t* conn) {
+    uint8_t c0c1[1537]; // C0 + C1
+    uint8_t s0s1s2[3073]; // S0 + S1 + S2
+    ssize_t bytes;
+
+    // Receive C0+C1
+    bytes = recv(conn->socket, c0c1, sizeof(c0c1), MSG_WAITALL);
+    if (bytes != sizeof(c0c1)) {
+        return false;
+    }
+
+    // Verify C0
+    if (c0c1[0] != 3) {
+        return false;
+    }
+
+    // Generate S0+S1+S2
+    s0s1s2[0] = 3; // S0 - version
+    
+    // S1 - timestamp + zero + random bytes
+    uint32_t timestamp = (uint32_t)time(NULL);
+    memcpy(s0s1s2 + 1, &timestamp, 4);
+    memset(s0s1s2 + 5, 0, 4);
+    for (int i = 9; i < 1537; i++) {
+        s0s1s2[i] = rand() % 256;
+    }
+
+    // S2 - echo client's timestamp + time2 + random echo
+    memcpy(s0s1s2 + 1537, c0c1 + 1, 1536);
+
+    // Send S0+S1+S2
+    bytes = send(conn->socket, s0s1s2, sizeof(s0s1s2), 0);
+    if (bytes != sizeof(s0s1s2)) {
+        return false;
+    }
+
+    // Receive C2
+    uint8_t c2[1536];
+    bytes = recv(conn->socket, c2, sizeof(c2), MSG_WAITALL);
+    if (bytes != sizeof(c2)) {
+        return false;
+    }
+
+    return true;
+}
+
+// Handle received RTMP message
+static void rtmp_connection_handle_message(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    switch (chunk->msg_type_id) {
+        case RTMP_MSG_CONNECT:
+            rtmp_handle_connect(conn, chunk);
+            break;
+            
+        case RTMP_MSG_CREATE_STREAM:
+            rtmp_handle_create_stream(conn, chunk);
+            break;
+            
+        case RTMP_MSG_PLAY:
+            rtmp_handle_play(conn, chunk);
+            break;
+            
+        case RTMP_MSG_PUBLISH:
+            rtmp_handle_publish(conn, chunk);
+            break;
+            
+        case RTMP_MSG_VIDEO:
+            rtmp_handle_video(conn, chunk);
+            break;
+            
+        case RTMP_MSG_AUDIO:
+            rtmp_handle_audio(conn, chunk);
+            break;
+            
+        case RTMP_MSG_DATA:
+        case RTMP_MSG_METADATA:
+            rtmp_handle_metadata(conn, chunk);
+            break;
+    }
+}
+
+// Handle connect command
+static void rtmp_handle_connect(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    // Parse connect parameters
+    rtmp_amf_data_t* amf = rtmp_amf_decode(chunk->msg_data, chunk->msg_length);
+    if (!amf) return;
+
+    // Get app name
+    rtmp_amf_data_t* app = rtmp_amf_get_prop(amf, "app");
+    if (app && app->type == RTMP_AMF_STRING) {
+        strncpy(conn->metadata.app_name, app->string_data, sizeof(conn->metadata.app_name)-1);
+    }
+
+    // Send Window Acknowledgement Size
+    uint8_t ack_size[4];
+    uint32_t window_size = RTMP_BUFFER_SIZE;
+    ack_size[0] = (window_size >> 24) & 0xff;
+    ack_size[1] = (window_size >> 16) & 0xff;
+    ack_size[2] = (window_size >> 8) & 0xff;
+    ack_size[3] = window_size & 0xff;
+    
+    rtmp_chunk_stream_t response;
+    memset(&response, 0, sizeof(response));
+    response.msg_type_id = RTMP_MSG_WINDOW_ACK_SIZE;
+    response.msg_stream_id = 0;
+    response.msg_length = 4;
+    response.msg_data = ack_size;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    // Send Set Peer Bandwidth
+    uint8_t peer_bw[5];
+    peer_bw[0] = (window_size >> 24) & 0xff;
+    peer_bw[1] = (window_size >> 16) & 0xff;
+    peer_bw[2] = (window_size >> 8) & 0xff;
+    peer_bw[3] = window_size & 0xff;
+    peer_bw[4] = 2; // Dynamic
+    
+    response.msg_type_id = RTMP_MSG_SET_PEER_BW;
+    response.msg_length = 5;
+    response.msg_data = peer_bw;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    // Send Stream Begin
+    uint8_t stream_begin[6] = {0,0,0,0,0,0};
+    response.msg_type_id = RTMP_MSG_USER_CONTROL;
+    response.msg_length = 6;
+    response.msg_data = stream_begin;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    // Send connect response
+    uint8_t connect_resp[256];
+    size_t resp_len = rtmp_amf_encode_connect_response(connect_resp, sizeof(connect_resp));
+    
+    response.msg_type_id = RTMP_MSG_COMMAND;
+    response.msg_length = resp_len;
+    response.msg_data = connect_resp;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    conn->state = RTMP_CONN_STATE_CONNECT;
+    rtmp_amf_data_free(amf);
+}
+
+// Handle create stream command
+static void rtmp_handle_create_stream(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    rtmp_amf_data_t* amf = rtmp_amf_decode(chunk->msg_data, chunk->msg_length);
+    if (!amf) return;
+
+    // Send create stream response
+    uint8_t create_stream_resp[256];
+    size_t resp_len = rtmp_amf_encode_create_stream_response(create_stream_resp, sizeof(create_stream_resp));
+    
+    rtmp_chunk_stream_t response;
+    memset(&response, 0, sizeof(response));
+    response.msg_type_id = RTMP_MSG_COMMAND;
+    response.msg_stream_id = chunk->msg_stream_id;
+    response.msg_length = resp_len;
+    response.msg_data = create_stream_resp;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    conn->state = RTMP_CONN_STATE_CREATE_STREAM;
+    rtmp_amf_data_free(amf);
+}
+
+// Handle play command
+static void rtmp_handle_play(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    rtmp_amf_data_t* amf = rtmp_amf_decode(chunk->msg_data, chunk->msg_length);
+    if (!amf) return;
+
+    // Get stream name
+    rtmp_amf_data_t* stream_name = rtmp_amf_get_prop(amf, "streamName");
+    if (stream_name && stream_name->type == RTMP_AMF_STRING) {
+        strncpy(conn->metadata.stream_name, stream_name->string_data, sizeof(conn->metadata.stream_name)-1);
+    }
+
+    // Send stream begin
+    uint8_t stream_begin[6] = {0,0,0,0,0,0};
+    rtmp_chunk_stream_t response;
+    memset(&response, 0, sizeof(response));
+    response.msg_type_id = RTMP_MSG_USER_CONTROL;
+    response.msg_stream_id = chunk->msg_stream_id;
+    response.msg_length = 6;
+    response.msg_data = stream_begin;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    // Send play response
+    uint8_t play_resp[256];
+    size_t resp_len = rtmp_amf_encode_play_response(play_resp, sizeof(play_resp));
+    
+    response.msg_type_id = RTMP_MSG_COMMAND;
+    response.msg_length = resp_len;
+    response.msg_data = play_resp;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    conn->state = RTMP_CONN_STATE_PLAY;
+    conn->is_publisher = false;
+    rtmp_amf_data_free(amf);
+}
+
+// Handle publish command
+static void rtmp_handle_publish(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    rtmp_amf_data_t* amf = rtmp_amf_decode(chunk->msg_data, chunk->msg_length);
+    if (!amf) return;
+
+    // Get publish name
+    rtmp_amf_data_t* publish_name = rtmp_amf_get_prop(amf, "publishName");
+    if (publish_name && publish_name->type == RTMP_AMF_STRING) {
+        strncpy(conn->metadata.stream_name, publish_name->string_data, sizeof(conn->metadata.stream_name)-1);
+    }
+
+    // Send publish response
+    uint8_t publish_resp[256];
+    size_t resp_len = rtmp_amf_encode_publish_response(publish_resp, sizeof(publish_resp));
+    
+    rtmp_chunk_stream_t response;
+    memset(&response, 0, sizeof(response));
+    response.msg_type_id = RTMP_MSG_COMMAND;
+    response.msg_stream_id = chunk->msg_stream_id;
+    response.msg_length = resp_len;
+    response.msg_data = publish_resp;
+    
+    rtmp_connection_send_chunk(conn, &response);
+
+    conn->state = RTMP_CONN_STATE_PUBLISHING;
+    conn->is_publisher = true;
+    gettimeofday(&conn->metadata.publish_time, NULL);
+    rtmp_amf_data_free(amf);
+}
+
+// Handle video data
+static void rtmp_handle_video(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    if (!conn->is_publisher || !chunk->msg_data || chunk->msg_length == 0) return;
+
+    conn->metadata.has_video = true;
+    conn->metadata.bytes_in += chunk->msg_length;
+
+    // Parse video frame header
+    uint8_t frame_type = (chunk->msg_data[0] & 0xf0) >> 4;
+    bool is_keyframe = (frame_type == 1);
+
+    // Forward to callback
+    if (frame_callback) {
+        frame_callback(chunk->msg_data, chunk->msg_length, chunk->timestamp, is_keyframe, frame_callback_data);
+    }
+}
+
+// Handle audio data
+static void rtmp_handle_audio(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    if (!conn->is_publisher || !chunk->msg_data || chunk->msg_length == 0) return;
+
+    conn->metadata.has_audio = true;
+    conn->metadata.bytes_in += chunk->msg_length;
+
+    // Parse audio header
+    uint8_t format = (chunk->msg_data[0] & 0xf0) >> 4;
+    uint8_t rate = (chunk->msg_data[0] & 0x0c) >> 2;
+    uint8_t size = (chunk->msg_data[0] & 0x02) >> 1;
+    uint8_t type = chunk->msg_data[0] & 0x01;
+
+    // Update metadata
+    conn->metadata.audio_sample_rate = rate;
+    conn->metadata.audio_channels = type + 1;
+}
+
+// Handle metadata
+static void rtmp_handle_metadata(rtmp_connection_t* conn, rtmp_chunk_stream_t* chunk) {
+    if (!conn->is_publisher || !chunk->msg_data || chunk->msg_length == 0) return;
+
+    rtmp_amf_data_t* amf = rtmp_amf_decode(chunk->msg_data, chunk->msg_length);
+    if (!amf) return;
+
+    // Parse metadata values
+    rtmp_amf_data_t* width = rtmp_amf_get_prop(amf, "width");
+    if (width && width->type == RTMP_AMF_NUMBER) {
+        conn->metadata.width = (uint32_t)width->number_data;
+    }
+
+    rtmp_amf_data_t* height = rtmp_amf_get_prop(amf, "height");
+    if (height && height->type == RTMP_AMF_NUMBER) {
+        conn->metadata.height = (uint32_t)height->number_data;
+    }
+
+    rtmp_amf_data_t* framerate = rtmp_amf_get_prop(amf, "framerate");
+    if (framerate && framerate->type == RTMP_AMF_NUMBER) {
+        conn->metadata.frame_rate = (uint32_t)framerate->number_data;
+    }
+
+    rtmp_amf_data_t* videodatarate = rtmp_amf_get_prop(amf, "videodatarate");
+    if (videodatarate && videodatarate->type == RTMP_AMF_NUMBER) {
+        conn->metadata.video_bitrate = (uint32_t)(videodatarate->number_data * 1024);
+    }
+
+    rtmp_amf_data_t* audiodatarate = rtmp_amf_get_prop(amf, "audiodatarate");
+    if (audiodatarate && audiodatarate->type == RTMP_AMF_NUMBER) {
+        conn->metadata.audio_bitrate = (uint32_t)(audiodatarate->number_data * 1024);
+    }
+
+    // Notify callback
+    if (metadata_callback) {
+        metadata_callback(&conn->metadata, metadata_callback_data);
+    }
+
+    rtmp_amf_data_free(amf);
+}
+
+// Public API implementations
+// Stop server
+void rtmp_server_stop(void) {
+    if (!server_ctx.running) return;
+
+    // Stop threads
+    server_ctx.running = false;
+    
+    // Close listen socket to break accept thread
+    if (server_ctx.listen_socket >= 0) {
+        close(server_ctx.listen_socket);
+        server_ctx.listen_socket = -1;
+    }
+
+    // Wait for threads to finish
+    pthread_join(server_ctx.accept_thread, NULL);
+    pthread_join(server_ctx.monitor_thread, NULL);
+
+    // Close all connections
+    pthread_mutex_lock(&server_ctx.lock);
+    while (server_ctx.connections) {
+        rtmp_connection_t* conn = server_ctx.connections;
+        server_ctx.connections = conn->next;
+        rtmp_server_cleanup_connection(conn);
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+
+    rtmp_server_update_state(RTMP_SERVER_STATE_STOPPED);
+}
+
+// Cleanup server resources
+void rtmp_server_cleanup(void) {
+    rtmp_server_stop();
+    pthread_mutex_destroy(&server_ctx.lock);
+}
+
+// Get server state
+rtmp_server_state_t rtmp_server_get_state(void) {
+    return server_ctx.state;
+}
+
+// Get connection by socket
+rtmp_connection_t* rtmp_server_get_connection(int socket) {
+    rtmp_connection_t* conn = NULL;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (conn = server_ctx.connections; conn; conn = conn->next) {
+        if (conn->socket == socket) break;
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+    
+    return conn;
+}
+
+// Close specific connection
+void rtmp_server_close_connection(rtmp_connection_t* conn) {
+    if (!conn) return;
+    rtmp_server_cleanup_connection(conn);
+}
+
+// Get number of active connections
+uint32_t rtmp_server_get_num_connections(void) {
+    return server_ctx.num_connections;
+}
+
+// Check if stream is being published
+bool rtmp_server_is_publishing(const char* stream_name) {
+    bool publishing = false;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        if (conn->is_publisher && strcmp(conn->metadata.stream_name, stream_name) == 0) {
+            publishing = true;
+            break;
         }
     }
-}
-
-static void update_stats(RTMPServerContext *ctx) {
-    uint32_t now = rtmp_get_timestamp();
-    ctx->stats.uptime = (now - ctx->startTime) / 1000; // Convert to seconds
-}
-
-static void log_error(RTMPServerContext *ctx, RTMPError error, const char *description) {
-    rtmp_log(RTMP_LOG_ERROR, "Server error: %s", description);
+    pthread_mutex_unlock(&server_ctx.lock);
     
-    if (ctx->errorCallback) {
-        ctx->errorCallback(ctx, error, description, ctx->errorCallbackData);
+    return publishing;
+}
+
+// Set callbacks
+void rtmp_server_set_connection_callback(rtmp_connection_callback_t callback, void* userdata) {
+    connection_callback = callback;
+    connection_callback_data = userdata;
+}
+
+void rtmp_server_set_metadata_callback(rtmp_metadata_callback_t callback, void* userdata) {
+    metadata_callback = callback;
+    metadata_callback_data = userdata;
+}
+
+void rtmp_server_set_frame_callback(rtmp_frame_callback_t callback, void* userdata) {
+    frame_callback = callback;
+    frame_callback_data = userdata;
+}
+
+void rtmp_server_set_state_callback(rtmp_server_state_callback_t callback, void* userdata) {
+    state_callback = callback;
+    state_callback_data = userdata;
+}
+
+// Get stream info
+bool rtmp_server_get_stream_info(const char* stream_name, rtmp_stream_metadata_t* info) {
+    if (!stream_name || !info) return false;
+    bool found = false;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        if (strcmp(conn->metadata.stream_name, stream_name) == 0) {
+            memcpy(info, &conn->metadata, sizeof(rtmp_stream_metadata_t));
+            found = true;
+            break;
+        }
     }
+    pthread_mutex_unlock(&server_ctx.lock);
+    
+    return found;
+}
+
+// Get server statistics
+uint64_t rtmp_server_get_bytes_received(void) {
+    uint64_t total = 0;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        total += conn->metadata.bytes_in;
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+    
+    return total;
+}
+
+uint64_t rtmp_server_get_bytes_sent(void) {
+    uint64_t total = 0;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        total += conn->metadata.bytes_out;
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+    
+    return total;
+}
+
+uint32_t rtmp_server_get_dropped_frames(void) {
+    uint32_t total = 0;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        total += conn->metadata.dropped_frames;
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+    
+    return total;
+}
+
+// Configuration functions
+void rtmp_server_set_chunk_size(uint32_t size) {
+    uint8_t msg[4];
+    msg[0] = (size >> 24) & 0xff;
+    msg[1] = (size >> 16) & 0xff;
+    msg[2] = (size >> 8) & 0xff;
+    msg[3] = size & 0xff;
+    
+    rtmp_chunk_stream_t chunk;
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.msg_type_id = RTMP_MSG_SET_CHUNK_SIZE;
+    chunk.msg_stream_id = 0;
+    chunk.msg_length = 4;
+    chunk.msg_data = msg;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        rtmp_connection_send_chunk(conn, &chunk);
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+}
+
+void rtmp_server_set_window_ack_size(uint32_t size) {
+    uint8_t msg[4];
+    msg[0] = (size >> 24) & 0xff;
+    msg[1] = (size >> 16) & 0xff;
+    msg[2] = (size >> 8) & 0xff;
+    msg[3] = size & 0xff;
+    
+    rtmp_chunk_stream_t chunk;
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.msg_type_id = RTMP_MSG_WINDOW_ACK_SIZE;
+    chunk.msg_stream_id = 0;
+    chunk.msg_length = 4;
+    chunk.msg_data = msg;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        rtmp_connection_send_chunk(conn, &chunk);
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+}
+
+void rtmp_server_set_peer_bandwidth(uint32_t window_size, uint8_t limit_type) {
+    uint8_t msg[5];
+    msg[0] = (window_size >> 24) & 0xff;
+    msg[1] = (window_size >> 16) & 0xff;
+    msg[2] = (window_size >> 8) & 0xff;
+    msg[3] = window_size & 0xff;
+    msg[4] = limit_type;
+    
+    rtmp_chunk_stream_t chunk;
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.msg_type_id = RTMP_MSG_SET_PEER_BW;
+    chunk.msg_stream_id = 0;
+    chunk.msg_length = 5;
+    chunk.msg_data = msg;
+    
+    pthread_mutex_lock(&server_ctx.lock);
+    for (rtmp_connection_t* conn = server_ctx.connections; conn; conn = conn->next) {
+        rtmp_connection_send_chunk(conn, &chunk);
+    }
+    pthread_mutex_unlock(&server_ctx.lock);
+}
+
+// Utility functions
+const char* rtmp_server_state_string(rtmp_server_state_t state) {
+    switch (state) {
+        case RTMP_SERVER_STATE_STOPPED:
+            return "Stopped";
+        case RTMP_SERVER_STATE_STARTING:
+            return "Starting";
+        case RTMP_SERVER_STATE_RUNNING:
+            return "Running";
+        case RTMP_SERVER_STATE_ERROR:
+            return "Error";
+        case RTMP_SERVER_STATE_RESTARTING:
+            return "Restarting";
+        default:
+            return "Unknown";
+    }
+}
+
+const char* rtmp_connection_state_string(rtmp_connection_state_t state) {
+    switch (state) {
+        case RTMP_CONN_STATE_NEW:
+            return "New";
+        case RTMP_CONN_STATE_HANDSHAKE:
+            return "Handshake";
+        case RTMP_CONN_STATE_CONNECT:
+            return "Connect";
+        case RTMP_CONN_STATE_CREATE_STREAM:
+            return "CreateStream";
+        case RTMP_CONN_STATE_PLAY:
+            return "Play";
+        case RTMP_CONN_STATE_PUBLISHING:
+            return "Publishing";
+        case RTMP_CONN_STATE_CLOSED:
+            return "Closed";
+        default:
+            return "Unknown";
+    }
+}
+
+void rtmp_server_dump_stats(void) {
+    pthread_mutex_lock(&server_ctx.lock);
+    
+    printf("RTMP Server Statistics:\n");
+    printf("  State: %s\n", rtmp_server_state_string(server_ctx.state));
+    printf("  Port: %d\n", server_ctx.port);
+    printf("  Connections: %d\n", server_ctx.num_connections);
+    
+    rtmp_connection_t* conn = server_ctx.connections;
+    while (conn) {
+        printf("  Connection %d:\n", conn->socket);
+        printf("    State: %s\n", rtmp_connection_state_string(conn->state));
+        printf("    App: %s\n", conn->metadata.app_name);
+        printf("    Stream: %s\n", conn->metadata.stream_name);
+        printf("    Is Publisher: %s\n", conn->is_publisher ? "Yes" : "No");
+        printf("    Bytes In: %lu\n", conn->metadata.bytes_in);
+        printf("    Bytes Out: %lu\n", conn->metadata.bytes_out);
+        if (conn->is_publisher) {
+            printf("    Video: %dx%d @ %d fps\n", 
+                   conn->metadata.width,
+                   conn->metadata.height,
+                   conn->metadata.frame_rate);
+            printf("    Video Bitrate: %d kbps\n", conn->metadata.video_bitrate / 1024);
+            printf("    Audio Bitrate: %d kbps\n", conn->metadata.audio_bitrate / 1024);
+            printf("    Dropped Frames: %d\n", conn->metadata.dropped_frames);
+        }
+        conn = conn->next;
+    }
+    
+    pthread_mutex_unlock(&server_ctx.lock);
 }
