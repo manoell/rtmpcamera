@@ -1,183 +1,297 @@
 #include "rtmp_stability.h"
+#include "rtmp_utils.h"
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <sys/time.h>
 
-#define MAX_RETRY_COUNT 5
-#define RETRY_DELAY_MS 1000
-#define HEARTBEAT_INTERVAL_MS 2000
-#define CONNECTION_TIMEOUT_MS 5000
+// Default settings
+#define DEFAULT_RECONNECT_ATTEMPTS 3
+#define DEFAULT_RECONNECT_DELAY 5000
+#define DEFAULT_HEARTBEAT_INTERVAL 30000
+#define DEFAULT_WATCHDOG_TIMEOUT 10000
 
-typedef struct {
-    int running;
-    int connected;
-    int retry_count;
-    pthread_t monitor_thread;
-    uint64_t last_heartbeat;
-    uint64_t connection_start;
-    StabilityConfig config;
-    StabilityCallback callback;
-    void* user_data;
-    
-    struct {
-        uint32_t disconnections;
-        uint32_t reconnections;
-        uint32_t failed_heartbeats;
-        uint64_t total_uptime;
-        uint64_t last_downtime;
-    } metrics;
-    
+typedef enum {
+    MONITOR_STATE_STOPPED = 0,
+    MONITOR_STATE_STARTING,
+    MONITOR_STATE_RUNNING,
+    MONITOR_STATE_RECOVERING,
+    MONITOR_STATE_FAILED
+} MonitorState;
+
+struct RTMPStabilityMonitor {
+    RTMPContext *rtmp;
+    RTMPStabilityConfig config;
+    MonitorState state;
+    uint32_t reconnectCount;
+    uint32_t lastHeartbeat;
+    uint32_t lastResponse;
+    RTMPStabilityCallback callback;
+    void *userData;
+    bool heartbeatPending;
+    pthread_t watchdogThread;
     pthread_mutex_t mutex;
-} StabilityController;
+    bool watchdogRunning;
+};
 
-static StabilityController* stability = NULL;
+// Private helper functions
+static void *watchdog_thread(void *arg);
+static bool attempt_reconnect(RTMPStabilityMonitor *monitor);
+static void send_heartbeat(RTMPStabilityMonitor *monitor);
+static void check_connection_status(RTMPStabilityMonitor *monitor);
+static void enter_recovery_mode(RTMPStabilityMonitor *monitor, RTMPRecoveryMode mode);
+static void exit_recovery_mode(RTMPStabilityMonitor *monitor, bool success);
 
-// Obtém timestamp atual em ms
-static uint64_t get_timestamp_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+RTMPStabilityMonitor *rtmp_stability_create(RTMPContext *rtmp) {
+    if (!rtmp) return NULL;
+
+    RTMPStabilityMonitor *monitor = (RTMPStabilityMonitor *)calloc(1, sizeof(RTMPStabilityMonitor));
+    if (!monitor) return NULL;
+
+    monitor->rtmp = rtmp;
+    monitor->state = MONITOR_STATE_STOPPED;
+    
+    // Initialize mutex
+    pthread_mutex_init(&monitor->mutex, NULL);
+
+    // Set default config
+    monitor->config.maxReconnectAttempts = DEFAULT_RECONNECT_ATTEMPTS;
+    monitor->config.reconnectDelay = DEFAULT_RECONNECT_DELAY;
+    monitor->config.heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL;
+    monitor->config.watchdogTimeout = DEFAULT_WATCHDOG_TIMEOUT;
+    monitor->config.recoveryMode = RTMP_RECOVERY_MODE_RECONNECT;
+    monitor->config.autoReconnect = true;
+    monitor->config.useWatchdog = true;
+    monitor->config.useHeartbeat = true;
+
+    return monitor;
 }
 
-// Thread de monitoramento
-static void* monitor_connection(void* arg) {
-    StabilityController* ctrl = (StabilityController*)arg;
-    uint64_t last_check = get_timestamp_ms();
+void rtmp_stability_destroy(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return;
+
+    rtmp_stability_stop(monitor);
+    pthread_mutex_destroy(&monitor->mutex);
+    free(monitor);
+}
+
+void rtmp_stability_set_config(RTMPStabilityMonitor *monitor, const RTMPStabilityConfig *config) {
+    if (!monitor || !config) return;
+
+    pthread_mutex_lock(&monitor->mutex);
+    memcpy(&monitor->config, config, sizeof(RTMPStabilityConfig));
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+const RTMPStabilityConfig *rtmp_stability_get_config(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return NULL;
+    return &monitor->config;
+}
+
+void rtmp_stability_start(RTMPStabilityMonitor *monitor) {
+    if (!monitor || monitor->state != MONITOR_STATE_STOPPED) return;
+
+    pthread_mutex_lock(&monitor->mutex);
     
-    while (ctrl->running) {
-        uint64_t now = get_timestamp_ms();
-        int should_reconnect = 0;
-        
-        pthread_mutex_lock(&ctrl->mutex);
-        
-        // Verifica timeout de heartbeat
-        if (ctrl->connected && (now - ctrl->last_heartbeat) > CONNECTION_TIMEOUT_MS) {
-            ctrl->metrics.failed_heartbeats++;
-            should_reconnect = 1;
-        }
-        
-        // Verifica necessidade de reconexão
-        if (should_reconnect) {
-            ctrl->connected = 0;
-            ctrl->metrics.disconnections++;
-            ctrl->metrics.last_downtime = now;
-            
-            if (ctrl->callback) {
-                ctrl->callback(STABILITY_EVENT_DISCONNECTED, ctrl->user_data);
-            }
-            
-            // Tenta reconexão se configurado
-            if (ctrl->config.auto_reconnect && ctrl->retry_count < MAX_RETRY_COUNT) {
-                ctrl->retry_count++;
-                
-                if (ctrl->callback) {
-                    ctrl->callback(STABILITY_EVENT_RECONNECTING, ctrl->user_data);
-                }
-                
-                // Espera delay entre tentativas
-                usleep(RETRY_DELAY_MS * 1000);
-                
-                // Tenta reconexão
-                if (ctrl->callback) {
-                    if (ctrl->callback(STABILITY_EVENT_RECONNECT_ATTEMPT, ctrl->user_data) == 0) {
-                        ctrl->connected = 1;
-                        ctrl->metrics.reconnections++;
-                        ctrl->retry_count = 0;
-                        ctrl->last_heartbeat = now;
-                        ctrl->metrics.total_uptime += (now - ctrl->metrics.last_downtime);
-                        
-                        ctrl->callback(STABILITY_EVENT_RECONNECTED, ctrl->user_data);
-                    }
-                }
-            }
-        }
-        
-        pthread_mutex_unlock(&ctrl->mutex);
-        
-        // Espera próximo ciclo
-        usleep(100 * 1000); // 100ms
+    monitor->state = MONITOR_STATE_STARTING;
+    monitor->reconnectCount = 0;
+    monitor->lastHeartbeat = rtmp_get_timestamp();
+    monitor->lastResponse = monitor->lastHeartbeat;
+    monitor->heartbeatPending = false;
+
+    // Start watchdog thread if enabled
+    if (monitor->config.useWatchdog) {
+        monitor->watchdogRunning = true;
+        pthread_create(&monitor->watchdogThread, NULL, watchdog_thread, monitor);
+    }
+
+    monitor->state = MONITOR_STATE_RUNNING;
+    
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+void rtmp_stability_stop(RTMPStabilityMonitor *monitor) {
+    if (!monitor || monitor->state == MONITOR_STATE_STOPPED) return;
+
+    pthread_mutex_lock(&monitor->mutex);
+
+    // Stop watchdog thread
+    if (monitor->watchdogRunning) {
+        monitor->watchdogRunning = false;
+        pthread_join(monitor->watchdogThread, NULL);
+    }
+
+    monitor->state = MONITOR_STATE_STOPPED;
+    
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+void rtmp_stability_reset(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return;
+
+    pthread_mutex_lock(&monitor->mutex);
+    
+    monitor->reconnectCount = 0;
+    monitor->lastHeartbeat = rtmp_get_timestamp();
+    monitor->lastResponse = monitor->lastHeartbeat;
+    monitor->heartbeatPending = false;
+
+    if (monitor->state == MONITOR_STATE_RECOVERING) {
+        monitor->state = MONITOR_STATE_RUNNING;
     }
     
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+bool rtmp_stability_is_stable(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return false;
+    return monitor->state == MONITOR_STATE_RUNNING;
+}
+
+bool rtmp_stability_is_recovering(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return false;
+    return monitor->state == MONITOR_STATE_RECOVERING;
+}
+
+uint32_t rtmp_stability_get_reconnect_count(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return 0;
+    return monitor->reconnectCount;
+}
+
+bool rtmp_stability_try_recover(RTMPStabilityMonitor *monitor) {
+    if (!monitor || monitor->state != MONITOR_STATE_FAILED) return false;
+
+    pthread_mutex_lock(&monitor->mutex);
+    bool result = attempt_reconnect(monitor);
+    pthread_mutex_unlock(&monitor->mutex);
+
+    return result;
+}
+
+void rtmp_stability_force_reconnect(RTMPStabilityMonitor *monitor) {
+    if (!monitor) return;
+
+    pthread_mutex_lock(&monitor->mutex);
+    enter_recovery_mode(monitor, RTMP_RECOVERY_MODE_RECONNECT);
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+void rtmp_stability_set_callback(RTMPStabilityMonitor *monitor, RTMPStabilityCallback callback, void *userData) {
+    if (!monitor) return;
+
+    pthread_mutex_lock(&monitor->mutex);
+    monitor->callback = callback;
+    monitor->userData = userData;
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+static void *watchdog_thread(void *arg) {
+    RTMPStabilityMonitor *monitor = (RTMPStabilityMonitor *)arg;
+    uint32_t checkInterval = 1000; // Check every second
+
+    while (monitor->watchdogRunning) {
+        pthread_mutex_lock(&monitor->mutex);
+
+        if (monitor->state == MONITOR_STATE_RUNNING) {
+            uint32_t now = rtmp_get_timestamp();
+
+            // Send heartbeat if needed
+            if (monitor->config.useHeartbeat && 
+                !monitor->heartbeatPending && 
+                now - monitor->lastHeartbeat >= monitor->config.heartbeatInterval) {
+                send_heartbeat(monitor);
+            }
+
+            // Check connection status
+            check_connection_status(monitor);
+        }
+
+        pthread_mutex_unlock(&monitor->mutex);
+        rtmp_sleep_ms(checkInterval);
+    }
+
     return NULL;
 }
 
-int rtmp_stability_init(StabilityConfig* config, StabilityCallback cb, void* user_data) {
-    if (stability) return -1;
-    
-    stability = calloc(1, sizeof(StabilityController));
-    
-    if (config) {
-        memcpy(&stability->config, config, sizeof(StabilityConfig));
-    } else {
-        // Configurações padrão
-        stability->config.auto_reconnect = 1;
-        stability->config.heartbeat_interval = HEARTBEAT_INTERVAL_MS;
-        stability->config.connection_timeout = CONNECTION_TIMEOUT_MS;
+static bool attempt_reconnect(RTMPStabilityMonitor *monitor) {
+    if (monitor->reconnectCount >= monitor->config.maxReconnectAttempts) {
+        monitor->state = MONITOR_STATE_FAILED;
+        return false;
     }
-    
-    stability->callback = cb;
-    stability->user_data = user_data;
-    stability->running = 1;
-    stability->connection_start = get_timestamp_ms();
-    
-    pthread_mutex_init(&stability->mutex, NULL);
-    
-    // Inicia thread de monitoramento
-    pthread_create(&stability->monitor_thread, NULL, monitor_connection, stability);
-    
-    return 0;
+
+    // Close existing connection
+    rtmp_disconnect(monitor->rtmp);
+    rtmp_sleep_ms(monitor->config.reconnectDelay);
+
+    // Try to reconnect
+    if (rtmp_connect(monitor->rtmp, monitor->rtmp->host, monitor->rtmp->port)) {
+        monitor->reconnectCount++;
+        monitor->state = MONITOR_STATE_RUNNING;
+        return true;
+    }
+
+    monitor->state = MONITOR_STATE_FAILED;
+    return false;
 }
 
-void rtmp_stability_heartbeat(void) {
-    if (!stability) return;
-    
-    pthread_mutex_lock(&stability->mutex);
-    stability->last_heartbeat = get_timestamp_ms();
-    pthread_mutex_unlock(&stability->mutex);
+static void send_heartbeat(RTMPStabilityMonitor *monitor) {
+    // Send ping
+    RTMPPacket packet = {
+        .type = RTMP_MSG_USER_CONTROL,
+        .size = 6,
+        .data = (uint8_t *)"\x06\x00\x00\x00\x00\x00",
+        .timestamp = rtmp_get_timestamp()
+    };
+
+    if (rtmp_send_packet(monitor->rtmp, &packet)) {
+        monitor->lastHeartbeat = packet.timestamp;
+        monitor->heartbeatPending = true;
+    }
 }
 
-void rtmp_stability_connected(void) {
-    if (!stability) return;
-    
-    pthread_mutex_lock(&stability->mutex);
-    stability->connected = 1;
-    stability->retry_count = 0;
-    stability->last_heartbeat = get_timestamp_ms();
-    pthread_mutex_unlock(&stability->mutex);
+static void check_connection_status(RTMPStabilityMonitor *monitor) {
+    uint32_t now = rtmp_get_timestamp();
+
+    if (monitor->heartbeatPending && 
+        now - monitor->lastHeartbeat >= monitor->config.watchdogTimeout) {
+        // Connection appears to be dead
+        enter_recovery_mode(monitor, monitor->config.recoveryMode);
+    }
 }
 
-void rtmp_stability_disconnected(void) {
-    if (!stability) return;
-    
-    pthread_mutex_lock(&stability->mutex);
-    stability->connected = 0;
-    stability->metrics.disconnections++;
-    stability->metrics.last_downtime = get_timestamp_ms();
-    pthread_mutex_unlock(&stability->mutex);
+static void enter_recovery_mode(RTMPStabilityMonitor *monitor, RTMPRecoveryMode mode) {
+    if (monitor->state != MONITOR_STATE_RUNNING) return;
+
+    monitor->state = MONITOR_STATE_RECOVERING;
+
+    if (monitor->callback) {
+        monitor->callback(monitor, mode, monitor->userData);
+    }
+
+    switch (mode) {
+        case RTMP_RECOVERY_MODE_RECONNECT:
+            if (monitor->config.autoReconnect) {
+                attempt_reconnect(monitor);
+            }
+            break;
+
+        case RTMP_RECOVERY_MODE_RESET:
+            rtmp_stability_reset(monitor);
+            break;
+
+        case RTMP_RECOVERY_MODE_FALLBACK:
+            monitor->state = MONITOR_STATE_FAILED;
+            break;
+
+        default:
+            break;
+    }
 }
 
-void rtmp_stability_get_stats(StabilityStats* stats) {
-    if (!stability || !stats) return;
-    
-    pthread_mutex_lock(&stability->mutex);
-    stats->disconnections = stability->metrics.disconnections;
-    stats->reconnections = stability->metrics.reconnections;
-    stats->failed_heartbeats = stability->metrics.failed_heartbeats;
-    stats->total_uptime = stability->metrics.total_uptime;
-    stats->current_retry = stability->retry_count;
-    stats->is_connected = stability->connected;
-    pthread_mutex_unlock(&stability->mutex);
-}
+static void exit_recovery_mode(RTMPStabilityMonitor *monitor, bool success) {
+    if (monitor->state != MONITOR_STATE_RECOVERING) return;
 
-void rtmp_stability_destroy(void) {
-    if (!stability) return;
-    
-    stability->running = 0;
-    pthread_join(stability->monitor_thread, NULL);
-    pthread_mutex_destroy(&stability->mutex);
-    
-    free(stability);
-    stability = NULL;
+    monitor->state = success ? MONITOR_STATE_RUNNING : MONITOR_STATE_FAILED;
+
+    if (monitor->callback) {
+        monitor->callback(monitor, RTMP_RECOVERY_MODE_NONE, monitor->userData);
+    }
 }

@@ -1,9 +1,28 @@
-Package: com.yourdomain.rtmpcamera
+Package: com.rtmpcamera.tweak
 Name: RTMPCamera
 Version: 1.0.0
-Architecture: iphoneos-arm
-Description: RTMP Camera Feed Replacement
-Maintainer: Your Name
-Author: Your Name
+Architecture: iphoneos-arm64
+Description: Advanced RTMP camera replacement for iOS
+ This tweak provides seamless RTMP camera integration,
+ allowing high-quality video streaming through custom
+ RTMP servers while maintaining native camera experience.
+ Features include:
+ * High performance RTMP streaming
+ * Native camera integration
+ * Advanced preview system
+ * Automatic failover
+ * Quality monitoring
+ * Undetectable operation
+Maintainer: Your Name <your@email.com>
+Author: Your Name <your@email.com>
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0), preferenceloader
+Conflicts: com.othercamera.tweak
+Replaces: com.oldcamera.tweak
+Priority: optional
+Tag: purpose::extension, role::enduser
+Icon: file:///Library/PreferenceBundles/RTMPCamera.bundle/icon.png
+Homepage: https://yourwebsite.com/rtmpcamera
+Support: https://yourwebsite.com/support
+Depiction: https://yourwebsite.com/rtmpcamera/depiction
+SileoDepiction: https://yourwebsite.com/rtmpcamera/sileo.json

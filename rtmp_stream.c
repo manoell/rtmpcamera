@@ -1,541 +1,528 @@
 #include "rtmp_stream.h"
-#include "rtmp_core.h"
 #include "rtmp_utils.h"
-#include "rtmp_diagnostics.h"
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
+#include <math.h>
 
-#define RTMP_STREAM_BUFFER_SIZE (1024 * 1024)  // 1MB buffer
-#define RTMP_MAX_FRAME_SIZE (1024 * 1024)      // 1MB max frame
-#define RTMP_KEYFRAME_INTERVAL 30              // Request keyframe every 30 frames
-#define RTMP_QUALITY_CHECK_INTERVAL 1000       // Check quality every 1 second
-#define RTMP_MAX_LATENCY 2000                 // Maximum allowed latency in ms
+// Private definitions
+#define DEFAULT_BUFFER_SIZE (512 * 1024)  // 512KB
+#define MIN_BITRATE 100000                // 100 Kbps
+#define MAX_BITRATE 8000000               // 8 Mbps
+#define STATS_UPDATE_INTERVAL 1000        // 1 second
+#define QUALITY_CHECK_INTERVAL 5000       // 5 seconds
 
 typedef struct {
     uint8_t *data;
     size_t size;
     size_t capacity;
-    uint64_t timestamp;
-} rtmp_frame_t;
+} StreamBuffer;
 
 typedef struct {
-    rtmp_frame_t *frames;
-    size_t head;
-    size_t tail;
-    size_t capacity;
-    pthread_mutex_t mutex;
-} rtmp_frame_buffer_t;
+    StreamBuffer video;
+    StreamBuffer audio;
+    uint32_t bufferSize;
+    uint32_t maxBitrate;
+    uint32_t minBitrate;
+    bool adaptiveBitrate;
+    RTMPStreamQuality quality;
+    uint32_t lastQualityCheck;
+    uint32_t lastStatsUpdate;
+} StreamContext;
 
-struct rtmp_stream {
-    int active;
-    pthread_mutex_t mutex;
-    pthread_t process_thread;
-    rtmp_frame_buffer_t frame_buffer;
-    rtmp_stream_config_t config;
-    rtmp_stream_stats_t stats;
-    rtmp_stream_callbacks_t callbacks;
-    uint64_t last_keyframe_time;
-    uint64_t last_quality_check;
-    float current_quality;
-    void *user_data;
-};
+// Private helper functions
+static bool send_metadata(RTMPStream *stream);
+static void update_stats(RTMPStream *stream, uint32_t now);
+static void check_quality(RTMPStream *stream, uint32_t now);
+static bool handle_connect_response(RTMPStream *stream, const AMFObject *response);
+static bool handle_publish_response(RTMPStream *stream, const AMFObject *response);
+static void reset_stream_context(StreamContext *ctx);
 
-// Forward declarations
-static void* rtmp_stream_process_loop(void *arg);
-static int rtmp_stream_handle_frame(rtmp_stream_t *stream, rtmp_frame_t *frame);
-static void rtmp_stream_check_quality(rtmp_stream_t *stream);
-static void rtmp_stream_adjust_quality(rtmp_stream_t *stream, float quality);
+// Implementation
+RTMPStream *rtmp_stream_create(RTMPContext *rtmp) {
+    if (!rtmp) return NULL;
 
-// Create new stream
-rtmp_stream_t* rtmp_stream_create(const rtmp_stream_config_t *config) {
-    rtmp_stream_t *stream = (rtmp_stream_t*)calloc(1, sizeof(rtmp_stream_t));
-    if (!stream) {
-        rtmp_log_error("Failed to allocate stream");
-        return NULL;
-    }
-    
-    // Initialize mutex
-    if (pthread_mutex_init(&stream->mutex, NULL) != 0) {
+    RTMPStream *stream = (RTMPStream *)calloc(1, sizeof(RTMPStream));
+    if (!stream) return NULL;
+
+    StreamContext *ctx = (StreamContext *)calloc(1, sizeof(StreamContext));
+    if (!ctx) {
         free(stream);
         return NULL;
     }
-    
-    // Initialize frame buffer
-    stream->frame_buffer.capacity = RTMP_STREAM_BUFFER_SIZE;
-    stream->frame_buffer.frames = (rtmp_frame_t*)calloc(
-        stream->frame_buffer.capacity, sizeof(rtmp_frame_t));
-    
-    if (!stream->frame_buffer.frames) {
-        pthread_mutex_destroy(&stream->mutex);
-        free(stream);
-        return NULL;
-    }
-    
-    if (pthread_mutex_init(&stream->frame_buffer.mutex, NULL) != 0) {
-        free(stream->frame_buffer.frames);
-        pthread_mutex_destroy(&stream->mutex);
-        free(stream);
-        return NULL;
-    }
-    
-    // Copy configuration
-    if (config) {
-        memcpy(&stream->config, config, sizeof(rtmp_stream_config_t));
-    } else {
-        // Default configuration
-        stream->config.width = 1280;
-        stream->config.height = 720;
-        stream->config.fps = 30;
-        stream->config.bitrate = 2000000;  // 2 Mbps
-        stream->config.gop_size = 30;
-        stream->config.quality = 1.0f;
-    }
-    
-    // Initialize statistics
-    stream->stats.start_time = rtmp_utils_get_time_ms();
-    stream->current_quality = 1.0f;
-    
+
+    stream->rtmp = rtmp;
+    stream->state = RTMP_STREAM_STATE_IDLE;
+    stream->userData = ctx;
+
+    // Initialize default config
+    stream->config.width = 1280;
+    stream->config.height = 720;
+    stream->config.frameRate = 30;
+    stream->config.videoBitrate = 2000000;  // 2 Mbps
+    stream->config.audioBitrate = 128000;   // 128 Kbps
+    stream->config.enableAudio = true;
+    stream->config.enableVideo = true;
+
+    // Initialize context
+    ctx->bufferSize = DEFAULT_BUFFER_SIZE;
+    ctx->maxBitrate = MAX_BITRATE;
+    ctx->minBitrate = MIN_BITRATE;
+    ctx->quality = RTMP_QUALITY_HIGH;
+    ctx->adaptiveBitrate = true;
+
     return stream;
 }
 
-// Start stream processing
-int rtmp_stream_start(rtmp_stream_t *stream) {
-    if (!stream) return RTMP_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&stream->mutex);
-    
-    if (stream->active) {
-        pthread_mutex_unlock(&stream->mutex);
-        return RTMP_ERROR_ALREADY_RUNNING;
-    }
-    
-    stream->active = 1;
-    
-    // Start processing thread
-    if (pthread_create(&stream->process_thread, NULL, rtmp_stream_process_loop, stream) != 0) {
-        stream->active = 0;
-        pthread_mutex_unlock(&stream->mutex);
-        return RTMP_ERROR_THREAD_CREATE;
-    }
-    
-    pthread_mutex_unlock(&stream->mutex);
-    
-    rtmp_log_info("Stream started");
-    return RTMP_SUCCESS;
-}
-
-// Push frame to stream
-int rtmp_stream_push_frame(rtmp_stream_t *stream, const uint8_t *data, size_t size, 
-                          uint64_t timestamp, int is_keyframe) {
-    if (!stream || !data || size == 0) return RTMP_ERROR_INVALID_PARAM;
-    if (size > RTMP_MAX_FRAME_SIZE) return RTMP_ERROR_FRAME_TOO_LARGE;
-    
-    pthread_mutex_lock(&stream->frame_buffer.mutex);
-    
-    // Check buffer space
-    size_t next_tail = (stream->frame_buffer.tail + 1) % stream->frame_buffer.capacity;
-    if (next_tail == stream->frame_buffer.head) {
-        // Buffer full, drop oldest frame
-        stream->frame_buffer.head = (stream->frame_buffer.head + 1) % 
-            stream->frame_buffer.capacity;
-        stream->stats.dropped_frames++;
-    }
-    
-    // Allocate frame data
-    rtmp_frame_t *frame = &stream->frame_buffer.frames[stream->frame_buffer.tail];
-    if (frame->capacity < size) {
-        uint8_t *new_data = (uint8_t*)realloc(frame->data, size);
-        if (!new_data) {
-            pthread_mutex_unlock(&stream->frame_buffer.mutex);
-            return RTMP_ERROR_MEMORY;
-        }
-        frame->data = new_data;
-        frame->capacity = size;
-    }
-    
-    // Copy frame data
-    memcpy(frame->data, data, size);
-    frame->size = size;
-    frame->timestamp = timestamp;
-    
-    // Update buffer state
-    stream->frame_buffer.tail = next_tail;
-    
-    // Update statistics
-    stream->stats.total_frames++;
-    stream->stats.bytes_received += size;
-    if (is_keyframe) {
-        stream->stats.keyframes++;
-        stream->last_keyframe_time = timestamp;
-    }
-    
-    pthread_mutex_unlock(&stream->frame_buffer.mutex);
-    
-    return RTMP_SUCCESS;
-}
-
-// Process frames in background thread
-static void* rtmp_stream_process_loop(void *arg) {
-    rtmp_stream_t *stream = (rtmp_stream_t*)arg;
-    rtmp_frame_t frame_copy;
-    memset(&frame_copy, 0, sizeof(frame_copy));
-    
-    while (stream->active) {
-        int has_frame = 0;
-        
-        // Get next frame
-        pthread_mutex_lock(&stream->frame_buffer.mutex);
-        
-        if (stream->frame_buffer.head != stream->frame_buffer.tail) {
-            rtmp_frame_t *frame = &stream->frame_buffer.frames[stream->frame_buffer.head];
-            
-            // Make copy of frame data
-            if (frame_copy.capacity < frame->size) {
-                uint8_t *new_data = (uint8_t*)realloc(frame_copy.data, frame->size);
-                if (new_data) {
-                    frame_copy.data = new_data;
-                    frame_copy.capacity = frame->size;
-                }
-            }
-            
-            if (frame_copy.capacity >= frame->size) {
-                memcpy(frame_copy.data, frame->data, frame->size);
-                frame_copy.size = frame->size;
-                frame_copy.timestamp = frame->timestamp;
-                has_frame = 1;
-            }
-            
-            stream->frame_buffer.head = (stream->frame_buffer.head + 1) % 
-                stream->frame_buffer.capacity;
-        }
-        
-        pthread_mutex_unlock(&stream->frame_buffer.mutex);
-        
-        // Process frame if we got one
-        if (has_frame) {
-            if (rtmp_stream_handle_frame(stream, &frame_copy) != RTMP_SUCCESS) {
-                stream->stats.failed_frames++;
-            }
-        }
-        
-        // Check and adjust quality periodically
-        uint64_t current_time = rtmp_utils_get_time_ms();
-        if (current_time - stream->last_quality_check >= RTMP_QUALITY_CHECK_INTERVAL) {
-            rtmp_stream_check_quality(stream);
-            stream->last_quality_check = current_time;
-        }
-        
-        // Small sleep to prevent CPU overload
-        rtmp_utils_sleep_ms(1);
-    }
-    
-    // Cleanup
-    free(frame_copy.data);
-    return NULL;
-}
-
-// Handle single frame
-static int rtmp_stream_handle_frame(rtmp_stream_t *stream, rtmp_frame_t *frame) {
-    if (!stream->callbacks.process_frame) {
-        return RTMP_ERROR_NO_CALLBACK;
-    }
-    
-    // Calculate current latency
-    uint64_t current_time = rtmp_utils_get_time_ms();
-    uint64_t latency = current_time - frame->timestamp;
-    
-    // Update statistics
-    stream->stats.current_latency = latency;
-    if (latency > stream->stats.max_latency) {
-        stream->stats.max_latency = latency;
-    }
-    
-    // Process frame through callback
-    int result = stream->callbacks.process_frame(frame->data, frame->size, 
-                                               frame->timestamp, stream->user_data);
-    
-    if (result == RTMP_SUCCESS) {
-        stream->stats.processed_frames++;
-        stream->stats.bytes_sent += frame->size;
-    }
-    
-    return result;
-}
-
-// Check stream quality
-static void rtmp_stream_check_quality(rtmp_stream_t *stream) {
-    float quality_score = 1.0f;
-    
-    // Calculate quality based on various metrics
-    
-    // 1. Latency impact
-    if (stream->stats.current_latency > RTMP_MAX_LATENCY) {
-        quality_score *= 0.8f;  // Reduce quality by 20% if latency is too high
-    }
-    
-    // 2. Frame drop impact
-    float drop_rate = (float)stream->stats.dropped_frames / stream->stats.total_frames;
-    if (drop_rate > 0.1f) {  // More than 10% frames dropped
-        quality_score *= (1.0f - drop_rate);
-    }
-    
-    // 3. Processing failure impact
-    float failure_rate = (float)stream->stats.failed_frames / stream->stats.total_frames;
-    if (failure_rate > 0.05f) {  // More than 5% frames failed
-        quality_score *= (1.0f - failure_rate);
-    }
-    
-    // 4. Buffer utilization impact
-    pthread_mutex_lock(&stream->frame_buffer.mutex);
-    size_t buffer_used = (stream->frame_buffer.tail - stream->frame_buffer.head + 
-                         stream->frame_buffer.capacity) % stream->frame_buffer.capacity;
-    float buffer_utilization = (float)buffer_used / stream->frame_buffer.capacity;
-    pthread_mutex_unlock(&stream->frame_buffer.mutex);
-    
-    if (buffer_utilization > 0.9f) {  // Buffer more than 90% full
-        quality_score *= 0.9f;
-    }
-    
-    // Update quality if it changed significantly
-    if (fabs(quality_score - stream->current_quality) > 0.1f) {
-        rtmp_stream_adjust_quality(stream, quality_score);
-    }
-    
-    // Update statistics
-    stream->stats.current_quality = stream->current_quality;
-}
-
-// Adjust stream quality
-static void rtmp_stream_adjust_quality(rtmp_stream_t *stream, float quality) {
-    // Clamp quality between 0.1 and 1.0
-    quality = quality < 0.1f ? 0.1f : (quality > 1.0f ? 1.0f : quality);
-    
-    if (quality == stream->current_quality) {
-        return;
-    }
-    
-    // Calculate new parameters based on quality
-    rtmp_stream_config_t new_config = stream->config;
-    new_config.bitrate = (int)(stream->config.bitrate * quality);
-    new_config.fps = (int)(stream->config.fps * quality);
-    
-    // Ensure minimum values
-    if (new_config.bitrate < 100000) new_config.bitrate = 100000;  // 100 Kbps minimum
-    if (new_config.fps < 10) new_config.fps = 10;  // 10 FPS minimum
-    
-    // Notify quality change if callback is set
-    if (stream->callbacks.quality_changed) {
-        stream->callbacks.quality_changed(quality, &new_config, stream->user_data);
-    }
-    
-    stream->current_quality = quality;
-    memcpy(&stream->config, &new_config, sizeof(rtmp_stream_config_t));
-    
-    rtmp_log_info("Stream quality adjusted to %.2f", quality);
-}
-
-// Stop stream
-int rtmp_stream_stop(rtmp_stream_t *stream) {
-    if (!stream) return RTMP_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&stream->mutex);
-    
-    if (!stream->active) {
-        pthread_mutex_unlock(&stream->mutex);
-        return RTMP_SUCCESS;
-    }
-    
-    stream->active = 0;
-    pthread_mutex_unlock(&stream->mutex);
-    
-    // Wait for processing thread to finish
-    pthread_join(stream->process_thread, NULL);
-    
-    rtmp_log_info("Stream stopped");
-    return RTMP_SUCCESS;
-}
-
-// Destroy stream
-void rtmp_stream_destroy(rtmp_stream_t *stream) {
+void rtmp_stream_destroy(RTMPStream *stream) {
     if (!stream) return;
-    
-    rtmp_stream_stop(stream);
-    
-    // Cleanup frame buffer
-    pthread_mutex_lock(&stream->frame_buffer.mutex);
-    for (size_t i = 0; i < stream->frame_buffer.capacity; i++) {
-        free(stream->frame_buffer.frames[i].data);
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (ctx) {
+        if (ctx->video.data) free(ctx->video.data);
+        if (ctx->audio.data) free(ctx->audio.data);
+        free(ctx);
     }
-    free(stream->frame_buffer.frames);
-    pthread_mutex_unlock(&stream->frame_buffer.mutex);
-    
-    pthread_mutex_destroy(&stream->frame_buffer.mutex);
-    pthread_mutex_destroy(&stream->mutex);
-    
+
     free(stream);
 }
 
-// Set stream callbacks
-void rtmp_stream_set_callbacks(rtmp_stream_t *stream, const rtmp_stream_callbacks_t *callbacks,
-                             void *user_data) {
-    if (!stream || !callbacks) return;
+bool rtmp_stream_connect(RTMPStream *stream, const char *url) {
+    if (!stream || !url) return false;
+
+    // Parse URL
+    char host[256];
+    int port = RTMP_DEFAULT_PORT;
+    char app[128];
+    char streamName[128];
     
-    pthread_mutex_lock(&stream->mutex);
-    memcpy(&stream->callbacks, callbacks, sizeof(rtmp_stream_callbacks_t));
-    stream->user_data = user_data;
-    pthread_mutex_unlock(&stream->mutex);
+    // Simple URL parser - in production you'd want more robust parsing
+    if (sscanf(url, "rtmp://%255[^:]:%d/%127[^/]/%127s", 
+               host, &port, app, streamName) < 4) {
+        if (sscanf(url, "rtmp://%255[^/]/%127[^/]/%127s",
+                   host, app, streamName) < 3) {
+            rtmp_log(RTMP_LOG_ERROR, "Invalid RTMP URL format");
+            return false;
+        }
+    }
+
+    stream->state = RTMP_STREAM_STATE_CONNECTING;
+    strncpy(stream->streamName, streamName, sizeof(stream->streamName) - 1);
+
+    // Configure RTMP context
+    RTMPContext *rtmp = stream->rtmp;
+    strncpy(rtmp->settings.app, app, sizeof(rtmp->settings.app) - 1);
+    snprintf(rtmp->settings.tcUrl, sizeof(rtmp->settings.tcUrl),
+             "rtmp://%s:%d/%s", host, port, app);
+
+    // Connect to server
+    if (!rtmp_connect(rtmp, host, port)) {
+        stream->state = RTMP_STREAM_STATE_IDLE;
+        return false;
+    }
+
+    // Send connect command
+    if (!rtmp_send_connect(rtmp)) {
+        rtmp_disconnect(rtmp);
+        stream->state = RTMP_STREAM_STATE_IDLE;
+        return false;
+    }
+
+    return true;
 }
 
-// Get stream statistics
-const rtmp_stream_stats_t* rtmp_stream_get_stats(rtmp_stream_t *stream) {
-    if (!stream) return NULL;
-    
-    pthread_mutex_lock(&stream->mutex);
-    // Update real-time stats
-    stream->stats.uptime = rtmp_utils_get_time_ms() - stream->stats.start_time;
-    if (stream->stats.uptime > 0) {
-        stream->stats.average_bitrate = (stream->stats.bytes_sent * 8000) / stream->stats.uptime;  // in bps
+void rtmp_stream_disconnect(RTMPStream *stream) {
+    if (!stream) return;
+
+    if (stream->state != RTMP_STREAM_STATE_IDLE) {
+        rtmp_disconnect(stream->rtmp);
+        stream->state = RTMP_STREAM_STATE_IDLE;
     }
-    pthread_mutex_unlock(&stream->mutex);
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (ctx) {
+        reset_stream_context(ctx);
+    }
+
+    if (stream->onStateChange) {
+        stream->onStateChange(stream, RTMP_STREAM_STATE_IDLE);
+    }
+}
+
+bool rtmp_stream_is_connected(RTMPStream *stream) {
+    return stream && stream->state != RTMP_STREAM_STATE_IDLE && 
+           stream->state != RTMP_STREAM_STATE_CLOSED;
+}
+
+bool rtmp_stream_publish(RTMPStream *stream, const char *name) {
+    if (!stream || !name || !rtmp_stream_is_connected(stream)) return false;
+
+    // Create stream first
+    if (!rtmp_send_create_stream(stream->rtmp)) {
+        return false;
+    }
+
+    // Send publish command
+    RTMPContext *rtmp = stream->rtmp;
+    strncpy(stream->streamName, name, sizeof(stream->streamName) - 1);
     
+    if (!rtmp_send_publish(rtmp)) {
+        return false;
+    }
+
+    stream->state = RTMP_STREAM_STATE_PUBLISHING;
+    
+    // Send metadata
+    if (!send_metadata(stream)) {
+        rtmp_log(RTMP_LOG_WARNING, "Failed to send stream metadata");
+    }
+
+    if (stream->onStateChange) {
+        stream->onStateChange(stream, RTMP_STREAM_STATE_PUBLISHING);
+    }
+
+    return true;
+}
+
+bool rtmp_stream_send_video(RTMPStream *stream, const uint8_t *data, size_t size,
+                          uint32_t timestamp, bool keyframe) {
+    if (!stream || !data || !size) return false;
+    if (stream->state != RTMP_STREAM_STATE_PUBLISHING) return false;
+
+    RTMPPacket packet = {
+        .type = RTMP_MSG_VIDEO,
+        .timestamp = timestamp,
+        .streamId = stream->streamId,
+        .data = (uint8_t *)data,
+        .size = size
+    };
+
+    bool result = rtmp_send_packet(stream->rtmp, &packet);
+    
+    if (result) {
+        // Update statistics
+        stream->stats.videoFramesSent++;
+        stream->stats.bytesSent += size;
+        
+        uint32_t now = rtmp_get_timestamp();
+        update_stats(stream, now);
+        
+        if (stream->config.enableVideo && keyframe) {
+            check_quality(stream, now);
+        }
+    }
+
+    return result;
+}
+
+bool rtmp_stream_send_audio(RTMPStream *stream, const uint8_t *data, size_t size,
+                          uint32_t timestamp) {
+    if (!stream || !data || !size) return false;
+    if (stream->state != RTMP_STREAM_STATE_PUBLISHING) return false;
+
+    RTMPPacket packet = {
+        .type = RTMP_MSG_AUDIO,
+        .timestamp = timestamp,
+        .streamId = stream->streamId,
+        .data = (uint8_t *)data,
+        .size = size
+    };
+
+    bool result = rtmp_send_packet(stream->rtmp, &packet);
+    
+    if (result) {
+        stream->stats.audioFramesSent++;
+        stream->stats.bytesSent += size;
+        update_stats(stream, rtmp_get_timestamp());
+    }
+
+    return result;
+}
+
+static bool send_metadata(RTMPStream *stream) {
+    AMFObject *metadata = amf_object_create();
+    if (!metadata) return false;
+
+    // Add video metadata
+    amf_object_add_number(metadata, "width", stream->config.width);
+    amf_object_add_number(metadata, "height", stream->config.height);
+    amf_object_add_number(metadata, "videocodecid", stream->config.videoCodec);
+    amf_object_add_number(metadata, "videodatarate", stream->config.videoBitrate / 1024.0);
+    amf_object_add_number(metadata, "framerate", stream->config.frameRate);
+
+    // Add audio metadata
+    if (stream->config.enableAudio) {
+        amf_object_add_number(metadata, "audiocodecid", stream->config.audioCodec);
+        amf_object_add_number(metadata, "audiodatarate", stream->config.audioBitrate / 1024.0);
+        amf_object_add_number(metadata, "audiochannels", 2);
+    }
+
+    // Add encoder metadata
+    amf_object_add_string(metadata, "encoder", "rtmp_camera/1.0");
+    amf_object_add_number(metadata, "filesize", 0);
+    amf_object_add_bool(metadata, "hasAudio", stream->config.enableAudio);
+    amf_object_add_bool(metadata, "hasVideo", stream->config.enableVideo);
+
+    // Send metadata packet
+    bool result = rtmp_stream_send_metadata(stream, "@setDataFrame", metadata);
+    amf_object_free(metadata);
+
+    return result;
+}
+
+bool rtmp_stream_send_metadata(RTMPStream *stream, const char *type, const AMFObject *metadata) {
+    if (!stream || !type || !metadata) return false;
+
+    uint8_t *data = NULL;
+    size_t size = 0;
+
+    // Encode metadata to AMF
+    if (!amf_encode_metadata(type, metadata, &data, &size)) {
+        return false;
+    }
+
+    RTMPPacket packet = {
+        .type = RTMP_MSG_DATA_AMF0,
+        .timestamp = 0,
+        .streamId = stream->streamId,
+        .data = data,
+        .size = size
+    };
+
+    bool result = rtmp_send_packet(stream->rtmp, &packet);
+    free(data);
+
+    return result;
+}
+
+static void update_stats(RTMPStream *stream, uint32_t now) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    // Update stats every STATS_UPDATE_INTERVAL
+    if (now - ctx->lastStatsUpdate < STATS_UPDATE_INTERVAL) {
+        return;
+    }
+
+    // Calculate current bitrate
+    uint32_t duration = now - ctx->lastStatsUpdate;
+    if (duration > 0) {
+        stream->stats.currentBitrate = (stream->stats.bytesSent * 8000) / duration; // bps
+    }
+
+    // Reset counters
+    stream->stats.bytesSent = 0;
+    ctx->lastStatsUpdate = now;
+
+    // Update stream uptime
+    stream->stats.streamUptime = now - stream->stats.streamUptime;
+}
+
+static void check_quality(RTMPStream *stream, uint32_t now) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx || !ctx->adaptiveBitrate) return;
+
+    // Check quality every QUALITY_CHECK_INTERVAL
+    if (now - ctx->lastQualityCheck < QUALITY_CHECK_INTERVAL) {
+        return;
+    }
+
+    // Simple adaptive bitrate logic
+    uint32_t currentBitrate = stream->stats.currentBitrate;
+    RTMPStreamQuality newQuality = ctx->quality;
+
+    if (currentBitrate > ctx->maxBitrate * 0.9) {
+        // If using >90% of max bitrate, reduce quality
+        if (newQuality < RTMP_QUALITY_LOW) {
+            newQuality++;
+        }
+    } else if (currentBitrate < ctx->maxBitrate * 0.7) {
+        // If using <70% of max bitrate, increase quality
+        if (newQuality > RTMP_QUALITY_HIGH) {
+            newQuality--;
+        }
+    }
+
+    if (newQuality != ctx->quality) {
+        rtmp_stream_set_quality(stream, newQuality);
+    }
+
+    ctx->lastQualityCheck = now;
+}
+
+static void reset_stream_context(StreamContext *ctx) {
+    if (!ctx) return;
+
+    // Reset buffers
+    if (ctx->video.data) {
+        free(ctx->video.data);
+        ctx->video.data = NULL;
+    }
+    ctx->video.size = 0;
+    ctx->video.capacity = 0;
+
+    if (ctx->audio.data) {
+        free(ctx->audio.data);
+        ctx->audio.data = NULL;
+    }
+    ctx->audio.size = 0;
+    ctx->audio.capacity = 0;
+
+    // Reset timing
+    ctx->lastQualityCheck = 0;
+    ctx->lastStatsUpdate = 0;
+}
+
+// Configuration functions
+void rtmp_stream_set_video_config(RTMPStream *stream, uint32_t width, uint32_t height,
+                                uint32_t frameRate, uint32_t bitrate) {
+    if (!stream) return;
+
+    stream->config.width = width;
+    stream->config.height = height;
+    stream->config.frameRate = frameRate;
+    stream->config.videoBitrate = bitrate;
+
+    // Send updated metadata if streaming
+    if (stream->state == RTMP_STREAM_STATE_PUBLISHING) {
+        send_metadata(stream);
+    }
+}
+
+void rtmp_stream_set_audio_config(RTMPStream *stream, uint32_t sampleRate,
+                                uint32_t channels, uint32_t bitrate) {
+    if (!stream) return;
+
+    stream->config.audioBitrate = bitrate;
+    
+    // Send updated metadata if streaming
+    if (stream->state == RTMP_STREAM_STATE_PUBLISHING) {
+        send_metadata(stream);
+    }
+}
+
+void rtmp_stream_enable_audio(RTMPStream *stream, bool enable) {
+    if (!stream) return;
+    stream->config.enableAudio = enable;
+}
+
+void rtmp_stream_enable_video(RTMPStream *stream, bool enable) {
+    if (!stream) return;
+    stream->config.enableVideo = enable;
+}
+
+// Quality control functions
+void rtmp_stream_set_quality(RTMPStream *stream, RTMPStreamQuality quality) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->quality = quality;
+
+    // Adjust bitrate based on quality
+    uint32_t newBitrate;
+    switch (quality) {
+        case RTMP_QUALITY_HIGH:
+            newBitrate = ctx->maxBitrate;
+            break;
+        case RTMP_QUALITY_MEDIUM:
+            newBitrate = (ctx->maxBitrate + ctx->minBitrate) / 2;
+            break;
+        case RTMP_QUALITY_LOW:
+            newBitrate = ctx->minBitrate;
+            break;
+        case RTMP_QUALITY_AUTO:
+            // Keep current bitrate, will be adjusted automatically
+            return;
+    }
+
+    rtmp_stream_set_video_config(stream, stream->config.width, stream->config.height,
+                                stream->config.frameRate, newBitrate);
+}
+
+void rtmp_stream_set_max_bitrate(RTMPStream *stream, uint32_t bitrate) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->maxBitrate = bitrate > MIN_BITRATE ? bitrate : MIN_BITRATE;
+}
+
+void rtmp_stream_set_min_bitrate(RTMPStream *stream, uint32_t bitrate) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->minBitrate = bitrate < MAX_BITRATE ? bitrate : MAX_BITRATE;
+}
+
+void rtmp_stream_enable_adaptive_bitrate(RTMPStream *stream, bool enable) {
+    if (!stream) return;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->adaptiveBitrate = enable;
+}
+
+// Statistics functions
+RTMPStreamStats *rtmp_stream_get_stats(RTMPStream *stream) {
+    if (!stream) return NULL;
     return &stream->stats;
 }
 
-// Request keyframe
-int rtmp_stream_request_keyframe(rtmp_stream_t *stream) {
-    if (!stream) return RTMP_ERROR_INVALID_PARAM;
-    if (!stream->callbacks.request_keyframe) return RTMP_ERROR_NO_CALLBACK;
-    
-    return stream->callbacks.request_keyframe(stream->user_data);
+void rtmp_stream_reset_stats(RTMPStream *stream) {
+    if (!stream) return;
+    memset(&stream->stats, 0, sizeof(RTMPStreamStats));
 }
 
-// Set stream configuration
-int rtmp_stream_set_config(rtmp_stream_t *stream, const rtmp_stream_config_t *config) {
-    if (!stream || !config) return RTMP_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&stream->mutex);
-    memcpy(&stream->config, config, sizeof(rtmp_stream_config_t));
-    pthread_mutex_unlock(&stream->mutex);
-    
-    return RTMP_SUCCESS;
+float rtmp_stream_get_bitrate(RTMPStream *stream) {
+    if (!stream) return 0.0f;
+    return stream->stats.currentBitrate / 1000.0f; // Return in Kbps
 }
 
-// Get stream configuration
-int rtmp_stream_get_config(rtmp_stream_t *stream, rtmp_stream_config_t *config) {
-    if (!stream || !config) return RTMP_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&stream->mutex);
-    memcpy(config, &stream->config, sizeof(rtmp_stream_config_t));
-    pthread_mutex_unlock(&stream->mutex);
-    
-    return RTMP_SUCCESS;
-}
-
-// Clear stream buffer
-int rtmp_stream_clear_buffer(rtmp_stream_t *stream) {
-    if (!stream) return RTMP_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&stream->frame_buffer.mutex);
-    stream->frame_buffer.head = 0;
-    stream->frame_buffer.tail = 0;
-    pthread_mutex_unlock(&stream->frame_buffer.mutex);
-    
-    return RTMP_SUCCESS;
-}
-
-// Check if stream is active
-int rtmp_stream_is_active(rtmp_stream_t *stream) {
+uint32_t rtmp_stream_get_fps(RTMPStream *stream) {
     if (!stream) return 0;
     
-    pthread_mutex_lock(&stream->mutex);
-    int active = stream->active;
-    pthread_mutex_unlock(&stream->mutex);
-    
-    return active;
+    // Calculate FPS over the last second
+    uint32_t now = rtmp_get_timestamp();
+    if (now - stream->stats.streamUptime >= 1000) {
+        return stream->stats.videoFramesSent;
+    }
+    return 0;
 }
 
-// Get current stream quality
-float rtmp_stream_get_quality(rtmp_stream_t *stream) {
-    if (!stream) return 0.0f;
-    
-    pthread_mutex_lock(&stream->mutex);
-    float quality = stream->current_quality;
-    pthread_mutex_unlock(&stream->mutex);
-    
-    return quality;
-}
-
-// Reset stream statistics
-void rtmp_stream_reset_stats(rtmp_stream_t *stream) {
+// Buffer management functions
+void rtmp_stream_set_buffer_size(RTMPStream *stream, uint32_t size) {
     if (!stream) return;
-    
-    pthread_mutex_lock(&stream->mutex);
-    memset(&stream->stats, 0, sizeof(rtmp_stream_stats_t));
-    stream->stats.start_time = rtmp_utils_get_time_ms();
-    pthread_mutex_unlock(&stream->mutex);
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->bufferSize = size;
 }
 
-// Debug functions
-void rtmp_stream_dump_debug_info(rtmp_stream_t *stream) {
+uint32_t rtmp_stream_get_buffer_size(RTMPStream *stream) {
+    if (!stream) return 0;
+
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return 0;
+
+    return ctx->bufferSize;
+}
+
+void rtmp_stream_clear_buffers(RTMPStream *stream) {
     if (!stream) return;
-    
-    pthread_mutex_lock(&stream->mutex);
-    
-    rtmp_log_debug("=== RTMP Stream Debug Info ===");
-    rtmp_log_debug("Active: %d", stream->active);
-    rtmp_log_debug("Quality: %.2f", stream->current_quality);
-    rtmp_log_debug("Configuration:");
-    rtmp_log_debug("  Width: %d", stream->config.width);
-    rtmp_log_debug("  Height: %d", stream->config.height);
-    rtmp_log_debug("  FPS: %d", stream->config.fps);
-    rtmp_log_debug("  Bitrate: %d bps", stream->config.bitrate);
-    rtmp_log_debug("  GOP Size: %d", stream->config.gop_size);
-    
-    rtmp_log_debug("Statistics:");
-    rtmp_log_debug("  Uptime: %lu ms", stream->stats.uptime);
-    rtmp_log_debug("  Total Frames: %lu", stream->stats.total_frames);
-    rtmp_log_debug("  Processed Frames: %lu", stream->stats.processed_frames);
-    rtmp_log_debug("  Dropped Frames: %lu", stream->stats.dropped_frames);
-    rtmp_log_debug("  Failed Frames: %lu", stream->stats.failed_frames);
-    rtmp_log_debug("  Keyframes: %lu", stream->stats.keyframes);
-    rtmp_log_debug("  Bytes Received: %lu", stream->stats.bytes_received);
-    rtmp_log_debug("  Bytes Sent: %lu", stream->stats.bytes_sent);
-    rtmp_log_debug("  Current Latency: %lu ms", stream->stats.current_latency);
-    rtmp_log_debug("  Max Latency: %lu ms", stream->stats.max_latency);
-    rtmp_log_debug("  Average Bitrate: %lu bps", stream->stats.average_bitrate);
-    
-    pthread_mutex_unlock(&stream->mutex);
-}
 
-// Health check
-int rtmp_stream_health_check(rtmp_stream_t *stream) {
-    if (!stream) return RTMP_ERROR_INVALID_PARAM;
-    
-    int health_status = RTMP_SUCCESS;
-    
-    pthread_mutex_lock(&stream->mutex);
-    
-    // Check various health indicators
-    if (stream->stats.current_latency > RTMP_MAX_LATENCY * 2) {
-        health_status |= RTMP_HEALTH_HIGH_LATENCY;
-    }
-    
-    float drop_rate = (float)stream->stats.dropped_frames / stream->stats.total_frames;
-    if (drop_rate > 0.2f) {
-        health_status |= RTMP_HEALTH_HIGH_DROP_RATE;
-    }
-    
-    float failure_rate = (float)stream->stats.failed_frames / stream->stats.total_frames;
-    if (failure_rate > 0.1f) {
-        health_status |= RTMP_HEALTH_HIGH_FAILURE_RATE;
-    }
-    
-    if (stream->current_quality < 0.5f) {
-        health_status |= RTMP_HEALTH_LOW_QUALITY;
-    }
-    
-    pthread_mutex_unlock(&stream->mutex);
-    
-    return health_status;
+    StreamContext *ctx = (StreamContext *)stream->userData;
+    if (!ctx) return;
+
+    ctx->video.size = 0;
+    ctx->audio.size = 0;
 }

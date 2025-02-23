@@ -1,143 +1,122 @@
-#ifndef _RTMP_PROTOCOL_H
-#define _RTMP_PROTOCOL_H
+#ifndef RTMP_PROTOCOL_H
+#define RTMP_PROTOCOL_H
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "rtmp_chunk.h"
+#include "rtmp_utils.h"
 
 // Protocol constants
-#define RTMP_VERSION                 3
-#define RTMP_HANDSHAKE_SIZE         1536
-#define RTMP_DEFAULT_PORT           1935
-#define RTMP_DEFAULT_TIMEOUT        30000  // 30 seconds
-#define RTMP_MAX_CHANNELS          65600
+#define RTMP_VERSION           3
+#define RTMP_HANDSHAKE_SIZE   1536
+#define RTMP_CHUNK_SIZE       128
+#define RTMP_DEFAULT_PORT     1935
 
 // Message types
-#define RTMP_MSG_SET_CHUNK_SIZE     1
-#define RTMP_MSG_ABORT              2
-#define RTMP_MSG_ACKNOWLEDGEMENT    3
-#define RTMP_MSG_USER_CONTROL       4
-#define RTMP_MSG_WINDOW_ACK_SIZE    5
-#define RTMP_MSG_SET_PEER_BW        6
-#define RTMP_MSG_AUDIO              8
-#define RTMP_MSG_VIDEO              9
-#define RTMP_MSG_DATA_AMF3          15
-#define RTMP_MSG_SHARED_OBJ_AMF3    16
-#define RTMP_MSG_COMMAND_AMF3       17
-#define RTMP_MSG_DATA_AMF0          18
-#define RTMP_MSG_SHARED_OBJ_AMF0    19
-#define RTMP_MSG_COMMAND_AMF0       20
-#define RTMP_MSG_AGGREGATE          22
-
-// User control message types
-#define RTMP_USER_STREAM_BEGIN      0
-#define RTMP_USER_STREAM_EOF        1
-#define RTMP_USER_STREAM_DRY        2
-#define RTMP_USER_SET_BUFFER_LEN    3
-#define RTMP_USER_STREAM_IS_REC     4
-#define RTMP_USER_PING_REQUEST      6
-#define RTMP_USER_PING_RESPONSE     7
-
-// Protocol states
 typedef enum {
-    RTMP_STATE_UNINITIALIZED = 0,
-    RTMP_STATE_VERSION_SENT,
-    RTMP_STATE_ACK_SENT,
-    RTMP_STATE_HANDSHAKE_DONE,
-    RTMP_STATE_CONNECT_PENDING,
-    RTMP_STATE_CONNECTED,
-    RTMP_STATE_DISCONNECTED,
-    RTMP_STATE_ERROR
-} rtmp_state_t;
+    RTMP_MSG_CHUNK_SIZE = 1,
+    RTMP_MSG_ABORT = 2,
+    RTMP_MSG_ACK = 3,
+    RTMP_MSG_USER_CONTROL = 4,
+    RTMP_MSG_WINDOW_ACK_SIZE = 5,
+    RTMP_MSG_SET_PEER_BW = 6,
+    RTMP_MSG_AUDIO = 8,
+    RTMP_MSG_VIDEO = 9,
+    RTMP_MSG_DATA_AMF3 = 15,
+    RTMP_MSG_SHARED_OBJ_AMF3 = 16,
+    RTMP_MSG_COMMAND_AMF3 = 17,
+    RTMP_MSG_DATA_AMF0 = 18,
+    RTMP_MSG_SHARED_OBJ_AMF0 = 19,
+    RTMP_MSG_COMMAND_AMF0 = 20,
+    RTMP_MSG_AGGREGATE = 22
+} RTMPMessageType;
 
-// Error codes
+// Chunk stream types
 typedef enum {
-    RTMP_ERROR_OK = 0,
-    RTMP_ERROR_INVALID_STATE = -1,
-    RTMP_ERROR_SOCKET = -2,
-    RTMP_ERROR_HANDSHAKE = -3,
-    RTMP_ERROR_CONNECT = -4,
-    RTMP_ERROR_STREAM = -5,
-    RTMP_ERROR_CHUNK = -6,
-    RTMP_ERROR_PROTOCOL = -7,
-    RTMP_ERROR_MEMORY = -8,
-    RTMP_ERROR_TIMEOUT = -9
-} rtmp_error_t;
+    RTMP_CHUNK_TYPE_0 = 0, // Full header
+    RTMP_CHUNK_TYPE_1 = 1, // Timestamp delta
+    RTMP_CHUNK_TYPE_2 = 2, // Timestamp delta only
+    RTMP_CHUNK_TYPE_3 = 3  // No header
+} RTMPChunkType;
 
-// Protocol configuration
+// RTMP connection states
+typedef enum {
+    RTMP_STATE_DISCONNECTED = 0,
+    RTMP_STATE_HANDSHAKE_INIT,
+    RTMP_STATE_HANDSHAKE_ACK,
+    RTMP_STATE_CONNECT,
+    RTMP_STATE_CREATE_STREAM,
+    RTMP_STATE_PUBLISH,
+    RTMP_STATE_PLAY,
+    RTMP_STATE_CONNECTED
+} RTMPState;
+
+// RTMP connection settings
 typedef struct {
-    uint32_t chunk_size;
-    uint32_t window_size;
-    uint32_t peer_bandwidth;
-    uint8_t peer_bandwidth_limit_type;
-    bool tcp_nodelay;
-    uint32_t timeout_ms;
-} rtmp_config_t;
+    char app[128];
+    char tcUrl[256];
+    char swfUrl[256];
+    char pageUrl[256];
+    char streamName[128];
+    bool publish;
+    uint32_t windowAckSize;
+    uint32_t peerBandwidth;
+    uint8_t limitType;
+} RTMPSettings;
 
-// Protocol statistics
-typedef struct {
-    uint64_t bytes_in;
-    uint64_t bytes_out;
-    uint32_t messages_in;
-    uint32_t messages_out;
-    uint32_t chunks_in;
-    uint32_t chunks_out;
-    uint32_t handshake_time_ms;
-    uint32_t connect_time_ms;
-    float bandwidth_in;
-    float bandwidth_out;
-} rtmp_stats_t;
+// RTMP connection context
+typedef struct RTMPContext {
+    int socket;
+    RTMPState state;
+    RTMPSettings settings;
+    uint32_t chunkSize;
+    uint32_t streamId;
+    uint32_t numInvokes;
+    uint32_t windowAckSize;
+    uint32_t bytesReceived;
+    uint32_t lastAckSize;
+    uint8_t *handshakeBuffer;
+    void *userData;
+    
+    // Callbacks
+    void (*onStateChange)(struct RTMPContext *ctx, RTMPState state);
+    void (*onError)(struct RTMPContext *ctx, RTMPError error);
+    void (*onPacket)(struct RTMPContext *ctx, RTMPPacket *packet);
+} RTMPContext;
 
-// Protocol context
-typedef struct rtmp_context_t rtmp_context_t;
-
-// Protocol callbacks
-typedef struct {
-    void (*on_state_change)(rtmp_context_t *ctx, rtmp_state_t old_state, rtmp_state_t new_state);
-    void (*on_chunk_received)(rtmp_context_t *ctx, rtmp_chunk_t *chunk);
-    void (*on_message_received)(rtmp_context_t *ctx, uint8_t type, uint32_t stream_id, const uint8_t *data, size_t len);
-    void (*on_error)(rtmp_context_t *ctx, rtmp_error_t error, const char *message);
-    void (*on_command)(rtmp_context_t *ctx, const char *command, const uint8_t *data, size_t len);
-} rtmp_callbacks_t;
-
-// Protocol functions
-rtmp_context_t* rtmp_create(const rtmp_config_t *config, const rtmp_callbacks_t *callbacks);
-void rtmp_destroy(rtmp_context_t *ctx);
-
-// Connection management
-rtmp_error_t rtmp_connect(rtmp_context_t *ctx, const char *host, uint16_t port);
-rtmp_error_t rtmp_disconnect(rtmp_context_t *ctx);
-bool rtmp_is_connected(const rtmp_context_t *ctx);
-
-// Handshake
-rtmp_error_t rtmp_handshake(rtmp_context_t *ctx);
-bool rtmp_is_handshake_done(const rtmp_context_t *ctx);
+// Core protocol functions
+RTMPContext *rtmp_create(void);
+void rtmp_destroy(RTMPContext *ctx);
+bool rtmp_connect(RTMPContext *ctx, const char *host, int port);
+void rtmp_disconnect(RTMPContext *ctx);
+bool rtmp_is_connected(RTMPContext *ctx);
 
 // Message handling
-rtmp_error_t rtmp_send_message(rtmp_context_t *ctx, uint8_t type, uint32_t stream_id, const uint8_t *data, size_t len);
-rtmp_error_t rtmp_send_command(rtmp_context_t *ctx, const char *command, const uint8_t *data, size_t len);
-rtmp_error_t rtmp_send_video(rtmp_context_t *ctx, const uint8_t *data, size_t len, uint32_t timestamp);
-rtmp_error_t rtmp_send_audio(rtmp_context_t *ctx, const uint8_t *data, size_t len, uint32_t timestamp);
+bool rtmp_send_packet(RTMPContext *ctx, RTMPPacket *packet);
+bool rtmp_read_packet(RTMPContext *ctx, RTMPPacket *packet);
+void rtmp_handle_packet(RTMPContext *ctx, RTMPPacket *packet);
 
-// Stream control
-rtmp_error_t rtmp_create_stream(rtmp_context_t *ctx, uint32_t *stream_id);
-rtmp_error_t rtmp_delete_stream(rtmp_context_t *ctx, uint32_t stream_id);
-rtmp_error_t rtmp_publish(rtmp_context_t *ctx, uint32_t stream_id, const char *name, const char *type);
-rtmp_error_t rtmp_play(rtmp_context_t *ctx, uint32_t stream_id, const char *name);
-rtmp_error_t rtmp_pause(rtmp_context_t *ctx, uint32_t stream_id, bool pause);
+// Command functions
+bool rtmp_send_connect(RTMPContext *ctx);
+bool rtmp_send_create_stream(RTMPContext *ctx);
+bool rtmp_send_publish(RTMPContext *ctx);
+bool rtmp_send_play(RTMPContext *ctx);
+bool rtmp_send_pause(RTMPContext *ctx, bool pause);
+bool rtmp_send_seek(RTMPContext *ctx, uint32_t ms);
 
-// Flow control
-rtmp_error_t rtmp_set_chunk_size(rtmp_context_t *ctx, uint32_t size);
-rtmp_error_t rtmp_set_window_size(rtmp_context_t *ctx, uint32_t size);
-rtmp_error_t rtmp_set_peer_bandwidth(rtmp_context_t *ctx, uint32_t size, uint8_t limit_type);
+// Control messages
+bool rtmp_send_chunk_size(RTMPContext *ctx, uint32_t size);
+bool rtmp_send_ack(RTMPContext *ctx, uint32_t size);
+bool rtmp_send_window_ack_size(RTMPContext *ctx, uint32_t size);
+bool rtmp_send_set_peer_bandwidth(RTMPContext *ctx, uint32_t size, uint8_t type);
 
-// Status and statistics
-rtmp_state_t rtmp_get_state(const rtmp_context_t *ctx);
-const rtmp_stats_t* rtmp_get_stats(const rtmp_context_t *ctx);
-const char* rtmp_get_error_string(rtmp_error_t error);
+// Media functions
+bool rtmp_send_audio(RTMPContext *ctx, const uint8_t *data, size_t size, uint32_t timestamp);
+bool rtmp_send_video(RTMPContext *ctx, const uint8_t *data, size_t size, uint32_t timestamp);
+bool rtmp_send_metadata(RTMPContext *ctx, const char *name, const AMFObject *obj);
 
 // Utility functions
-bool rtmp_is_valid_message_type(uint8_t type);
-const char* rtmp_get_message_type_string(uint8_t type);
+void rtmp_set_chunk_size(RTMPContext *ctx, uint32_t size);
+void rtmp_set_window_ack_size(RTMPContext *ctx, uint32_t size);
+void rtmp_set_stream_id(RTMPContext *ctx, uint32_t streamId);
 
-#endif /* _RTMP_PROTOCOL_H */
+#endif /* RTMP_PROTOCOL_H */

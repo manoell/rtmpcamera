@@ -6,21 +6,19 @@
     <dict>
         <key>Bundles</key>
         <array>
-            <string>com.apple.UIKit</string>
-            <string>com.apple.AVFoundation</string>
             <string>com.apple.camera</string>
+            <string>com.apple.springboard</string>
         </array>
         <key>Executables</key>
         <array>
-            <string>SpringBoard</string>
             <string>Camera</string>
+            <string>SpringBoard</string>
         </array>
         <key>Classes</key>
         <array>
-            <string>AVCaptureDevice</string>
             <string>AVCaptureSession</string>
+            <string>AVCaptureDevice</string>
             <string>AVCaptureVideoPreviewLayer</string>
-            <string>UIImagePickerController</string>
         </array>
         <key>Mode</key>
         <string>Any</string>

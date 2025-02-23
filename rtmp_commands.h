@@ -1,163 +1,64 @@
 #ifndef RTMP_COMMANDS_H
 #define RTMP_COMMANDS_H
 
+#include <stdint.h>
 #include "rtmp_core.h"
-#include "rtmp_amf.h"
 
-// Error codes
-#define RTMP_ERROR_INVALID_PARAM -1
-#define RTMP_ERROR_HANDLER -2
-#define RTMP_ERROR_NO_HANDLER -3
-#define RTMP_ERROR_UNHANDLED_COMMAND -4
-#define RTMP_ERROR_MEMORY -5
+// Tipos de comandos RTMP
+typedef enum {
+    RTMP_CMD_CONNECT = 1,
+    RTMP_CMD_CREATESTREAM,
+    RTMP_CMD_PUBLISH,
+    RTMP_CMD_PLAY,
+    RTMP_CMD_PAUSE,
+    RTMP_CMD_SEEK,
+    RTMP_CMD_CLOSESTREAM,
+    RTMP_CMD_DELETESTREAM,
+    RTMP_CMD_RESULT,
+    RTMP_CMD_ERROR,
+    RTMP_CMD_PING,
+    RTMP_CMD_PONG,
+    RTMP_CMD_CUSTOM
+} rtmp_command_type_t;
 
-// Forward declaration
-typedef struct rtmp_command_context rtmp_command_context_t;
-
-// Connect parameters
+// Estrutura do comando
 typedef struct {
-    const char *swf_url;
-    const char *tc_url;
-    const char *page_url;
-    double object_encoding;
-} rtmp_connect_params_t;
+    rtmp_command_type_t type;
+    uint32_t transaction_id;
+    char *command_name;
+    void *command_object;
+    void *optional_args;
+    size_t optional_args_size;
+} rtmp_command_t;
 
-// Callback types
-typedef int (*rtmp_command_callback)(rtmp_connection_t *conn,
-                                   const char *command_name,
-                                   const rtmp_amf_object_t *command_object,
-                                   const rtmp_amf_object_t *info_object,
-                                   void *user_data);
+// Funções de criação de comandos
+rtmp_command_t* rtmp_command_create(rtmp_command_type_t type);
+void rtmp_command_destroy(rtmp_command_t *cmd);
 
-typedef int (*rtmp_status_callback)(rtmp_connection_t *conn,
-                                  const rtmp_amf_object_t *info_object,
-                                  void *user_data);
+// Funções de codificação/decodificação
+int rtmp_command_encode(const rtmp_command_t *cmd, uint8_t *buffer, size_t *size);
+int rtmp_command_decode(const uint8_t *buffer, size_t size, rtmp_command_t *cmd);
 
-// Initialize/cleanup
-rtmp_command_context_t* rtmp_command_init(void);
-void rtmp_command_cleanup(rtmp_command_context_t *ctx);
+// Funções de comandos específicos
+int rtmp_command_connect(rtmp_command_t *cmd, const char *app_name, const char *tc_url);
+int rtmp_command_create_stream(rtmp_command_t *cmd, uint32_t transaction_id);
+int rtmp_command_publish(rtmp_command_t *cmd, const char *stream_name, const char *stream_type);
+int rtmp_command_play(rtmp_command_t *cmd, const char *stream_name, double start, double duration);
+int rtmp_command_pause(rtmp_command_t *cmd, int pause_state, double milliseconds);
+int rtmp_command_seek(rtmp_command_t *cmd, double milliseconds);
+int rtmp_command_close_stream(rtmp_command_t *cmd, uint32_t stream_id);
+int rtmp_command_delete_stream(rtmp_command_t *cmd, uint32_t stream_id);
 
-// Command functions
-int rtmp_command_connect(rtmp_connection_t *conn,
-                        const char *app,
-                        const rtmp_connect_params_t *params,
-                        rtmp_command_callback callback,
-                        void *user_data);
+// Funções de resultado/erro
+int rtmp_command_send_result(rtmp_command_t *cmd, uint32_t transaction_id, void *result);
+int rtmp_command_send_error(rtmp_command_t *cmd, uint32_t transaction_id, const char *error);
 
-int rtmp_command_create_stream(rtmp_connection_t *conn,
-                             rtmp_command_callback callback,
-                             void *user_data);
+// Funções de controle
+int rtmp_command_handle(rtmp_connection_t *conn, const rtmp_command_t *cmd);
+int rtmp_command_process(rtmp_connection_t *conn, const uint8_t *data, size_t size);
 
-int rtmp_command_publish(rtmp_connection_t *conn,
-                        double stream_id,
-                        const char *name,
-                        const char *type,
-                        rtmp_command_callback callback,
-                        void *user_data);
-
-int rtmp_command_play(rtmp_connection_t *conn,
-                     double stream_id,
-                     const char *name,
-                     double start,
-                     double duration,
-                     rtmp_command_callback callback,
-                     void *user_data);
-
-int rtmp_command_pause(rtmp_connection_t *conn,
-                      double stream_id,
-                      bool pause,
-                      double milliseconds,
-                      rtmp_command_callback callback,
-                      void *user_data);
-
-int rtmp_command_seek(rtmp_connection_t *conn,
-                     double stream_id,
-                     double milliseconds,
-                     rtmp_command_callback callback,
-                     void *user_data);
-
-int rtmp_command_close_stream(rtmp_connection_t *conn,
-                            double stream_id,
-                            rtmp_command_callback callback,
-                            void *user_data);
-
-int rtmp_command_release_stream(rtmp_connection_t *conn,
-                              const char *name,
-                              rtmp_command_callback callback,
-                              void *user_data);
-
-// Command handling
-int rtmp_command_handle(rtmp_connection_t *conn,
-                       const char *command_name,
-                       double transaction_id,
-                       const rtmp_amf_object_t *command_object,
-                       const rtmp_amf_object_t *info_object);
-
-// Callback registration
-void rtmp_command_set_callback(rtmp_connection_t *conn,
-                             rtmp_command_callback callback,
-                             void *user_data);
-
-void rtmp_command_set_status_callback(rtmp_connection_t *conn,
-                                    rtmp_status_callback callback,
-                                    void *user_data);
-
-// Command statistics
-typedef struct {
-    uint32_t commands_sent;
-    uint32_t commands_received;
-    uint32_t errors;
-    uint32_t timeouts;
-    double average_response_time;
-} rtmp_command_stats_t;
-
-// Get command statistics
-void rtmp_command_get_stats(rtmp_connection_t *conn,
-                          rtmp_command_stats_t *stats);
-
-// Command debugging
-typedef struct {
-    bool log_commands;           // Log all commands
-    bool log_responses;          // Log all responses
-    bool log_transactions;       // Log transaction IDs
-    bool dump_amf;              // Dump AMF objects
-    int log_level;              // Debug log level
-} rtmp_command_debug_t;
-
-// Set debug options
-void rtmp_command_set_debug(rtmp_connection_t *conn,
-                          const rtmp_command_debug_t *debug);
-
-// Transaction tracking
-typedef struct {
-    double transaction_id;
-    char command_name[32];
-    uint64_t timestamp;
-    uint32_t retries;
-    bool completed;
-} rtmp_transaction_info_t;
-
-// Get active transactions
-int rtmp_command_get_transactions(rtmp_connection_t *conn,
-                                rtmp_transaction_info_t *transactions,
-                                size_t *count);
-
-// Command queue management
-int rtmp_command_queue_size(rtmp_connection_t *conn);
-void rtmp_command_queue_clear(rtmp_connection_t *conn);
-int rtmp_command_queue_flush(rtmp_connection_t *conn);
-
-// Advanced options
-typedef struct {
-    uint32_t retry_count;        // Max retries for failed commands
-    uint32_t retry_delay;        // Delay between retries (ms)
-    uint32_t timeout;           // Command timeout (ms)
-    uint32_t queue_size;        // Maximum command queue size
-    bool auto_retry;            // Auto retry failed commands
-} rtmp_command_options_t;
-
-// Set command options
-void rtmp_command_set_options(rtmp_connection_t *conn,
-                            const rtmp_command_options_t *options);
+// Funções de notificação
+int rtmp_command_send_status(rtmp_connection_t *conn, const char *level, const char *code, const char *description);
+int rtmp_command_send_metadata(rtmp_connection_t *conn, const char *name, const void *data, size_t size);
 
 #endif // RTMP_COMMANDS_H

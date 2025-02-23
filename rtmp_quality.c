@@ -1,248 +1,325 @@
 #include "rtmp_quality.h"
 #include "rtmp_utils.h"
-#include "rtmp_diagnostics.h"
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <pthread.h>
 
-#define RTMP_QUALITY_CHECK_INTERVAL 1000  // Check every 1 second
-#define RTMP_QUALITY_HISTORY_SIZE 30      // Keep 30 seconds of history
-#define RTMP_MIN_BITRATE 100000           // 100 Kbps
-#define RTMP_MAX_BITRATE 10000000         // 10 Mbps
-#define RTMP_MIN_FPS 10
-#define RTMP_MAX_FPS 60
+#define QUALITY_CHECK_INTERVAL 5000 // 5 seconds
+#define BUFFER_HEALTH_TARGET 3000   // 3 seconds
+#define MAX_LATENCY 5000           // 5 seconds
+#define MIN_KEYFRAME_INTERVAL 2000 // 2 seconds
 
-typedef struct {
-    float network_quality;
-    float processing_quality;
-    float overall_quality;
-    uint64_t timestamp;
-} quality_sample_t;
-
-struct rtmp_quality_controller {
-    pthread_mutex_t mutex;
-    quality_sample_t history[RTMP_QUALITY_HISTORY_SIZE];
-    size_t history_index;
-    rtmp_quality_config_t config;
-    rtmp_quality_stats_t stats;
-    rtmp_quality_callbacks_t callbacks;
-    void *user_data;
-    uint64_t last_check_time;
-    int active;
+struct RTMPQualityController {
+    RTMPContext *rtmp;
+    RTMPQualityConfig config;
+    RTMPQualityStats stats;
+    uint32_t lastCheck;
+    uint32_t lastKeyframe;
+    RTMPQualityCallback callback;
+    void *userData;
 };
 
-// Create quality controller
-rtmp_quality_controller_t* rtmp_quality_create(const rtmp_quality_config_t *config) {
-    rtmp_quality_controller_t *controller = calloc(1, sizeof(rtmp_quality_controller_t));
-    if (!controller) {
-        rtmp_log_error("Failed to allocate quality controller");
-        return NULL;
-    }
+// Private helper functions
+static void adjust_quality(RTMPQualityController *ctrl);
+static void apply_quality_level(RTMPQualityController *ctrl, RTMPQualityLevel level);
+static uint32_t calculate_optimal_bitrate(RTMPQualityController *ctrl);
+static uint32_t calculate_optimal_fps(RTMPQualityController *ctrl);
+static bool should_increase_quality(RTMPQualityController *ctrl);
+static bool should_decrease_quality(RTMPQualityController *ctrl);
+
+RTMPQualityController *rtmp_quality_create(RTMPContext *rtmp) {
+    if (!rtmp) return NULL;
+
+    RTMPQualityController *ctrl = (RTMPQualityController *)calloc(1, sizeof(RTMPQualityController));
+    if (!ctrl) return NULL;
+
+    ctrl->rtmp = rtmp;
     
-    if (pthread_mutex_init(&controller->mutex, NULL) != 0) {
-        free(controller);
-        return NULL;
-    }
-    
-    // Set default configuration if none provided
-    if (config) {
-        memcpy(&controller->config, config, sizeof(rtmp_quality_config_t));
-    } else {
-        controller->config.target_quality = 1.0f;
-        controller->config.min_quality = 0.1f;
-        controller->config.adjust_threshold = 0.1f;
-        controller->config.network_weight = 0.6f;
-        controller->config.processing_weight = 0.4f;
-    }
-    
-    controller->last_check_time = rtmp_utils_get_time_ms();
-    
-    return controller;
+    // Set default configuration
+    ctrl->config.level = RTMP_QUALITY_LEVEL_AUTO;
+    ctrl->config.targetBitrate = RTMP_QUALITY_MEDIUM_BITRATE;
+    ctrl->config.targetFPS = RTMP_QUALITY_MEDIUM_FPS;
+    ctrl->config.keyframeInterval = 2000;
+    ctrl->config.width = 1280;
+    ctrl->config.height = 720;
+    ctrl->config.adaptiveBitrate = true;
+    ctrl->config.adaptiveFPS = true;
+
+    return ctrl;
 }
 
-// Update network metrics
-void rtmp_quality_update_network(rtmp_quality_controller_t *controller,
-                               const rtmp_network_metrics_t *metrics) {
-    if (!controller || !metrics) return;
-    
-    pthread_mutex_lock(&controller->mutex);
-    
-    // Calculate network quality score (0.0 - 1.0)
-    float latency_score = metrics->latency > 0 ? 
-        1.0f - fminf(metrics->latency / 1000.0f, 1.0f) : 1.0f;
-    
-    float packet_loss_score = 1.0f - metrics->packet_loss_rate;
-    
-    float bandwidth_score = metrics->available_bandwidth > 0 ?
-        fminf(metrics->current_bitrate / (float)metrics->available_bandwidth, 1.0f) : 1.0f;
-    
-    // Weighted average of metrics
-    float network_quality = latency_score * 0.4f + 
-                          packet_loss_score * 0.4f +
-                          bandwidth_score * 0.2f;
-    
-    // Update current sample
-    controller->history[controller->history_index].network_quality = network_quality;
-    controller->history[controller->history_index].timestamp = rtmp_utils_get_time_ms();
-    
-    // Update statistics
-    controller->stats.current_latency = metrics->latency;
-    controller->stats.packet_loss_rate = metrics->packet_loss_rate;
-    controller->stats.current_bitrate = metrics->current_bitrate;
-    controller->stats.available_bandwidth = metrics->available_bandwidth;
-    
-    pthread_mutex_unlock(&controller->mutex);
+void rtmp_quality_destroy(RTMPQualityController *ctrl) {
+    free(ctrl);
 }
 
-// Update processing metrics
-void rtmp_quality_update_processing(rtmp_quality_controller_t *controller,
-                                  const rtmp_processing_metrics_t *metrics) {
-    if (!controller || !metrics) return;
-    
-    pthread_mutex_lock(&controller->mutex);
-    
-    // Calculate processing quality score (0.0 - 1.0)
-    float frame_drop_score = 1.0f - fminf(metrics->frame_drop_rate, 1.0f);
-    float processing_delay_score = metrics->processing_delay > 0 ?
-        1.0f - fminf(metrics->processing_delay / 100.0f, 1.0f) : 1.0f;
-    float cpu_usage_score = 1.0f - fminf(metrics->cpu_usage / 100.0f, 1.0f);
-    
-    // Weighted average of metrics
-    float processing_quality = frame_drop_score * 0.4f +
-                             processing_delay_score * 0.3f +
-                             cpu_usage_score * 0.3f;
-    
-    // Update current sample
-    controller->history[controller->history_index].processing_quality = processing_quality;
-    
-    // Calculate overall quality
-    float network_quality = controller->history[controller->history_index].network_quality;
-    float overall_quality = network_quality * controller->config.network_weight +
-                           processing_quality * controller->config.processing_weight;
-    
-    controller->history[controller->history_index].overall_quality = overall_quality;
-    
-    // Update index
-    controller->history_index = (controller->history_index + 1) % RTMP_QUALITY_HISTORY_SIZE;
-    
-    // Update statistics
-    controller->stats.frame_drop_rate = metrics->frame_drop_rate;
-    controller->stats.processing_delay = metrics->processing_delay;
-    controller->stats.cpu_usage = metrics->cpu_usage;
-    controller->stats.current_quality = overall_quality;
-    
-    // Check if quality adjustment is needed
-    uint64_t current_time = rtmp_utils_get_time_ms();
-    if (current_time - controller->last_check_time >= RTMP_QUALITY_CHECK_INTERVAL) {
-        rtmp_quality_check_adjust(controller);
-        controller->last_check_time = current_time;
+void rtmp_quality_set_level(RTMPQualityController *ctrl, RTMPQualityLevel level) {
+    if (!ctrl) return;
+
+    if (ctrl->config.level != level) {
+        ctrl->config.level = level;
+        apply_quality_level(ctrl, level);
     }
-    
-    pthread_mutex_unlock(&controller->mutex);
 }
 
-// Check and adjust quality if needed
-static void rtmp_quality_check_adjust(rtmp_quality_controller_t *controller) {
-    // Calculate average quality over history
-    float sum_quality = 0;
-    int valid_samples = 0;
-    
-    for (int i = 0; i < RTMP_QUALITY_HISTORY_SIZE; i++) {
-        if (controller->history[i].timestamp > 0) {
-            sum_quality += controller->history[i].overall_quality;
-            valid_samples++;
+void rtmp_quality_set_target_bitrate(RTMPQualityController *ctrl, uint32_t bitrate) {
+    if (!ctrl) return;
+    ctrl->config.targetBitrate = bitrate;
+}
+
+void rtmp_quality_set_target_fps(RTMPQualityController *ctrl, uint32_t fps) {
+    if (!ctrl) return;
+    ctrl->config.targetFPS = fps;
+}
+
+void rtmp_quality_set_keyframe_interval(RTMPQualityController *ctrl, uint32_t interval) {
+    if (!ctrl) return;
+    ctrl->config.keyframeInterval = interval;
+}
+
+void rtmp_quality_set_resolution(RTMPQualityController *ctrl, uint32_t width, uint32_t height) {
+    if (!ctrl) return;
+    ctrl->config.width = width;
+    ctrl->config.height = height;
+}
+
+void rtmp_quality_enable_adaptive_bitrate(RTMPQualityController *ctrl, bool enable) {
+    if (!ctrl) return;
+    ctrl->config.adaptiveBitrate = enable;
+}
+
+void rtmp_quality_enable_adaptive_fps(RTMPQualityController *ctrl, bool enable) {
+    if (!ctrl) return;
+    ctrl->config.adaptiveFPS = enable;
+}
+
+RTMPQualityStats *rtmp_quality_get_stats(RTMPQualityController *ctrl) {
+    if (!ctrl) return NULL;
+    return &ctrl->stats;
+}
+
+void rtmp_quality_reset_stats(RTMPQualityController *ctrl) {
+    if (!ctrl) return;
+    memset(&ctrl->stats, 0, sizeof(RTMPQualityStats));
+}
+
+void rtmp_quality_update_bitrate(RTMPQualityController *ctrl, uint32_t bytes, uint32_t duration) {
+    if (!ctrl || !duration) return;
+    ctrl->stats.currentBitrate = (bytes * 8 * 1000) / duration;
+}
+
+void rtmp_quality_update_fps(RTMPQualityController *ctrl, uint32_t frames, uint32_t duration) {
+    if (!ctrl || !duration) return;
+    ctrl->stats.currentFPS = (frames * 1000) / duration;
+}
+
+void rtmp_quality_add_dropped_frame(RTMPQualityController *ctrl) {
+    if (!ctrl) return;
+    ctrl->stats.droppedFrames++;
+}
+
+void rtmp_quality_add_keyframe(RTMPQualityController *ctrl) {
+    if (!ctrl) return;
+    ctrl->stats.keyframesSent++;
+    ctrl->lastKeyframe = rtmp_get_timestamp();
+}
+
+void rtmp_quality_update_buffer(RTMPQualityController *ctrl, uint32_t size) {
+    if (!ctrl) return;
+    ctrl->stats.bufferHealth = size;
+}
+
+void rtmp_quality_update_timing(RTMPQualityController *ctrl, uint32_t encodeTime, uint32_t sendTime) {
+    if (!ctrl) return;
+    ctrl->stats.encodingTime = encodeTime;
+    ctrl->stats.sendingTime = sendTime;
+}
+
+void rtmp_quality_update_latency(RTMPQualityController *ctrl, uint32_t latency) {
+    if (!ctrl) return;
+    ctrl->stats.latency = latency;
+}
+
+void rtmp_quality_check_and_adjust(RTMPQualityController *ctrl) {
+    if (!ctrl) return;
+
+    uint32_t now = rtmp_get_timestamp();
+    if (now - ctrl->lastCheck < QUALITY_CHECK_INTERVAL) {
+        return;
+    }
+
+    ctrl->lastCheck = now;
+
+    if (ctrl->config.level == RTMP_QUALITY_LEVEL_AUTO) {
+        adjust_quality(ctrl);
+    }
+}
+
+bool rtmp_quality_should_drop_frame(RTMPQualityController *ctrl) {
+    if (!ctrl) return false;
+
+    if (ctrl->stats.bufferHealth > BUFFER_HEALTH_TARGET * 2) {
+        return true;
+    }
+
+    if (ctrl->stats.currentFPS > ctrl->config.targetFPS * 1.1) {
+        return true;
+    }
+
+    if (ctrl->stats.encodingTime + ctrl->stats.sendingTime > 1000/ctrl->config.targetFPS) {
+        return true;
+    }
+
+    return false;
+}
+
+bool rtmp_quality_should_send_keyframe(RTMPQualityController *ctrl) {
+    if (!ctrl) return false;
+
+    uint32_t now = rtmp_get_timestamp();
+    return (now - ctrl->lastKeyframe >= ctrl->config.keyframeInterval);
+}
+
+uint32_t rtmp_quality_get_target_bitrate(RTMPQualityController *ctrl) {
+    if (!ctrl) return RTMP_QUALITY_MEDIUM_BITRATE;
+    return ctrl->config.targetBitrate;
+}
+
+uint32_t rtmp_quality_get_target_fps(RTMPQualityController *ctrl) {
+    if (!ctrl) return RTMP_QUALITY_MEDIUM_FPS;
+    return ctrl->config.targetFPS;
+}
+
+void rtmp_quality_set_callback(RTMPQualityController *ctrl, RTMPQualityCallback callback, void *userData) {
+    if (!ctrl) return;
+    ctrl->callback = callback;
+    ctrl->userData = userData;
+}
+
+static void adjust_quality(RTMPQualityController *ctrl) {
+    if (!ctrl) return;
+
+    RTMPQualityLevel newLevel = ctrl->config.level;
+
+    if (should_decrease_quality(ctrl)) {
+        if (newLevel > RTMP_QUALITY_LEVEL_LOW) {
+            newLevel--;
+        }
+    } else if (should_increase_quality(ctrl)) {
+        if (newLevel < RTMP_QUALITY_LEVEL_HIGH) {
+            newLevel++;
         }
     }
-    
-    if (valid_samples == 0) return;
-    
-    float avg_quality = sum_quality / valid_samples;
-    float quality_diff = fabs(avg_quality - controller->config.target_quality);
-    
-    // Check if adjustment is needed
-    if (quality_diff > controller->config.adjust_threshold) {
-        // Calculate new quality target
-        float new_quality = avg_quality < controller->config.target_quality ?
-            fmaxf(avg_quality - controller->config.adjust_threshold, controller->config.min_quality) :
-            fminf(avg_quality + controller->config.adjust_threshold, 1.0f);
+
+    if (newLevel != ctrl->config.level) {
+        apply_quality_level(ctrl, newLevel);
         
-        // Calculate new parameters
-        rtmp_quality_params_t new_params;
-        new_params.bitrate = (int)(RTMP_MAX_BITRATE * new_quality);
-        new_params.fps = (int)(RTMP_MIN_FPS + (RTMP_MAX_FPS - RTMP_MIN_FPS) * new_quality);
-        new_params.quality = new_quality;
-        
-        // Ensure minimum values
-        if (new_params.bitrate < RTMP_MIN_BITRATE) new_params.bitrate = RTMP_MIN_BITRATE;
-        if (new_params.fps < RTMP_MIN_FPS) new_params.fps = RTMP_MIN_FPS;
-        
-        // Notify through callback
-        if (controller->callbacks.quality_adjusted) {
-            controller->callbacks.quality_adjusted(&new_params, controller->user_data);
+        if (ctrl->callback) {
+            ctrl->callback(ctrl, newLevel, ctrl->userData);
         }
-        
-        // Update statistics
-        controller->stats.quality_adjustments++;
-        controller->stats.last_adjustment_time = rtmp_utils_get_time_ms();
     }
 }
 
-// Set callbacks
-void rtmp_quality_set_callbacks(rtmp_quality_controller_t *controller,
-                              const rtmp_quality_callbacks_t *callbacks,
-                              void *user_data) {
-    if (!controller || !callbacks) return;
-    
-    pthread_mutex_lock(&controller->mutex);
-    memcpy(&controller->callbacks, callbacks, sizeof(rtmp_quality_callbacks_t));
-    controller->user_data = user_data;
-    pthread_mutex_unlock(&controller->mutex);
+static void apply_quality_level(RTMPQualityController *ctrl, RTMPQualityLevel level) {
+    if (!ctrl) return;
+
+    switch (level) {
+        case RTMP_QUALITY_LEVEL_LOW:
+            ctrl->config.targetBitrate = RTMP_QUALITY_LOW_BITRATE;
+            ctrl->config.targetFPS = RTMP_QUALITY_LOW_FPS;
+            break;
+
+        case RTMP_QUALITY_LEVEL_MEDIUM:
+            ctrl->config.targetBitrate = RTMP_QUALITY_MEDIUM_BITRATE;
+            ctrl->config.targetFPS = RTMP_QUALITY_MEDIUM_FPS;
+            break;
+
+        case RTMP_QUALITY_LEVEL_HIGH:
+            ctrl->config.targetBitrate = RTMP_QUALITY_HIGH_BITRATE;
+            ctrl->config.targetFPS = RTMP_QUALITY_HIGH_FPS;
+            break;
+
+        case RTMP_QUALITY_LEVEL_AUTO:
+            ctrl->config.targetBitrate = calculate_optimal_bitrate(ctrl);
+            ctrl->config.targetFPS = calculate_optimal_fps(ctrl);
+            break;
+    }
 }
 
-// Get current statistics
-const rtmp_quality_stats_t* rtmp_quality_get_stats(rtmp_quality_controller_t *controller) {
-    if (!controller) return NULL;
-    return &controller->stats;
+static uint32_t calculate_optimal_bitrate(RTMPQualityController *ctrl) {
+    if (!ctrl) return RTMP_QUALITY_MEDIUM_BITRATE;
+
+    uint32_t optimalBitrate = ctrl->stats.currentBitrate;
+
+    if (ctrl->stats.bufferHealth < BUFFER_HEALTH_TARGET) {
+        optimalBitrate = (uint32_t)(optimalBitrate * 0.8);
+    } else if (ctrl->stats.bufferHealth > BUFFER_HEALTH_TARGET * 2) {
+        optimalBitrate = (uint32_t)(optimalBitrate * 1.2);
+    }
+
+    if (ctrl->stats.droppedFrames > 0) {
+        optimalBitrate = (uint32_t)(optimalBitrate * 0.9);
+    }
+
+    if (ctrl->stats.latency > MAX_LATENCY) {
+        optimalBitrate = (uint32_t)(optimalBitrate * 0.8);
+    }
+
+    // Clamp to limits
+    if (optimalBitrate < RTMP_QUALITY_LOW_BITRATE) {
+        optimalBitrate = RTMP_QUALITY_LOW_BITRATE;
+    } else if (optimalBitrate > RTMP_QUALITY_HIGH_BITRATE) {
+        optimalBitrate = RTMP_QUALITY_HIGH_BITRATE;
+    }
+
+    return optimalBitrate;
 }
 
-// Reset statistics
-void rtmp_quality_reset_stats(rtmp_quality_controller_t *controller) {
-    if (!controller) return;
-    
-    pthread_mutex_lock(&controller->mutex);
-    memset(&controller->stats, 0, sizeof(rtmp_quality_stats_t));
-    controller->stats.start_time = rtmp_utils_get_time_ms();
-    pthread_mutex_unlock(&controller->mutex);
+static uint32_t calculate_optimal_fps(RTMPQualityController *ctrl) {
+    if (!ctrl) return RTMP_QUALITY_MEDIUM_FPS;
+
+    uint32_t optimalFPS = ctrl->config.targetFPS;
+
+    if (ctrl->stats.encodingTime > (1000 / optimalFPS)) {
+        optimalFPS = (uint32_t)(optimalFPS * 0.8);
+    }
+
+    if (ctrl->stats.sendingTime > (1000 / optimalFPS)) {
+        optimalFPS = (uint32_t)(optimalFPS * 0.8);
+    }
+
+    // Clamp to limits
+    if (optimalFPS < RTMP_QUALITY_LOW_FPS) {
+        optimalFPS = RTMP_QUALITY_LOW_FPS;
+    } else if (optimalFPS > RTMP_QUALITY_HIGH_FPS) {
+        optimalFPS = RTMP_QUALITY_HIGH_FPS;
+    }
+
+    return optimalFPS;
 }
 
-// Destroy controller
-void rtmp_quality_destroy(rtmp_quality_controller_t *controller) {
-    if (!controller) return;
-    
-    pthread_mutex_destroy(&controller->mutex);
-    free(controller);
+static bool should_decrease_quality(RTMPQualityController *ctrl) {
+    if (!ctrl) return false;
+
+    if (ctrl->stats.bufferHealth < BUFFER_HEALTH_TARGET / 2) return true;
+    if (ctrl->stats.droppedFrames > ctrl->stats.currentFPS / 2) return true;
+    if (ctrl->stats.latency > MAX_LATENCY * 1.5) return true;
+    if (ctrl->stats.currentBitrate > ctrl->config.targetBitrate * 1.2) return true;
+    if (ctrl->stats.encodingTime + ctrl->stats.sendingTime > 1000/ctrl->config.targetFPS) return true;
+
+    return false;
 }
 
-// Debug functions
-void rtmp_quality_dump_debug_info(rtmp_quality_controller_t *controller) {
-    if (!controller) return;
-    
-    pthread_mutex_lock(&controller->mutex);
-    
-    rtmp_log_debug("=== Quality Controller Debug Info ===");
-    rtmp_log_debug("Current Quality: %.2f", controller->stats.current_quality);
-    rtmp_log_debug("Network Metrics:");
-    rtmp_log_debug("  Latency: %lu ms", controller->stats.current_latency);
-    rtmp_log_debug("  Packet Loss: %.2f%%", controller->stats.packet_loss_rate * 100);
-    rtmp_log_debug("  Bitrate: %lu bps", controller->stats.current_bitrate);
-    rtmp_log_debug("  Available Bandwidth: %lu bps", controller->stats.available_bandwidth);
-    
-    rtmp_log_debug("Processing Metrics:");
-    rtmp_log_debug("  Frame Drop Rate: %.2f%%", controller->stats.frame_drop_rate * 100);
-    rtmp_log_debug("  Processing Delay: %.2f ms", controller->stats.processing_delay);
-    rtmp_log_debug("  CPU Usage: %.2f%%", controller->stats.cpu_usage);
-    
-    rtmp_log_debug("Quality Adjustments: %lu", controller->stats.quality_adjustments);
-    
-    pthread_mutex_unlock(&controller->mutex);
+static bool should_increase_quality(RTMPQualityController *ctrl) {
+    if (!ctrl) return false;
+
+    if (ctrl->stats.bufferHealth < BUFFER_HEALTH_TARGET) return false;
+    if (ctrl->stats.droppedFrames > 0) return false;
+    if (ctrl->stats.latency > MAX_LATENCY) return false;
+    if (ctrl->stats.currentBitrate > ctrl->config.targetBitrate) return false;
+    if (ctrl->stats.encodingTime + ctrl->stats.sendingTime > (1000/ctrl->config.targetFPS) * 0.8) return false;
+
+    uint32_t now = rtmp_get_timestamp();
+    if (now - ctrl->lastCheck < QUALITY_CHECK_INTERVAL * 2) return false;
+
+    return true;
 }

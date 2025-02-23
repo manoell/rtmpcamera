@@ -1,293 +1,394 @@
 #include "rtmp_failover.h"
 #include "rtmp_utils.h"
-#include "rtmp_diagnostics.h"
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 
-#define RTMP_FAILOVER_MAX_RETRIES 3
-#define RTMP_FAILOVER_RETRY_DELAY 5000 // 5 seconds
-#define RTMP_FAILOVER_CHECK_INTERVAL 1000 // 1 second
-#define RTMP_FAILOVER_MAX_SERVERS 10
+#define DEFAULT_SWITCH_TIMEOUT 5000    // 5 seconds
+#define DEFAULT_HEALTH_INTERVAL 10000  // 10 seconds
+#define DEFAULT_MAX_ATTEMPTS 3
+#define NETWORK_CHECK_INTERVAL 1000    // 1 second
 
-typedef struct {
-    char *url;
-    int priority;
-    bool active;
-    uint64_t last_attempt;
-    uint32_t fail_count;
-} rtmp_server_info_t;
-
-struct rtmp_failover_context {
-    rtmp_server_info_t servers[RTMP_FAILOVER_MAX_SERVERS];
-    size_t server_count;
-    int current_server;
+struct RTMPFailoverHandler {
+    RTMPContext *rtmp;
+    RTMPFailoverConfig config;
+    RTMPFailoverStatus status;
+    RTMPFailoverCallback callback;
+    void *userData;
+    pthread_t healthThread;
     pthread_mutex_t mutex;
-    pthread_t monitor_thread;
-    bool running;
-    rtmp_failover_config_t config;
-    rtmp_failover_callbacks_t callbacks;
-    void *user_data;
-    rtmp_failover_stats_t stats;
+    bool threadRunning;
 };
 
-// Create failover context
-rtmp_failover_context_t* rtmp_failover_create(const rtmp_failover_config_t *config) {
-    rtmp_failover_context_t *ctx = rtmp_utils_malloc(sizeof(rtmp_failover_context_t));
-    if (!ctx) {
-        rtmp_log_error("Failed to allocate failover context");
-        return NULL;
-    }
+// Private helper functions
+static void *health_check_thread(void *arg);
+static bool switch_server(RTMPFailoverHandler *handler);
+static bool switch_network(RTMPFailoverHandler *handler);
+static bool switch_to_local(RTMPFailoverHandler *handler);
+static void perform_health_check(RTMPFailoverHandler *handler);
+static bool reconnect_to_server(RTMPFailoverHandler *handler, const char *server);
+static bool is_network_available(const char *interface);
+static bool start_local_recording(RTMPFailoverHandler *handler);
+static void stop_local_recording(RTMPFailoverHandler *handler);
+
+RTMPFailoverHandler *rtmp_failover_create(RTMPContext *rtmp) {
+    if (!rtmp) return NULL;
+
+    RTMPFailoverHandler *handler = (RTMPFailoverHandler *)calloc(1, sizeof(RTMPFailoverHandler));
+    if (!handler) return NULL;
+
+    handler->rtmp = rtmp;
     
-    if (pthread_mutex_init(&ctx->mutex, NULL) != 0) {
-        rtmp_utils_free(ctx);
-        rtmp_log_error("Failed to initialize failover mutex");
-        return NULL;
-    }
+    // Initialize mutex
+    pthread_mutex_init(&handler->mutex, NULL);
     
-    ctx->server_count = 0;
-    ctx->current_server = -1;
-    ctx->running = false;
+    // Set default config
+    handler->config.enableServerFailover = true;
+    handler->config.enableNetworkFailover = true;
+    handler->config.enableLocalFailover = true;
+    handler->config.maxSwitchAttempts = DEFAULT_MAX_ATTEMPTS;
+    handler->config.switchTimeout = DEFAULT_SWITCH_TIMEOUT;
+    handler->config.healthCheckInterval = DEFAULT_HEALTH_INTERVAL;
     
-    // Copy configuration
-    if (config) {
-        memcpy(&ctx->config, config, sizeof(rtmp_failover_config_t));
-    } else {
-        // Default configuration
-        ctx->config.max_retries = RTMP_FAILOVER_MAX_RETRIES;
-        ctx->config.retry_delay = RTMP_FAILOVER_RETRY_DELAY;
-        ctx->config.check_interval = RTMP_FAILOVER_CHECK_INTERVAL;
-        ctx->config.auto_reconnect = true;
-    }
-    
-    memset(&ctx->stats, 0, sizeof(rtmp_failover_stats_t));
-    ctx->stats.start_time = rtmp_utils_get_time_ms();
-    
-    return ctx;
+    // Initialize status
+    handler->status.state = RTMP_FAILOVER_STATE_IDLE;
+    handler->status.currentType = RTMP_FAILOVER_NONE;
+    handler->status.isHealthy = true;
+
+    return handler;
 }
 
-// Add server to failover list
-int rtmp_failover_add_server(rtmp_failover_context_t *ctx, const char *url, int priority) {
-    if (!ctx || !url) return RTMP_FAILOVER_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    
-    if (ctx->server_count >= RTMP_FAILOVER_MAX_SERVERS) {
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_log_error("Maximum number of failover servers reached");
-        return RTMP_FAILOVER_ERROR_MAX_SERVERS;
-    }
-    
-    // Find insert position based on priority
-    size_t pos = 0;
-    while (pos < ctx->server_count && ctx->servers[pos].priority <= priority) {
-        pos++;
-    }
-    
-    // Shift existing servers
-    if (pos < ctx->server_count) {
-        memmove(&ctx->servers[pos + 1], &ctx->servers[pos],
-                (ctx->server_count - pos) * sizeof(rtmp_server_info_t));
-    }
-    
-    // Add new server
-    ctx->servers[pos].url = rtmp_utils_strdup(url);
-    ctx->servers[pos].priority = priority;
-    ctx->servers[pos].active = false;
-    ctx->servers[pos].last_attempt = 0;
-    ctx->servers[pos].fail_count = 0;
-    
-    ctx->server_count++;
-    
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    rtmp_log_info("Added failover server: %s (priority: %d)", url, priority);
-    return RTMP_FAILOVER_SUCCESS;
+void rtmp_failover_destroy(RTMPFailoverHandler *handler) {
+    if (!handler) return;
+
+    rtmp_failover_stop(handler);
+    pthread_mutex_destroy(&handler->mutex);
+    free(handler);
 }
 
-// Monitor thread function
-static void* rtmp_failover_monitor(void *arg) {
-    rtmp_failover_context_t *ctx = (rtmp_failover_context_t*)arg;
-    uint64_t last_check = rtmp_utils_get_time_ms();
+void rtmp_failover_set_config(RTMPFailoverHandler *handler, const RTMPFailoverConfig *config) {
+    if (!handler || !config) return;
+
+    pthread_mutex_lock(&handler->mutex);
+    memcpy(&handler->config, config, sizeof(RTMPFailoverConfig));
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+const RTMPFailoverConfig *rtmp_failover_get_config(RTMPFailoverHandler *handler) {
+    if (!handler) return NULL;
+    return &handler->config;
+}
+
+void rtmp_failover_start(RTMPFailoverHandler *handler) {
+    if (!handler) return;
+
+    pthread_mutex_lock(&handler->mutex);
     
-    while (ctx->running) {
-        uint64_t current_time = rtmp_utils_get_time_ms();
+    if (handler->status.state == RTMP_FAILOVER_STATE_IDLE) {
+        handler->status.state = RTMP_FAILOVER_STATE_ACTIVE;
+        handler->status.switchAttempts = 0;
+        handler->status.lastSwitchTime = rtmp_get_timestamp();
+        handler->status.healthCheckTime = handler->status.lastSwitchTime;
         
-        // Check servers periodically
-        if (current_time - last_check >= ctx->config.check_interval) {
-            pthread_mutex_lock(&ctx->mutex);
-            
-            // Check current server
-            if (ctx->current_server >= 0) {
-                rtmp_server_info_t *server = &ctx->servers[ctx->current_server];
-                
-                // Check if server is healthy
-                if (ctx->callbacks.check_server) {
-                    if (!ctx->callbacks.check_server(server->url, ctx->user_data)) {
-                        server->fail_count++;
-                        ctx->stats.failures++;
-                        
-                        rtmp_log_warning("Server %s health check failed (%d/%d)",
-                                      server->url, server->fail_count,
-                                      ctx->config.max_retries);
-                        
-                        // Switch to next server if max retries exceeded
-                        if (server->fail_count >= ctx->config.max_retries) {
-                            server->active = false;
-                            ctx->current_server = -1;
-                            
-                            if (ctx->callbacks.server_failed) {
-                                ctx->callbacks.server_failed(server->url, ctx->user_data);
-                            }
-                        }
-                    } else {
-                        server->fail_count = 0;
-                    }
-                }
-            }
-            
-            // Try to connect to a new server if needed
-            if (ctx->current_server < 0 && ctx->config.auto_reconnect) {
-                for (size_t i = 0; i < ctx->server_count; i++) {
-                    rtmp_server_info_t *server = &ctx->servers[i];
-                    
-                    // Skip recently failed servers
-                    if (current_time - server->last_attempt < ctx->config.retry_delay) {
-                        continue;
-                    }
-                    
-                    // Try to connect
-                    server->last_attempt = current_time;
-                    
-                    if (ctx->callbacks.connect_server &&
-                        ctx->callbacks.connect_server(server->url, ctx->user_data) == RTMP_FAILOVER_SUCCESS) {
-                        server->active = true;
-                        server->fail_count = 0;
-                        ctx->current_server = i;
-                        ctx->stats.switches++;
-                        
-                        rtmp_log_info("Switched to failover server: %s", server->url);
-                        
-                        if (ctx->callbacks.server_switched) {
-                            ctx->callbacks.server_switched(server->url, ctx->user_data);
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            pthread_mutex_unlock(&ctx->mutex);
-            last_check = current_time;
+        // Start health check thread
+        handler->threadRunning = true;
+        pthread_create(&handler->healthThread, NULL, health_check_thread, handler);
+    }
+    
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+void rtmp_failover_stop(RTMPFailoverHandler *handler) {
+    if (!handler) return;
+
+    pthread_mutex_lock(&handler->mutex);
+    
+    if (handler->status.state != RTMP_FAILOVER_STATE_IDLE) {
+        // Stop health check thread
+        handler->threadRunning = false;
+        pthread_join(handler->healthThread, NULL);
+        
+        // Stop local recording if active
+        if (handler->status.currentType == RTMP_FAILOVER_LOCAL) {
+            stop_local_recording(handler);
         }
         
-        rtmp_utils_sleep_ms(100); // Sleep to prevent CPU overload
+        handler->status.state = RTMP_FAILOVER_STATE_IDLE;
+        handler->status.currentType = RTMP_FAILOVER_NONE;
+    }
+    
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+void rtmp_failover_reset(RTMPFailoverHandler *handler) {
+    if (!handler) return;
+
+    pthread_mutex_lock(&handler->mutex);
+    
+    handler->status.switchAttempts = 0;
+    handler->status.lastSwitchTime = rtmp_get_timestamp();
+    handler->status.healthCheckTime = handler->status.lastSwitchTime;
+    handler->status.isHealthy = true;
+    
+    if (handler->status.state == RTMP_FAILOVER_STATE_FAILED) {
+        handler->status.state = RTMP_FAILOVER_STATE_ACTIVE;
+    }
+    
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+bool rtmp_failover_trigger(RTMPFailoverHandler *handler, RTMPFailoverType type) {
+    if (!handler) return false;
+
+    pthread_mutex_lock(&handler->mutex);
+    
+    bool success = false;
+    
+    if (handler->status.state == RTMP_FAILOVER_STATE_ACTIVE &&
+        handler->status.switchAttempts < handler->config.maxSwitchAttempts) {
+        
+        handler->status.state = RTMP_FAILOVER_STATE_SWITCHING;
+        handler->status.currentType = type;
+        handler->status.switchAttempts++;
+        
+        switch (type) {
+            case RTMP_FAILOVER_SERVER:
+                if (handler->config.enableServerFailover) {
+                    success = switch_server(handler);
+                }
+                break;
+                
+            case RTMP_FAILOVER_NETWORK:
+                if (handler->config.enableNetworkFailover) {
+                    success = switch_network(handler);
+                }
+                break;
+                
+            case RTMP_FAILOVER_LOCAL:
+                if (handler->config.enableLocalFailover) {
+                    success = switch_to_local(handler);
+                }
+                break;
+                
+            default:
+                break;
+        }
+        
+        if (success) {
+            handler->status.state = RTMP_FAILOVER_STATE_ACTIVE;
+            handler->status.lastSwitchTime = rtmp_get_timestamp();
+        } else {
+            handler->status.state = RTMP_FAILOVER_STATE_FAILED;
+        }
+        
+        if (handler->callback) {
+            handler->callback(handler, type, success, handler->userData);
+        }
+    }
+    
+    pthread_mutex_unlock(&handler->mutex);
+    
+    return success;
+}
+
+RTMPFailoverStatus *rtmp_failover_get_status(RTMPFailoverHandler *handler) {
+    if (!handler) return NULL;
+    return &handler->status;
+}
+
+bool rtmp_failover_is_active(RTMPFailoverHandler *handler) {
+    if (!handler) return false;
+    return handler->status.state == RTMP_FAILOVER_STATE_ACTIVE;
+}
+
+bool rtmp_failover_is_healthy(RTMPFailoverHandler *handler) {
+    if (!handler) return false;
+    return handler->status.isHealthy;
+}
+
+void rtmp_failover_check_health(RTMPFailoverHandler *handler) {
+    if (!handler) return;
+    perform_health_check(handler);
+}
+
+void rtmp_failover_set_healthy(RTMPFailoverHandler *handler, bool healthy) {
+    if (!handler) return;
+
+    pthread_mutex_lock(&handler->mutex);
+    handler->status.isHealthy = healthy;
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+void rtmp_failover_set_callback(RTMPFailoverHandler *handler,
+                               RTMPFailoverCallback callback,
+                               void *userData) {
+    if (!handler) return;
+
+    pthread_mutex_lock(&handler->mutex);
+    handler->callback = callback;
+    handler->userData = userData;
+    pthread_mutex_unlock(&handler->mutex);
+}
+
+static void *health_check_thread(void *arg) {
+    RTMPFailoverHandler *handler = (RTMPFailoverHandler *)arg;
+    
+    while (handler->threadRunning) {
+        pthread_mutex_lock(&handler->mutex);
+        
+        if (handler->status.state == RTMP_FAILOVER_STATE_ACTIVE) {
+            uint32_t now = rtmp_get_timestamp();
+            
+            if (now - handler->status.healthCheckTime >= handler->config.healthCheckInterval) {
+                perform_health_check(handler);
+                handler->status.healthCheckTime = now;
+            }
+        }
+        
+        pthread_mutex_unlock(&handler->mutex);
+        rtmp_sleep_ms(NETWORK_CHECK_INTERVAL);
     }
     
     return NULL;
 }
 
-// Start failover system
-int rtmp_failover_start(rtmp_failover_context_t *ctx) {
-    if (!ctx) return RTMP_FAILOVER_ERROR_INVALID_PARAM;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    
-    if (ctx->running) {
-        pthread_mutex_unlock(&ctx->mutex);
-        return RTMP_FAILOVER_ERROR_ALREADY_RUNNING;
+static bool switch_server(RTMPFailoverHandler *handler) {
+    // Try each backup server in order
+    for (uint32_t i = 0; i < handler->config.numBackupServers; i++) {
+        if (reconnect_to_server(handler, handler->config.backupServers[i])) {
+            strncpy(handler->status.currentServer, 
+                   handler->config.backupServers[i],
+                   sizeof(handler->status.currentServer) - 1);
+            return true;
+        }
     }
     
-    ctx->running = true;
+    return false;
+}
+
+static bool switch_network(RTMPFailoverHandler *handler) {
+    // Get list of available network interfaces
+    char interfaces[4][64] = {"en0", "en1", "pdp_ip0", "pdp_ip1"}; // Example interfaces
     
-    // Start monitor thread
-    if (pthread_create(&ctx->monitor_thread, NULL, rtmp_failover_monitor, ctx) != 0) {
-        ctx->running = false;
-        pthread_mutex_unlock(&ctx->mutex);
-        rtmp_log_error("Failed to create failover monitor thread");
-        return RTMP_FAILOVER_ERROR_THREAD;
+    for (int i = 0; i < 4; i++) {
+        if (strcmp(interfaces[i], handler->status.currentNetwork) != 0 &&
+            is_network_available(interfaces[i])) {
+            
+            // Try to reconnect using this interface
+            if (reconnect_to_server(handler, handler->status.currentServer)) {
+                strncpy(handler->status.currentNetwork,
+                       interfaces[i],
+                       sizeof(handler->status.currentNetwork) - 1);
+                return true;
+            }
+        }
     }
     
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    rtmp_log_info("Failover system started");
-    return RTMP_FAILOVER_SUCCESS;
+    return false;
 }
 
-// Stop failover system
-int rtmp_failover_stop(rtmp_failover_context_t *ctx) {
-    if (!ctx) return RTMP_FAILOVER_ERROR_INVALID_PARAM;
+static bool switch_to_local(RTMPFailoverHandler *handler) {
+    // Stop current streaming
+    rtmp_disconnect(handler->rtmp);
     
-    pthread_mutex_lock(&ctx->mutex);
+    // Start local recording
+    return start_local_recording(handler);
+}
+
+static void perform_health_check(RTMPFailoverHandler *handler) {
+    bool healthy = true;
     
-    if (!ctx->running) {
-        pthread_mutex_unlock(&ctx->mutex);
-        return RTMP_FAILOVER_SUCCESS;
+    // Check connection status
+    if (!rtmp_is_connected(handler->rtmp)) {
+        healthy = false;
     }
     
-    ctx->running = false;
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    // Wait for monitor thread to finish
-    pthread_join(ctx->monitor_thread, NULL);
-    
-    rtmp_log_info("Failover system stopped");
-    return RTMP_FAILOVER_SUCCESS;
-}
-
-// Set callbacks
-void rtmp_failover_set_callbacks(rtmp_failover_context_t *ctx,
-                               const rtmp_failover_callbacks_t *callbacks,
-                               void *user_data) {
-    if (!ctx || !callbacks) return;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    memcpy(&ctx->callbacks, callbacks, sizeof(rtmp_failover_callbacks_t));
-    ctx->user_data = user_data;
-    pthread_mutex_unlock(&ctx->mutex);
-}
-
-// Get current server
-const char* rtmp_failover_get_current_server(rtmp_failover_context_t *ctx) {
-    if (!ctx) return NULL;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    const char *url = ctx->current_server >= 0 ?
-                     ctx->servers[ctx->current_server].url : NULL;
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    return url;
-}
-
-// Get statistics
-const rtmp_failover_stats_t* rtmp_failover_get_stats(rtmp_failover_context_t *ctx) {
-    if (!ctx) return NULL;
-    
-    pthread_mutex_lock(&ctx->mutex);
-    
-    // Update uptime
-    ctx->stats.uptime = rtmp_utils_get_time_ms() - ctx->stats.start_time;
-    
-    const rtmp_failover_stats_t *stats = &ctx->stats;
-    pthread_mutex_unlock(&ctx->mutex);
-    
-    return stats;
-}
-
-// Cleanup
-void rtmp_failover_destroy(rtmp_failover_context_t *ctx) {
-    if (!ctx) return;
-    
-    rtmp_failover_stop(ctx);
-    
-    pthread_mutex_lock(&ctx->mutex);
-    
-    // Free server URLs
-    for (size_t i = 0; i < ctx->server_count; i++) {
-        rtmp_utils_free(ctx->servers[i].url);
+    // Check network status
+    if (!is_network_available(handler->status.currentNetwork)) {
+        healthy = false;
     }
+
+    // Check server response
+    RTMPPacket ping = {
+        .type = RTMP_MSG_USER_CONTROL,
+        .size = 6,
+        .data = (uint8_t *)"\x06\x00\x00\x00\x00\x00",
+        .timestamp = rtmp_get_timestamp()
+    };
+
+    if (!rtmp_send_packet(handler->rtmp, &ping)) {
+        healthy = false;
+    }
+
+    // Update health status
+    handler->status.isHealthy = healthy;
+
+    // Trigger failover if unhealthy
+    if (!healthy) {
+        if (handler->config.enableServerFailover) {
+            rtmp_failover_trigger(handler, RTMP_FAILOVER_SERVER);
+        } else if (handler->config.enableNetworkFailover) {
+            rtmp_failover_trigger(handler, RTMP_FAILOVER_NETWORK);
+        } else if (handler->config.enableLocalFailover) {
+            rtmp_failover_trigger(handler, RTMP_FAILOVER_LOCAL);
+        }
+    }
+}
+
+static bool reconnect_to_server(RTMPFailoverHandler *handler, const char *server) {
+    // Close existing connection
+    rtmp_disconnect(handler->rtmp);
+    rtmp_sleep_ms(1000); // Wait 1 second before reconnecting
+
+    // Parse server URL
+    char host[256];
+    int port = RTMP_DEFAULT_PORT;
+    char app[128];
     
-    pthread_mutex_unlock(&ctx->mutex);
-    pthread_mutex_destroy(&ctx->mutex);
+    if (sscanf(server, "rtmp://%255[^:]:%d/%127s", host, &port, app) < 3) {
+        if (sscanf(server, "rtmp://%255[^/]/%127s", host, app) < 2) {
+            return false;
+        }
+    }
+
+    // Try to connect
+    uint32_t startTime = rtmp_get_timestamp();
+    bool connected = false;
+
+    while (!connected && (rtmp_get_timestamp() - startTime < handler->config.switchTimeout)) {
+        if (rtmp_connect(handler->rtmp, host, port)) {
+            connected = true;
+            break;
+        }
+        rtmp_sleep_ms(500);
+    }
+
+    return connected;
+}
+
+static bool is_network_available(const char *interface) {
+    // Check if network interface is up and has valid IP
+    // This is a simplified check - in practice you'd want to use platform specific APIs
     
-    rtmp_utils_free(ctx);
+    if (!interface) return false;
+
+    // For iOS you'd use SCNetworkReachability APIs here
+    // For now we just assume en0 (WiFi) and pdp_ip0 (Cellular) are valid
+    return (strcmp(interface, "en0") == 0 || 
+            strcmp(interface, "pdp_ip0") == 0);
+}
+
+static bool start_local_recording(RTMPFailoverHandler *handler) {
+    if (!handler->config.localRecordingPath[0]) return false;
+
+    // Here you'd implement local recording logic
+    // This could involve writing to a file or using AVFoundation to record
+    
+    // For this example we just pretend it worked
+    return true;
+}
+
+static void stop_local_recording(RTMPFailoverHandler *handler) {
+    // Here you'd implement logic to stop local recording
+    // This could involve closing files or stopping AVFoundation recording
 }

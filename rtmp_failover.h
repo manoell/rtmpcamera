@@ -1,69 +1,83 @@
 #ifndef RTMP_FAILOVER_H
 #define RTMP_FAILOVER_H
 
-#include <stdint.h>
-#include <stdbool.h>
+#include "rtmp_protocol.h"
 
-// Error codes
-#define RTMP_FAILOVER_SUCCESS 0
-#define RTMP_FAILOVER_ERROR_INVALID_PARAM -1
-#define RTMP_FAILOVER_ERROR_MAX_SERVERS -2
-#define RTMP_FAILOVER_ERROR_THREAD -3
-#define RTMP_FAILOVER_ERROR_ALREADY_RUNNING -4
+// Failover types
+typedef enum {
+    RTMP_FAILOVER_NONE = 0,
+    RTMP_FAILOVER_SERVER,     // Switch to backup server
+    RTMP_FAILOVER_NETWORK,    // Switch network interface
+    RTMP_FAILOVER_LOCAL       // Switch to local recording
+} RTMPFailoverType;
 
-// Forward declaration
-typedef struct rtmp_failover_context rtmp_failover_context_t;
+// Failover states
+typedef enum {
+    RTMP_FAILOVER_STATE_IDLE = 0,
+    RTMP_FAILOVER_STATE_ACTIVE,
+    RTMP_FAILOVER_STATE_SWITCHING,
+    RTMP_FAILOVER_STATE_FAILED
+} RTMPFailoverState;
 
-// Callback function types
-typedef bool (*rtmp_failover_check_callback)(const char *url, void *user_data);
-typedef int (*rtmp_failover_connect_callback)(const char *url, void *user_data);
-typedef void (*rtmp_failover_switch_callback)(const char *url, void *user_data);
-typedef void (*rtmp_failover_fail_callback)(const char *url, void *user_data);
-
-// Callback structure
+// Failover settings
 typedef struct {
-    rtmp_failover_check_callback check_server;
-    rtmp_failover_connect_callback connect_server;
-    rtmp_failover_switch_callback server_switched;
-    rtmp_failover_fail_callback server_failed;
-} rtmp_failover_callbacks_t;
+    bool enableServerFailover;
+    bool enableNetworkFailover;
+    bool enableLocalFailover;
+    uint32_t maxSwitchAttempts;
+    uint32_t switchTimeout;
+    uint32_t healthCheckInterval;
+    char backupServers[8][256];
+    uint32_t numBackupServers;
+    char localRecordingPath[256];
+} RTMPFailoverConfig;
 
-// Configuration structure
+// Failover status
 typedef struct {
-    uint32_t max_retries;
-    uint32_t retry_delay;
-    uint32_t check_interval;
-    bool auto_reconnect;
-} rtmp_failover_config_t;
+    RTMPFailoverState state;
+    RTMPFailoverType currentType;
+    uint32_t switchAttempts;
+    uint32_t lastSwitchTime;
+    uint32_t healthCheckTime;
+    bool isHealthy;
+    char currentServer[256];
+    char currentNetwork[64];
+} RTMPFailoverStatus;
 
-// Statistics structure
-typedef struct {
-    uint64_t start_time;
-    uint64_t uptime;
-    uint32_t switches;
-    uint32_t failures;
-    uint32_t total_downtime;
-} rtmp_failover_stats_t;
+// Failover handler object
+typedef struct RTMPFailoverHandler RTMPFailoverHandler;
 
-// Core functions
-rtmp_failover_context_t* rtmp_failover_create(const rtmp_failover_config_t *config);
-void rtmp_failover_destroy(rtmp_failover_context_t *ctx);
-int rtmp_failover_start(rtmp_failover_context_t *ctx);
-int rtmp_failover_stop(rtmp_failover_context_t *ctx);
+// Creation/destruction
+RTMPFailoverHandler *rtmp_failover_create(RTMPContext *rtmp);
+void rtmp_failover_destroy(RTMPFailoverHandler *handler);
 
-// Server management
-int rtmp_failover_add_server(rtmp_failover_context_t *ctx,
-                            const char *url,
-                            int priority);
+// Configuration
+void rtmp_failover_set_config(RTMPFailoverHandler *handler, const RTMPFailoverConfig *config);
+const RTMPFailoverConfig *rtmp_failover_get_config(RTMPFailoverHandler *handler);
 
-const char* rtmp_failover_get_current_server(rtmp_failover_context_t *ctx);
+// Control
+void rtmp_failover_start(RTMPFailoverHandler *handler);
+void rtmp_failover_stop(RTMPFailoverHandler *handler);
+void rtmp_failover_reset(RTMPFailoverHandler *handler);
+bool rtmp_failover_trigger(RTMPFailoverHandler *handler, RTMPFailoverType type);
 
-// Callback management
-void rtmp_failover_set_callbacks(rtmp_failover_context_t *ctx,
-                               const rtmp_failover_callbacks_t *callbacks,
-                               void *user_data);
+// Status
+RTMPFailoverStatus *rtmp_failover_get_status(RTMPFailoverHandler *handler);
+bool rtmp_failover_is_active(RTMPFailoverHandler *handler);
+bool rtmp_failover_is_healthy(RTMPFailoverHandler *handler);
 
-// Statistics
-const rtmp_failover_stats_t* rtmp_failover_get_stats(rtmp_failover_context_t *ctx);
+// Health check
+void rtmp_failover_check_health(RTMPFailoverHandler *handler);
+void rtmp_failover_set_healthy(RTMPFailoverHandler *handler, bool healthy);
 
-#endif // RTMP_FAILOVER_H
+// Callbacks
+typedef void (*RTMPFailoverCallback)(RTMPFailoverHandler *handler, 
+                                   RTMPFailoverType type,
+                                   bool success,
+                                   void *userData);
+
+void rtmp_failover_set_callback(RTMPFailoverHandler *handler,
+                               RTMPFailoverCallback callback,
+                               void *userData);
+
+#endif /* RTMP_FAILOVER_H */

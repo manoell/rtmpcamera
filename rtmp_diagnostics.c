@@ -1,298 +1,253 @@
-#include "rtmp_diagnostics.h"
-#include "rtmp_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <pthread.h>
 #include <time.h>
+#include <pthread.h>
+#include "rtmp_diagnostics.h"
+#include "rtmp_utils.h"
 
-#define RTMP_LOG_BUFFER_SIZE 4096
-#define RTMP_MAX_LOG_FILES 5
-#define RTMP_MAX_FILE_SIZE (10 * 1024 * 1024)  // 10MB per file
-#define RTMP_MAX_EVENTS 1000
-
-typedef struct {
-    rtmp_diagnostic_event_t events[RTMP_MAX_EVENTS];
-    size_t head;
-    size_t tail;
-    pthread_mutex_t mutex;
-} event_ring_buffer_t;
+#define MAX_LOG_LENGTH 1024
+#define MAX_TIMING_OPERATIONS 100
+#define TIMING_HISTORY_SIZE 50
 
 typedef struct {
-    int enabled;
-    FILE *log_file;
-    char log_path[256];
-    int log_level;
-    pthread_mutex_t log_mutex;
-    event_ring_buffer_t event_buffer;
-    rtmp_diagnostic_callbacks_t callbacks;
+    char operation[64];
+    uint64_t start_time;
+    uint64_t duration;
+} timing_record_t;
+
+typedef struct {
+    rtmp_diagnostic_stats_t stats;
+    rtmp_log_callback_t log_callback;
     void *callback_data;
-} rtmp_diagnostics_ctx_t;
+    int min_log_level;
+    uint32_t diag_flags;
+    timing_record_t timing_history[TIMING_HISTORY_SIZE];
+    int timing_history_index;
+    pthread_mutex_t mutex;
+    uint64_t timing_ids[MAX_TIMING_OPERATIONS];
+    char *timing_operations[MAX_TIMING_OPERATIONS];
+    int timing_count;
+} rtmp_diagnostic_context_t;
 
-static rtmp_diagnostics_ctx_t diag_ctx = {0};
+static rtmp_diagnostic_context_t *diag_ctx = NULL;
 
-// Initialize diagnostics system
-int rtmp_diagnostics_init(const char *log_path, int log_level) {
-    if (diag_ctx.enabled) {
-        return RTMP_DIAG_ALREADY_INITIALIZED;
-    }
-    
-    // Initialize mutexes
-    if (pthread_mutex_init(&diag_ctx.log_mutex, NULL) != 0 ||
-        pthread_mutex_init(&diag_ctx.event_buffer.mutex, NULL) != 0) {
-        return RTMP_DIAG_MUTEX_ERROR;
-    }
-    
-    // Set log path and level
-    if (log_path) {
-        strncpy(diag_ctx.log_path, log_path, sizeof(diag_ctx.log_path) - 1);
-        
-        // Open log file
-        diag_ctx.log_file = fopen(log_path, "a");
-        if (!diag_ctx.log_file) {
-            pthread_mutex_destroy(&diag_ctx.log_mutex);
-            pthread_mutex_destroy(&diag_ctx.event_buffer.mutex);
-            return RTMP_DIAG_FILE_ERROR;
-        }
-    }
-    
-    diag_ctx.log_level = log_level;
-    diag_ctx.enabled = 1;
-    
-    rtmp_log_info("Diagnostics system initialized");
-    return RTMP_DIAG_SUCCESS;
+static const char *log_level_strings[] = {
+    "DEBUG",
+    "INFO",
+    "WARNING",
+    "ERROR",
+    "FATAL"
+};
+
+static uint64_t get_timestamp_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-// Log message with variable arguments
-void rtmp_log_message(int level, const char *format, ...) {
-    if (!diag_ctx.enabled || level > diag_ctx.log_level) return;
+int rtmp_diagnostic_init(void) {
+    if (diag_ctx) return 0;
     
-    char buffer[RTMP_LOG_BUFFER_SIZE];
-    va_list args;
+    diag_ctx = (rtmp_diagnostic_context_t*)calloc(1, sizeof(rtmp_diagnostic_context_t));
+    if (!diag_ctx) return 0;
     
-    // Get current time
-    time_t now;
-    time(&now);
-    struct tm *timeinfo = localtime(&now);
+    pthread_mutex_init(&diag_ctx->mutex, NULL);
+    diag_ctx->min_log_level = RTMP_LOG_INFO;
+    diag_ctx->diag_flags = RTMP_DIAG_ALL;
+    diag_ctx->stats.start_time = get_timestamp_ms();
+    
+    return 1;
+}
+
+void rtmp_diagnostic_shutdown(void) {
+    if (!diag_ctx) return;
+    
+    pthread_mutex_lock(&diag_ctx->mutex);
+    
+    // Limpa operações de timing pendentes
+    for (int i = 0; i < diag_ctx->timing_count; i++) {
+        free(diag_ctx->timing_operations[i]);
+    }
+    
+    pthread_mutex_unlock(&diag_ctx->mutex);
+    pthread_mutex_destroy(&diag_ctx->mutex);
+    
+    free(diag_ctx);
+    diag_ctx = NULL;
+}
+
+void rtmp_diagnostic_set_callback(rtmp_log_callback_t callback, void *user_data) {
+    if (!diag_ctx) return;
+    
+    pthread_mutex_lock(&diag_ctx->mutex);
+    diag_ctx->log_callback = callback;
+    diag_ctx->callback_data = user_data;
+    pthread_mutex_unlock(&diag_ctx->mutex);
+}
+
+void rtmp_diagnostic_set_level(int level) {
+    if (!diag_ctx) return;
+    diag_ctx->min_log_level = level;
+}
+
+void rtmp_diagnostic_set_flags(uint32_t flags) {
+    if (!diag_ctx) return;
+    diag_ctx->diag_flags = flags;
+}
+
+void rtmp_diagnostic_log(int level, const char *module, const char *format, va_list args) {
+    if (!diag_ctx || level < diag_ctx->min_log_level) return;
+    
+    char message[MAX_LOG_LENGTH];
     char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+    time_t now;
+    struct tm *tm_info;
     
-    // Format message
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
     
-    pthread_mutex_lock(&diag_ctx.log_mutex);
+    vsnprintf(message, sizeof(message), format, args);
     
-    // Write to file if enabled
-    if (diag_ctx.log_file) {
-        fprintf(diag_ctx.log_file, "[%s] [%s] %s\n",
-                timestamp,
-                rtmp_diagnostics_level_string(level),
-                buffer);
-        fflush(diag_ctx.log_file);
-        
-        // Check file size and rotate if needed
-        if (ftell(diag_ctx.log_file) > RTMP_MAX_FILE_SIZE) {
-            rtmp_diagnostics_rotate_logs();
-        }
+    pthread_mutex_lock(&diag_ctx->mutex);
+    
+    if (diag_ctx->log_callback) {
+        diag_ctx->log_callback(level, module, message, diag_ctx->callback_data);
+    } else {
+        fprintf(stderr, "[%s] %s - %s: %s\n", 
+                timestamp, 
+                log_level_strings[level], 
+                module, 
+                message);
     }
     
-    // Call callback if registered
-    if (diag_ctx.callbacks.log_callback) {
-        diag_ctx.callbacks.log_callback(level, buffer, diag_ctx.callback_data);
+    if (level >= RTMP_LOG_ERROR) {
+        diag_ctx->stats.error_count++;
     }
     
-    pthread_mutex_unlock(&diag_ctx.log_mutex);
-}
-
-// Convenience logging functions
-void rtmp_log_error(const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    char buffer[RTMP_LOG_BUFFER_SIZE];
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    rtmp_log_message(RTMP_LOG_ERROR, buffer);
-}
-
-void rtmp_log_warning(const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    char buffer[RTMP_LOG_BUFFER_SIZE];
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    rtmp_log_message(RTMP_LOG_WARNING, buffer);
-}
-
-void rtmp_log_info(const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    char buffer[RTMP_LOG_BUFFER_SIZE];
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    rtmp_log_message(RTMP_LOG_INFO, buffer);
+    pthread_mutex_unlock(&diag_ctx->mutex);
 }
 
 void rtmp_log_debug(const char *format, ...) {
     va_list args;
     va_start(args, format);
-    char buffer[RTMP_LOG_BUFFER_SIZE];
-    vsnprintf(buffer, sizeof(buffer), format, args);
+    rtmp_diagnostic_log(RTMP_LOG_DEBUG, "RTMP", format, args);
     va_end(args);
-    rtmp_log_message(RTMP_LOG_DEBUG, buffer);
 }
 
-// Record diagnostic event
-void rtmp_diagnostics_record_event(rtmp_diagnostic_event_type_t type,
-                                 const char *description,
-                                 const void *data,
-                                 size_t data_size) {
-    if (!diag_ctx.enabled) return;
-    
-    pthread_mutex_lock(&diag_ctx.event_buffer.mutex);
-    
-    // Calculate next position
-    size_t next_tail = (diag_ctx.event_buffer.tail + 1) % RTMP_MAX_EVENTS;
-    
-    // Check if buffer is full
-    if (next_tail == diag_ctx.event_buffer.head) {
-        // Remove oldest event
-        diag_ctx.event_buffer.head = (diag_ctx.event_buffer.head + 1) % RTMP_MAX_EVENTS;
-    }
-    
-    // Add new event
-    rtmp_diagnostic_event_t *event = &diag_ctx.event_buffer.events[diag_ctx.event_buffer.tail];
-    event->type = type;
-    event->timestamp = rtmp_utils_get_time_ms();
-    strncpy(event->description, description, sizeof(event->description) - 1);
-    
-    // Copy event data if provided
-    if (data && data_size > 0) {
-        size_t copy_size = data_size < sizeof(event->data) ? data_size : sizeof(event->data);
-        memcpy(event->data, data, copy_size);
-        event->data_size = copy_size;
-    } else {
-        event->data_size = 0;
-    }
-    
-    diag_ctx.event_buffer.tail = next_tail;
-    
-    // Notify callback if registered
-    if (diag_ctx.callbacks.event_callback) {
-        diag_ctx.callbacks.event_callback(event, diag_ctx.callback_data);
-    }
-    
-    pthread_mutex_unlock(&diag_ctx.event_buffer.mutex);
+void rtmp_log_info(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    rtmp_diagnostic_log(RTMP_LOG_INFO, "RTMP", format, args);
+    va_end(args);
 }
 
-// Get diagnostic events
-size_t rtmp_diagnostics_get_events(rtmp_diagnostic_event_t *events,
-                                 size_t max_events,
-                                 uint64_t since_timestamp) {
-    if (!diag_ctx.enabled || !events || max_events == 0) return 0;
+void rtmp_log_warning(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    rtmp_diagnostic_log(RTMP_LOG_WARNING, "RTMP", format, args);
+    va_end(args);
+}
+
+void rtmp_log_error(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    rtmp_diagnostic_log(RTMP_LOG_ERROR, "RTMP", format, args);
+    va_end(args);
+}
+
+void rtmp_log_fatal(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    rtmp_diagnostic_log(RTMP_LOG_FATAL, "RTMP", format, args);
+    va_end(args);
+}
+
+int rtmp_diagnostic_get_stats(rtmp_diagnostic_stats_t *stats) {
+    if (!diag_ctx || !stats) return 0;
     
-    size_t count = 0;
-    pthread_mutex_lock(&diag_ctx.event_buffer.mutex);
+    pthread_mutex_lock(&diag_ctx->mutex);
     
-    size_t current = diag_ctx.event_buffer.head;
-    while (current != diag_ctx.event_buffer.tail && count < max_events) {
-        rtmp_diagnostic_event_t *event = &diag_ctx.event_buffer.events[current];
-        if (event->timestamp > since_timestamp) {
-            memcpy(&events[count++], event, sizeof(rtmp_diagnostic_event_t));
+    memcpy(stats, &diag_ctx->stats, sizeof(rtmp_diagnostic_stats_t));
+    stats->uptime = get_timestamp_ms() - diag_ctx->stats.start_time;
+    
+    pthread_mutex_unlock(&diag_ctx->mutex);
+    return 1;
+}
+
+void rtmp_diagnostic_reset_stats(void) {
+    if (!diag_ctx) return;
+    
+    pthread_mutex_lock(&diag_ctx->mutex);
+    memset(&diag_ctx->stats, 0, sizeof(rtmp_diagnostic_stats_t));
+    diag_ctx->stats.start_time = get_timestamp_ms();
+    pthread_mutex_unlock(&diag_ctx->mutex);
+}
+
+void rtmp_diagnostic_mark_event(const char *event_name) {
+    if (!diag_ctx || !event_name) return;
+    
+    rtmp_log_info("Event: %s", event_name);
+}
+
+uint64_t rtmp_diagnostic_start_timing(const char *operation) {
+    if (!diag_ctx || !operation || diag_ctx->timing_count >= MAX_TIMING_OPERATIONS) {
+        return 0;
+    }
+    
+    pthread_mutex_lock(&diag_ctx->mutex);
+    
+    uint64_t timing_id = get_timestamp_ms();
+    int idx = diag_ctx->timing_count++;
+    
+    diag_ctx->timing_ids[idx] = timing_id;
+    diag_ctx->timing_operations[idx] = strdup(operation);
+    
+    pthread_mutex_unlock(&diag_ctx->mutex);
+    
+    return timing_id;
+}
+
+void rtmp_diagnostic_end_timing(uint64_t timing_id) {
+    if (!diag_ctx || !timing_id) return;
+    
+    pthread_mutex_lock(&diag_ctx->mutex);
+    
+    uint64_t end_time = get_timestamp_ms();
+    
+    for (int i = 0; i < diag_ctx->timing_count; i++) {
+        if (diag_ctx->timing_ids[i] == timing_id) {
+            uint64_t duration = end_time - timing_id;
+            
+            // Registra no histórico
+            int hist_idx = diag_ctx->timing_history_index;
+            strncpy(diag_ctx->timing_history[hist_idx].operation,
+                   diag_ctx->timing_operations[i],
+                   sizeof(diag_ctx->timing_history[hist_idx].operation)-1);
+            diag_ctx->timing_history[hist_idx].start_time = timing_id;
+            diag_ctx->timing_history[hist_idx].duration = duration;
+            
+            diag_ctx->timing_history_index = (hist_idx + 1) % TIMING_HISTORY_SIZE;
+            
+            // Log se duração for significativa (> 100ms)
+            if (duration > 100) {
+                rtmp_log_warning("Operation '%s' took %llu ms",
+                               diag_ctx->timing_operations[i],
+                               duration);
+            }
+            
+            free(diag_ctx->timing_operations[i]);
+            
+            // Remove da lista de operações ativas
+            for (int j = i; j < diag_ctx->timing_count - 1; j++) {
+                diag_ctx->timing_ids[j] = diag_ctx->timing_ids[j+1];
+                diag_ctx->timing_operations[j] = diag_ctx->timing_operations[j+1];
+            }
+            diag_ctx->timing_count--;
+            break;
         }
-        current = (current + 1) % RTMP_MAX_EVENTS;
     }
     
-    pthread_mutex_unlock(&diag_ctx.event_buffer.mutex);
-    return count;
-}
-
-// Set diagnostic callbacks
-void rtmp_diagnostics_set_callbacks(const rtmp_diagnostic_callbacks_t *callbacks,
-                                  void *user_data) {
-    if (!diag_ctx.enabled || !callbacks) return;
-    
-    pthread_mutex_lock(&diag_ctx.log_mutex);
-    memcpy(&diag_ctx.callbacks, callbacks, sizeof(rtmp_diagnostic_callbacks_t));
-    diag_ctx.callback_data = user_data;
-    pthread_mutex_unlock(&diag_ctx.log_mutex);
-}
-
-// Rotate log files
-static void rtmp_diagnostics_rotate_logs(void) {
-    if (!diag_ctx.log_file || !diag_ctx.log_path[0]) return;
-    
-    // Close current log file
-    fclose(diag_ctx.log_file);
-    
-    // Rotate existing log files
-    char old_path[270], new_path[270];
-    for (int i = RTMP_MAX_LOG_FILES - 1; i > 0; i--) {
-        snprintf(old_path, sizeof(old_path), "%s.%d", diag_ctx.log_path, i - 1);
-        snprintf(new_path, sizeof(new_path), "%s.%d", diag_ctx.log_path, i);
-        rename(old_path, new_path);
-    }
-    
-    // Rename current log file
-    snprintf(new_path, sizeof(new_path), "%s.0", diag_ctx.log_path);
-    rename(diag_ctx.log_path, new_path);
-    
-    // Open new log file
-    diag_ctx.log_file = fopen(diag_ctx.log_path, "a");
-}
-
-// Get log level string
-const char* rtmp_diagnostics_level_string(int level) {
-    switch (level) {
-        case RTMP_LOG_ERROR:   return "ERROR";
-        case RTMP_LOG_WARNING: return "WARNING";
-        case RTMP_LOG_INFO:    return "INFO";
-        case RTMP_LOG_DEBUG:   return "DEBUG";
-        default:               return "UNKNOWN";
-    }
-}
-
-// Clean up diagnostics system
-void rtmp_diagnostics_cleanup(void) {
-    if (!diag_ctx.enabled) return;
-    
-    rtmp_log_info("Diagnostics system shutting down");
-    
-    pthread_mutex_lock(&diag_ctx.log_mutex);
-    
-    if (diag_ctx.log_file) {
-        fclose(diag_ctx.log_file);
-        diag_ctx.log_file = NULL;
-    }
-    
-    diag_ctx.enabled = 0;
-    
-    pthread_mutex_unlock(&diag_ctx.log_mutex);
-    
-    pthread_mutex_destroy(&diag_ctx.log_mutex);
-    pthread_mutex_destroy(&diag_ctx.event_buffer.mutex);
-}
-
-// Dump diagnostic information
-void rtmp_diagnostics_dump_info(void) {
-    if (!diag_ctx.enabled) return;
-    
-    rtmp_log_info("=== Diagnostic Information ===");
-    rtmp_log_info("Log Level: %s", rtmp_diagnostics_level_string(diag_ctx.log_level));
-    rtmp_log_info("Log Path: %s", diag_ctx.log_path);
-    
-    pthread_mutex_lock(&diag_ctx.event_buffer.mutex);
-    
-    size_t event_count = 0;
-    if (diag_ctx.event_buffer.tail >= diag_ctx.event_buffer.head) {
-        event_count = diag_ctx.event_buffer.tail - diag_ctx.event_buffer.head;
-    } else {
-        event_count = RTMP_MAX_EVENTS - diag_ctx.event_buffer.head + diag_ctx.event_buffer.tail;
-    }
-    
-    rtmp_log_info("Events in Buffer: %zu", event_count);
-    
-    pthread_mutex_unlock(&diag_ctx.event_buffer.mutex);
+    pthread_mutex_unlock(&diag_ctx->mutex);
 }

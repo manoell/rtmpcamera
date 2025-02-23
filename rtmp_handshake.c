@@ -1,246 +1,253 @@
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include "rtmp_handshake.h"
 #include "rtmp_utils.h"
-#include "rtmp_diagnostics.h"
-#include <string.h>
 
-#define RTMP_HANDSHAKE_SIZE 1536
-#define RTMP_HANDSHAKE_VERSION 3
-#define RTMP_DIGEST_LENGTH 32
-#define RTMP_HANDSHAKE_TIMEOUT 5000 // 5 seconds
+#define RTMP_HANDSHAKE_KEYSIZE 32
 
-// Handshake patterns
-static const uint8_t RTMP_CLIENT_PATTERN[] = {
+// Chaves de criptografia para diferentes tipos de handshake
+static const uint8_t rtmp_handshake_key_fp[] = {
     'G', 'e', 'n', 'u', 'i', 'n', 'e', ' ', 'A', 'd', 'o', 'b', 'e', ' ',
     'F', 'l', 'a', 's', 'h', ' ', 'P', 'l', 'a', 'y', 'e', 'r', ' ',
-    '0', '0', '1'
+    '0', '0', '1', 0xF0, 0xEE
 };
 
-static const uint8_t RTMP_SERVER_PATTERN[] = {
+static const uint8_t rtmp_handshake_key_fms[] = {
     'G', 'e', 'n', 'u', 'i', 'n', 'e', ' ', 'A', 'd', 'o', 'b', 'e', ' ',
     'F', 'l', 'a', 's', 'h', ' ', 'M', 'e', 'd', 'i', 'a', ' ',
     'S', 'e', 'r', 'v', 'e', 'r'
 };
 
-// HMAC keys
-static const uint8_t RTMP_CLIENT_KEY[] = {
-    'G', 'e', 'n', 'u', 'i', 'n', 'e', ' ', 'A', 'd', 'o', 'b', 'e', ' ',
-    'F', 'l', 'a', 's', 'h', ' ', 'P', 'l', 'a', 'y', 'e', 'r'
+struct rtmp_handshake_ctx {
+    uint8_t version;
+    uint8_t *c1;
+    uint8_t *s1;
+    uint8_t *c2;
+    uint8_t *s2;
+    size_t c1_size;
+    size_t s1_size;
+    size_t c2_size;
+    size_t s2_size;
+    int state;
+    int digest_type;
+    uint8_t digest[RTMP_HANDSHAKE_DIGEST_SIZE];
 };
 
-static const uint8_t RTMP_SERVER_KEY[] = {
-    'G', 'e', 'n', 'u', 'i', 'n', 'e', ' ', 'A', 'd', 'o', 'b', 'e', ' ',
-    'F', 'l', 'a', 's', 'h', ' ', 'M', 'e', 'd', 'i', 'a', ' ',
-    'S', 'e', 'r', 'v', 'e', 'r', ' ',
-    '0', '0', '1'
-};
-
-// Calculate positions for the digest
-static void rtmp_handshake_get_digest_offset(const uint8_t *buf, size_t size,
-                                           int *offset1, int *offset2) {
-    // Hash offset calculation based on first 4 bytes
-    uint32_t offset = ((uint32_t)buf[0] + buf[1] + buf[2] + buf[3]) % 728 + 12;
+static void rtmp_handshake_init_packet(uint8_t *packet) {
+    uint32_t timestamp = (uint32_t)time(NULL);
+    memset(packet, 0, RTMP_HANDSHAKE_SIZE);
+    memcpy(packet, &timestamp, 4);
     
-    *offset1 = offset;
-    *offset2 = size - RTMP_DIGEST_LENGTH - offset;
+    // Gerar bytes aleatórios para o resto do pacote
+    for (int i = 8; i < RTMP_HANDSHAKE_SIZE; i++) {
+        packet[i] = rand() & 0xFF;
+    }
 }
 
-// Validate client digest
-static int rtmp_handshake_validate_client_digest(const uint8_t *handshake,
-                                               const uint8_t *key,
-                                               size_t key_size) {
-    uint8_t digest[RTMP_DIGEST_LENGTH];
-    int offset1, offset2;
+static int rtmp_handshake_calculate_digest(const uint8_t *data, size_t size,
+                                         const uint8_t *key, size_t key_size,
+                                         uint8_t *digest) {
+    unsigned int digest_len;
+    HMAC_CTX *ctx = HMAC_CTX_new();
+    if (!ctx) return 0;
     
-    rtmp_handshake_get_digest_offset(handshake, RTMP_HANDSHAKE_SIZE, &offset1, &offset2);
+    HMAC_Init_ex(ctx, key, key_size, EVP_sha256(), NULL);
+    HMAC_Update(ctx, data, size);
+    HMAC_Final(ctx, digest, &digest_len);
     
-    // Calculate expected digest
-    uint8_t *temp = rtmp_utils_malloc(RTMP_HANDSHAKE_SIZE);
-    if (!temp) return -1;
-    
-    memcpy(temp, handshake, RTMP_HANDSHAKE_SIZE);
-    memset(temp + offset1, 0, RTMP_DIGEST_LENGTH);
-    
-    rtmp_utils_hmac_sha256(key, key_size, temp, RTMP_HANDSHAKE_SIZE, digest);
-    rtmp_utils_free(temp);
-    
-    // Compare with received digest
-    return memcmp(digest, handshake + offset1, RTMP_DIGEST_LENGTH);
+    HMAC_CTX_free(ctx);
+    return (digest_len == RTMP_HANDSHAKE_DIGEST_SIZE);
 }
 
-// Generate server digest
-static void rtmp_handshake_generate_server_digest(const uint8_t *handshake,
-                                                uint8_t *output) {
-    int offset1, offset2;
-    rtmp_handshake_get_digest_offset(handshake, RTMP_HANDSHAKE_SIZE, &offset1, &offset2);
+static int rtmp_handshake_find_digest(const uint8_t *data, size_t size,
+                                    const uint8_t *key, size_t key_size) {
+    uint8_t digest[RTMP_HANDSHAKE_DIGEST_SIZE];
+    int offset = -1;
     
-    // Calculate server digest
-    uint8_t *temp = rtmp_utils_malloc(RTMP_HANDSHAKE_SIZE);
-    if (!temp) return;
+    // Procurar digest em posições válidas
+    for (size_t i = 0; i < size - RTMP_HANDSHAKE_DIGEST_SIZE; i++) {
+        if (rtmp_handshake_calculate_digest(data, i, key, key_size, digest) &&
+            memcmp(digest, data + i, RTMP_HANDSHAKE_DIGEST_SIZE) == 0) {
+            offset = i;
+            break;
+        }
+    }
     
-    memcpy(temp, handshake, RTMP_HANDSHAKE_SIZE);
-    memset(temp + offset2, 0, RTMP_DIGEST_LENGTH);
-    
-    rtmp_utils_hmac_sha256(RTMP_SERVER_KEY, sizeof(RTMP_SERVER_KEY),
-                         temp, RTMP_HANDSHAKE_SIZE, output);
-    rtmp_utils_free(temp);
+    return offset;
 }
 
-// Perform server handshake
-int rtmp_handshake_server(rtmp_connection_t *conn) {
-    if (!conn) return RTMP_ERROR_INVALID_PARAM;
-    
-    uint8_t c0, s0 = RTMP_HANDSHAKE_VERSION;
-    uint8_t c1[RTMP_HANDSHAKE_SIZE];
-    uint8_t s1[RTMP_HANDSHAKE_SIZE];
-    uint8_t c2[RTMP_HANDSHAKE_SIZE];
-    uint8_t s2[RTMP_HANDSHAKE_SIZE];
-    
-    rtmp_log_debug("Starting RTMP handshake");
-    
-    // Receive C0
-    if (rtmp_utils_receive(conn->socket, &c0, 1, RTMP_HANDSHAKE_TIMEOUT) != 1) {
-        rtmp_log_error("Failed to receive C0");
-        return RTMP_ERROR_HANDSHAKE_C0;
-    }
-    
-    // Validate version
-    if (c0 != RTMP_HANDSHAKE_VERSION) {
-        rtmp_log_error("Invalid RTMP version: %d", c0);
-        return RTMP_ERROR_VERSION;
-    }
-    
-    // Receive C1
-    if (rtmp_utils_receive(conn->socket, c1, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to receive C1");
-        return RTMP_ERROR_HANDSHAKE_C1;
-    }
-    
-    // Validate client digest
-    if (rtmp_handshake_validate_client_digest(c1, RTMP_CLIENT_KEY, sizeof(RTMP_CLIENT_KEY)) != 0) {
-        rtmp_log_warning("Invalid client digest, continuing anyway");
-    }
-    
-    // Generate S1
-    rtmp_utils_random_bytes(s1, RTMP_HANDSHAKE_SIZE);
-    
-    // Set timestamp
-    uint32_t timestamp = rtmp_utils_get_time_ms();
-    memcpy(s1, &timestamp, 4);
-    memset(s1 + 4, 0, 4);  // Zero out the time2 field
-    
-    // Generate and embed server digest
-    uint8_t server_digest[RTMP_DIGEST_LENGTH];
-    rtmp_handshake_generate_server_digest(s1, server_digest);
-    
-    int offset1, offset2;
-    rtmp_handshake_get_digest_offset(s1, RTMP_HANDSHAKE_SIZE, &offset1, &offset2);
-    memcpy(s1 + offset2, server_digest, RTMP_DIGEST_LENGTH);
-    
-    // Send S0+S1
-    if (rtmp_utils_send(conn->socket, &s0, 1, RTMP_HANDSHAKE_TIMEOUT) != 1 ||
-        rtmp_utils_send(conn->socket, s1, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to send S0+S1");
-        return RTMP_ERROR_HANDSHAKE_S0S1;
-    }
-    
-    // Generate S2 (copy of C1)
-    memcpy(s2, c1, RTMP_HANDSHAKE_SIZE);
-    
-    // Send S2
-    if (rtmp_utils_send(conn->socket, s2, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to send S2");
-        return RTMP_ERROR_HANDSHAKE_S2;
-    }
-    
-    // Receive C2
-    if (rtmp_utils_receive(conn->socket, c2, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to receive C2");
-        return RTMP_ERROR_HANDSHAKE_C2;
-    }
-    
-    // Validate C2 (should be copy of S1)
-    if (memcmp(c2, s1, RTMP_HANDSHAKE_SIZE) != 0) {
-        rtmp_log_warning("C2 does not match S1, continuing anyway");
-    }
-    
-    rtmp_log_debug("RTMP handshake completed successfully");
-    return RTMP_SUCCESS;
-}
-
-// Perform client handshake
 int rtmp_handshake_client(rtmp_connection_t *conn) {
-    if (!conn) return RTMP_ERROR_INVALID_PARAM;
+    rtmp_handshake_ctx_t *ctx;
+    uint8_t *c1;
+    int ret;
     
-    uint8_t c0 = RTMP_HANDSHAKE_VERSION, s0;
-    uint8_t c1[RTMP_HANDSHAKE_SIZE];
-    uint8_t s1[RTMP_HANDSHAKE_SIZE];
-    uint8_t c2[RTMP_HANDSHAKE_SIZE];
-    uint8_t s2[RTMP_HANDSHAKE_SIZE];
+    ctx = (rtmp_handshake_ctx_t*)calloc(1, sizeof(rtmp_handshake_ctx_t));
+    if (!ctx) return 0;
     
-    rtmp_log_debug("Starting RTMP client handshake");
-    
-    // Generate C1
-    rtmp_utils_random_bytes(c1, RTMP_HANDSHAKE_SIZE);
-    
-    // Set timestamp
-    uint32_t timestamp = rtmp_utils_get_time_ms();
-    memcpy(c1, &timestamp, 4);
-    memset(c1 + 4, 0, 4);  // Zero out the time2 field
-    
-    // Generate and embed client digest
-    uint8_t client_digest[RTMP_DIGEST_LENGTH];
-    rtmp_utils_hmac_sha256(RTMP_CLIENT_KEY, sizeof(RTMP_CLIENT_KEY),
-                         c1, RTMP_HANDSHAKE_SIZE, client_digest);
-    
-    int offset1, offset2;
-    rtmp_handshake_get_digest_offset(c1, RTMP_HANDSHAKE_SIZE, &offset1, &offset2);
-    memcpy(c1 + offset1, client_digest, RTMP_DIGEST_LENGTH);
-    
-    // Send C0+C1
-    if (rtmp_utils_send(conn->socket, &c0, 1, RTMP_HANDSHAKE_TIMEOUT) != 1 ||
-        rtmp_utils_send(conn->socket, c1, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to send C0+C1");
-        return RTMP_ERROR_HANDSHAKE_C0C1;
+    // Enviar versão
+    ctx->version = RTMP_HANDSHAKE_VERSION;
+    ret = rtmp_send(conn, &ctx->version, 1);
+    if (ret != 1) {
+        free(ctx);
+        return 0;
     }
     
-    // Receive S0
-    if (rtmp_utils_receive(conn->socket, &s0, 1, RTMP_HANDSHAKE_TIMEOUT) != 1) {
-        rtmp_log_error("Failed to receive S0");
-        return RTMP_ERROR_HANDSHAKE_S0;
+    // Preparar e enviar C1
+    c1 = (uint8_t*)malloc(RTMP_HANDSHAKE_SIZE);
+    if (!c1) {
+        free(ctx);
+        return 0;
     }
     
-    // Validate version
-    if (s0 != RTMP_HANDSHAKE_VERSION) {
-        rtmp_log_error("Invalid RTMP version from server: %d", s0);
-        return RTMP_ERROR_VERSION;
+    rtmp_handshake_init_packet(c1);
+    ctx->c1 = c1;
+    ctx->c1_size = RTMP_HANDSHAKE_SIZE;
+    
+    // Calcular e inserir digest
+    uint8_t digest[RTMP_HANDSHAKE_DIGEST_SIZE];
+    rtmp_handshake_calculate_digest(c1, RTMP_HANDSHAKE_SIZE - RTMP_HANDSHAKE_DIGEST_SIZE,
+                                  rtmp_handshake_key_fp, sizeof(rtmp_handshake_key_fp),
+                                  digest);
+    memcpy(c1 + RTMP_HANDSHAKE_SIZE - RTMP_HANDSHAKE_DIGEST_SIZE,
+           digest, RTMP_HANDSHAKE_DIGEST_SIZE);
+    
+    ret = rtmp_send(conn, c1, RTMP_HANDSHAKE_SIZE);
+    if (ret != RTMP_HANDSHAKE_SIZE) {
+        free(c1);
+        free(ctx);
+        return 0;
     }
     
-    // Receive S1
-    if (rtmp_utils_receive(conn->socket, s1, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to receive S1");
-        return RTMP_ERROR_HANDSHAKE_S1;
+    conn->handshake = ctx;
+    return 1;
+}
+
+int rtmp_handshake_server(rtmp_connection_t *conn) {
+    rtmp_handshake_ctx_t *ctx;
+    uint8_t *s1;
+    int ret;
+    
+    ctx = (rtmp_handshake_ctx_t*)calloc(1, sizeof(rtmp_handshake_ctx_t));
+    if (!ctx) return 0;
+    
+    // Receber versão
+    ret = rtmp_recv(conn, &ctx->version, 1);
+    if (ret != 1 || ctx->version != RTMP_HANDSHAKE_VERSION) {
+        free(ctx);
+        return 0;
     }
     
-    // Generate C2 (copy of S1)
-    memcpy(c2, s1, RTMP_HANDSHAKE_SIZE);
-    
-    // Send C2
-    if (rtmp_utils_send(conn->socket, c2, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to send C2");
-        return RTMP_ERROR_HANDSHAKE_C2;
+    // Preparar e enviar S1
+    s1 = (uint8_t*)malloc(RTMP_HANDSHAKE_SIZE);
+    if (!s1) {
+        free(ctx);
+        return 0;
     }
     
-    // Receive S2
-    if (rtmp_utils_receive(conn->socket, s2, RTMP_HANDSHAKE_SIZE, RTMP_HANDSHAKE_TIMEOUT) != RTMP_HANDSHAKE_SIZE) {
-        rtmp_log_error("Failed to receive S2");
-        return RTMP_ERROR_HANDSHAKE_S2;
+    rtmp_handshake_init_packet(s1);
+    ctx->s1 = s1;
+    ctx->s1_size = RTMP_HANDSHAKE_SIZE;
+    
+    // Calcular e inserir digest
+    uint8_t digest[RTMP_HANDSHAKE_DIGEST_SIZE];
+    rtmp_handshake_calculate_digest(s1, RTMP_HANDSHAKE_SIZE - RTMP_HANDSHAKE_DIGEST_SIZE,
+                                  rtmp_handshake_key_fms, sizeof(rtmp_handshake_key_fms),
+                                  digest);
+    memcpy(s1 + RTMP_HANDSHAKE_SIZE - RTMP_HANDSHAKE_DIGEST_SIZE,
+           digest, RTMP_HANDSHAKE_DIGEST_SIZE);
+    
+    ret = rtmp_send(conn, s1, RTMP_HANDSHAKE_SIZE);
+    if (ret != RTMP_HANDSHAKE_SIZE) {
+        free(s1);
+        free(ctx);
+        return 0;
     }
     
-    // Validate S2 (should be copy of C1)
-    if (memcmp(s2, c1, RTMP_HANDSHAKE_SIZE) != 0) {
-        rtmp_log_warning("S2 does not match C1, continuing anyway");
+    conn->handshake = ctx;
+    return 1;
+}
+
+int rtmp_handshake_process(rtmp_connection_t *conn, const uint8_t *data, size_t size) {
+    rtmp_handshake_ctx_t *ctx = conn->handshake;
+    if (!ctx) return 0;
+    
+    switch (ctx->state) {
+        case 0: // Aguardando S1
+            if (size < RTMP_HANDSHAKE_SIZE) return 0;
+            
+            ctx->s1 = (uint8_t*)malloc(RTMP_HANDSHAKE_SIZE);
+            if (!ctx->s1) return 0;
+            
+            memcpy(ctx->s1, data, RTMP_HANDSHAKE_SIZE);
+            ctx->s1_size = RTMP_HANDSHAKE_SIZE;
+            
+            // Verificar digest do servidor
+            if (rtmp_handshake_find_digest(ctx->s1, RTMP_HANDSHAKE_SIZE,
+                                         rtmp_handshake_key_fms,
+                                         sizeof(rtmp_handshake_key_fms)) < 0) {
+                return 0;
+            }
+            
+            // Preparar e enviar C2
+            ctx->c2 = (uint8_t*)malloc(RTMP_HANDSHAKE_SIZE);
+            if (!ctx->c2) return 0;
+            
+            memcpy(ctx->c2, ctx->s1, RTMP_HANDSHAKE_SIZE);
+            ctx->c2_size = RTMP_HANDSHAKE_SIZE;
+            
+            if (rtmp_send(conn, ctx->c2, RTMP_HANDSHAKE_SIZE) != RTMP_HANDSHAKE_SIZE) {
+                return 0;
+            }
+            
+            ctx->state = 1;
+            break;
+            
+        case 1: // Aguardando S2
+            if (size < RTMP_HANDSHAKE_SIZE) return 0;
+            
+            ctx->s2 = (uint8_t*)malloc(RTMP_HANDSHAKE_SIZE);
+            if (!ctx->s2) return 0;
+            
+            memcpy(ctx->s2, data, RTMP_HANDSHAKE_SIZE);
+            ctx->s2_size = RTMP_HANDSHAKE_SIZE;
+            
+            // Verificar se S2 corresponde a C1
+            if (memcmp(ctx->s2, ctx->c1, RTMP_HANDSHAKE_SIZE) != 0) {
+                return 0;
+            }
+            
+            ctx->state = 2;
+            break;
+            
+        default:
+            return 0;
     }
     
-    rtmp_log_debug("RTMP client handshake completed successfully");
-    return RTMP_SUCCESS;
+    return 1;
+}
+
+int rtmp_handshake_is_done(rtmp_connection_t *conn) {
+    rtmp_handshake_ctx_t *ctx = conn->handshake;
+    return (ctx && ctx->state == 2);
+}
+
+int rtmp_handshake_generate_signature(const uint8_t *data, size_t size,
+                                    const uint8_t *key, size_t key_size,
+                                    uint8_t *signature) {
+    return rtmp_handshake_calculate_digest(data, size, key, key_size, signature);
+}
+
+int rtmp_handshake_verify_signature(const uint8_t *data, size_t size,
+                                  const uint8_t *key, size_t key_size,
+                                  const uint8_t *signature) {
+    uint8_t calculated[RTMP_HANDSHAKE_DIGEST_SIZE];
+    
+    if (!rtmp_handshake_calculate_digest(data, size, key, key_size, calculated)) {
+        return 0;
+    }
+    
+    return (memcmp(calculated, signature, RTMP_HANDSHAKE_DIGEST_SIZE) == 0);
 }
